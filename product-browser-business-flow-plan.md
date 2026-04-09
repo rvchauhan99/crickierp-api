@@ -85,11 +85,15 @@ flowchart TD
   player --> exchange
   bank --> deposit
   bank --> withdrawal
+  bank --> b2b[B2B Transfer]
   exchange --> deposit
   exchange --> withdrawal
+  exchange --> e2e[E2E Transfer]
 
   deposit --> ledger[TransactionLedger]
   withdrawal --> ledger
+  b2b --> ledger
+  e2e --> ledger
   expensives --> ledger
   ledger --> reports
   ledger --> history
@@ -109,9 +113,10 @@ Primary entities:
 - Audit/Event History
 
 Likely status flows to implement:
-- Deposit: Draft/Pending -> Verified -> Finalized
+- Deposit: Draft/Pending -> UTR/Player Reconciliation & Bonus Assign -> Verified -> Finalized
 - Withdrawal: Requested/Pending -> Approved/Rejected -> Finalized
 - Exchange: Created -> Edited/Reviewed -> Listed/Settled
+- Rebalancing: Bank-to-Bank (B2B) Transfer, Exchange-to-Exchange (E2E) Transfer
 
 ## 5) Frontend Implementation Plan (Module-wise)
 
@@ -193,6 +198,8 @@ This section captures what is visible in each opened screen from the browser wal
 ### Dashboard (`#/dashboard`)
 - Widgets: Full Day Summary.
 - Summary cards/metrics visible: Deposit, Withdrawal, Total Bonus (D/W), Gross Profit & Loss, New Clients.
+- Active Balance Tracking: Banker vs. Pending Deposits, Exchange vs. Pending Withdrawals.
+- Net Profit Calculation: Evaluates active Net Profit & Loss automatically deducting Expenses `(Gross Profit & Loss - Expenses)`.
 - Dashboard appears to be operational KPI landing page.
 
 ### Sub Admin - Add (`#/add-subadmin`)
@@ -228,7 +235,7 @@ This section captures what is visible in each opened screen from the browser wal
 - Screen title observed as Add Exchange Player (player onboarding mapped to exchange).
 - Fields: Exchange, Player ID, Phone Number, Player Excel file.
 - Actions: Save, Cancel.
-- Also observed an additional readonly `id` field section with Save/Cancel (likely CSV/bulk helper area).
+- Bulk Upload: Dedicated section for Bulk Excel Upload allowing for scalable player onboarding.
 
 ### Bank - Add (`#/add-bank`)
 - Fields:
@@ -267,9 +274,8 @@ This section captures what is visible in each opened screen from the browser wal
 - Controls: Search by UTR, page size, pagination.
 - Row action observed: Banker Update.
 - Sidebar shows additional deposit menus:
-  - Exchange Depositors
-  - Final List
-  (not fully navigable under current account state in this pass)
+  - Exchange Depositors: Allows matching incoming Banker UTRs with Player IDs and assigning Bonuses. Features "Submit" (Approve) or "Reject" flows for strict transaction reconciliation.
+  - Final List: Readonly view of finalized deposits post reconciliation.
 
 ### Withdrawal - Final List (`#/withdrawal-final-list`)
 - Filters: Player Name, Bank Name, From Date, To Date, Search, Submit.

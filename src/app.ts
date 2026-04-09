@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
+import cookieParser from "cookie-parser";
 import { env } from "./config/env";
 import { apiRouter } from "./routes";
 import { requestIdMiddleware } from "./shared/middlewares/requestId.middleware";
@@ -19,6 +20,7 @@ export function createApp() {
     }),
   );
   app.use(express.json());
+  app.use(cookieParser());
   app.use(requestIdMiddleware);
   app.use(httpLoggerMiddleware);
   app.use(morgan("dev"));

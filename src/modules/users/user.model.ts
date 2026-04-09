@@ -1,6 +1,6 @@
 import { Schema, model, Types } from "mongoose";
 
-export type UserRole = "admin" | "sub_admin";
+export type UserRole = "superadmin" | "admin" | "sub_admin";
 export type UserStatus = "active" | "deactive";
 
 export interface UserDocument {
@@ -12,6 +12,11 @@ export interface UserDocument {
   role: UserRole;
   status: UserStatus;
   permissions: string[];
+  twoFactorSecret?: string;
+  isTwoFactorEnabled?: boolean;
+  resetPasswordOtp?: string;
+  resetPasswordExpires?: Date;
+  createdBy?: Types.ObjectId;
   lastLoginAt?: Date;
   createdAt: Date;
   updatedAt: Date;
@@ -23,9 +28,14 @@ const userSchema = new Schema<UserDocument>(
     email: { type: String, required: true, trim: true, lowercase: true, unique: true },
     username: { type: String, required: true, trim: true, unique: true },
     passwordHash: { type: String, required: true },
-    role: { type: String, enum: ["admin", "sub_admin"], default: "sub_admin" },
+    role: { type: String, enum: ["superadmin", "admin", "sub_admin"], default: "sub_admin" },
     status: { type: String, enum: ["active", "deactive"], default: "active" },
-    permissions: [{ type: String, required: true }],
+    permissions: [{ type: String }],
+    twoFactorSecret: { type: String },
+    isTwoFactorEnabled: { type: Boolean, default: false },
+    resetPasswordOtp: { type: String },
+    resetPasswordExpires: { type: Date },
+    createdBy: { type: Schema.Types.ObjectId, ref: "User" },
     lastLoginAt: { type: Date },
   },
   { timestamps: true },
