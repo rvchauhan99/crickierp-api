@@ -20,9 +20,25 @@ export const updateExchangeBodySchema = z.object({
 export const listExchangeQuerySchema = z.object({
   search: z.string().optional(),
   page: z.coerce.number().int().positive().default(1),
-  pageSize: z.coerce.number().int().positive().max(100).default(20),
+  pageSize: z.coerce.number().int().positive().max(500).default(20),
   sortBy: z.enum(["createdAt", "name", "provider"]).default("createdAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
+  /** Column filters (same keys as crickierp-web exchange list) */
+  name: z.string().optional(),
+  name_op: z.string().optional(),
+  provider: z.string().optional(),
+  provider_op: z.string().optional(),
+  status: z.string().optional(),
+  createdBy: z.string().optional(),
+  createdAt_from: z.string().optional(),
+  createdAt_to: z.string().optional(),
+  createdAt_op: z.string().optional(),
+  openingBalance: z.string().optional(),
+  openingBalance_to: z.string().optional(),
+  openingBalance_op: z.string().optional(),
+  bonus: z.string().optional(),
+  bonus_to: z.string().optional(),
+  bonus_op: z.string().optional(),
 });
 
 export const exchangeIdParamSchema = z.object({

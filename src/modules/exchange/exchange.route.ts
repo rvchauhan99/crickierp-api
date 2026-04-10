@@ -5,6 +5,7 @@ import { validate } from "../../shared/middlewares/validate.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import {
   createExchangeController,
+  exportExchangeController,
   getExchangeController,
   listExchangeController,
   updateExchangeController,
@@ -31,6 +32,12 @@ exchangeRouter.get(
   permissionMiddleware(PERMISSIONS.EXCHANGE_LIST),
   validate({ query: listExchangeQuerySchema }),
   listExchangeController,
+);
+exchangeRouter.get(
+  "/export",
+  permissionMiddleware(PERMISSIONS.EXCHANGE_LIST),
+  validate({ query: listExchangeQuerySchema }),
+  exportExchangeController,
 );
 exchangeRouter.get(
   "/:id",
