@@ -8,7 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "lint": "eslint .",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "db:reset": "tsx src/scripts/reset-database.ts"
   },
   "repository": {
     "type": "git",

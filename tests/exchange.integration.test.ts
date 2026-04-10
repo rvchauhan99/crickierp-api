@@ -15,8 +15,8 @@ describe("Exchange API integration", () => {
     await bootstrapData();
 
     const loginRes = await request(app).post("/api/v1/auth/login").send({
-      username: "admin",
-      password: "Admin@123",
+      username: "superadmin",
+      password: "SuperAdmin@123",
     });
     accessToken = loginRes.body.data.accessToken;
   });
