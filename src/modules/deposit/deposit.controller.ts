@@ -1,19 +1,56 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
-import { createDeposit, listDeposits, updateDepositStatus } from "./deposit.service";
+import {
+  createDeposit,
+  exchangeApproveDeposit,
+  exchangeRejectDeposit,
+  exportDepositsToBuffer,
+  listDeposits,
+} from "./deposit.service";
+import {
+  createDepositBodySchema,
+  exchangeActionBodySchema,
+  listDepositQuerySchema,
+} from "./deposit.validation";
 
 export async function createDepositController(req: Request, res: Response) {
-  const data = await createDeposit(req.body, req.user!.userId, req.requestId);
+  const body = createDepositBodySchema.parse(req.body);
+  const data = await createDeposit(body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
 }
 
 export async function listDepositController(req: Request, res: Response) {
-  const stage = String(req.query.stage ?? "banker") as "banker" | "exchange" | "final";
-  const data = await listDeposits(stage);
-  res.status(StatusCodes.OK).json({ success: true, data });
+  const query = listDepositQuerySchema.parse(req.query);
+  const result = await listDeposits(query);
+  res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
-export async function updateDepositStatusController(req: Request, res: Response) {
-  const data = await updateDepositStatus(String(req.params.id), req.body.status, req.user!.userId, req.requestId);
+export async function exportDepositController(req: Request, res: Response) {
+  const query = listDepositQuerySchema.parse(req.query);
+  const buffer = await exportDepositsToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="deposits-export.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function exchangeActionController(req: Request, res: Response) {
+  const body = exchangeActionBodySchema.parse(req.body);
+  const id = String(req.params.id);
+
+  if (body.action === "approve") {
+    const data = await exchangeApproveDeposit(
+      id,
+      { playerId: body.playerId, bonusAmount: body.bonusAmount },
+      req.user!.userId,
+      req.requestId,
+    );
+    res.status(StatusCodes.OK).json({ success: true, data });
+    return;
+  }
+
+  const data = await exchangeRejectDeposit(id, body.remark, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
 }

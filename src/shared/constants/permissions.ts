@@ -35,6 +35,7 @@ export const PERMISSIONS = {
 
   REPORTS_TRANSACTION_HISTORY: "reports.transaction_history",
   USER_HISTORY_VIEW: "user_history.view",
+
   EXPENSE_MASTER_LIST: "expense.master_list",
   EXPENSE_ADD: "expense.add",
   EXPENSE_EDIT: "expense.edit",

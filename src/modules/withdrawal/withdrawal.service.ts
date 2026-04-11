@@ -22,8 +22,24 @@ export async function createWithdrawal(input: {
   return doc;
 }
 
-export async function listWithdrawals(stage: "exchange" | "banker" | "final") {
-  return WithdrawalModel.find({ stage }).sort({ createdAt: -1 });
+export async function listWithdrawals(stage: "exchange" | "banker" | "final", query: { page?: number; limit?: number }) {
+  const { page = 1, limit = 20 } = query;
+  const skip = (page - 1) * limit;
+
+  const [data, total] = await Promise.all([
+    WithdrawalModel.find({ stage }).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    WithdrawalModel.countDocuments({ stage }),
+  ]);
+
+  return {
+    data,
+    meta: {
+      total,
+      page: Number(page),
+      limit: Number(limit),
+      pages: Math.ceil(total / limit),
+    },
+  };
 }
 
 export async function updateWithdrawalStatus(id: string, status: WithdrawalStatus, actorId: string, requestId?: string) {

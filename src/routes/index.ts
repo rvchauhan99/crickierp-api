@@ -7,6 +7,8 @@ import { historyRouter } from "../modules/history/history.route";
 import { reportsRouter } from "../modules/reports/reports.route";
 import { userRouter } from "../modules/users/user.route";
 import { withdrawalRouter } from "../modules/withdrawal/withdrawal.route";
+import { playerRouter } from "../modules/player/player.route";
+import { mastersRouter } from "../modules/masters/masters.route";
 
 const apiRouter = Router();
 
@@ -15,11 +17,13 @@ apiRouter.get("/health", (_req, res) => {
 });
 apiRouter.use("/auth", authRouter);
 apiRouter.use("/exchange", exchangeRouter);
+apiRouter.use("/players", playerRouter);
 apiRouter.use("/bank", bankRouter);
 apiRouter.use("/deposit", depositRouter);
 apiRouter.use("/withdrawal", withdrawalRouter);
 apiRouter.use("/users", userRouter);
 apiRouter.use("/reports", reportsRouter);
 apiRouter.use("/history", historyRouter);
+apiRouter.use("/masters", mastersRouter);
 
 export { apiRouter };

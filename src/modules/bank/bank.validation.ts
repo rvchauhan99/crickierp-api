@@ -8,3 +8,30 @@ export const createBankBodySchema = z.object({
   openingBalance: z.number().min(0),
   status: z.enum(["active", "deactive"]).default("active"),
 });
+
+export const listBankQuerySchema = z.object({
+  search: z.string().optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(500).default(20),
+  limit: z.coerce.number().int().positive().max(500).optional(),
+  sortBy: z
+    .enum(["createdAt", "holderName", "bankName", "accountNumber", "ifsc", "openingBalance", "status"])
+    .default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+  holderName: z.string().optional(),
+  holderName_op: z.string().optional(),
+  bankName: z.string().optional(),
+  bankName_op: z.string().optional(),
+  accountNumber: z.string().optional(),
+  accountNumber_op: z.string().optional(),
+  ifsc: z.string().optional(),
+  ifsc_op: z.string().optional(),
+  status: z.string().optional(),
+  createdBy: z.string().optional(),
+  createdAt_from: z.string().optional(),
+  createdAt_to: z.string().optional(),
+  createdAt_op: z.string().optional(),
+  openingBalance: z.string().optional(),
+  openingBalance_to: z.string().optional(),
+  openingBalance_op: z.string().optional(),
+});
