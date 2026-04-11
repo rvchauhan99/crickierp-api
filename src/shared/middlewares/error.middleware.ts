@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from "express";
 import { ZodError } from "zod";
 import { AppError } from "../errors/AppError";
+import { formatZodErrorMessage } from "../utils/zodErrorMessage";
 
 export function notFoundMiddleware(req: Request, res: Response) {
   res.status(404).json({
@@ -31,7 +32,7 @@ export function errorMiddleware(error: unknown, req: Request, res: Response, _ne
       success: false,
       error: {
         code: "validation_error",
-        message: "Validation failed",
+        message: formatZodErrorMessage(error),
         details: error.flatten(),
         requestId: req.requestId,
       },

@@ -9,6 +9,8 @@ import { userRouter } from "../modules/users/user.route";
 import { withdrawalRouter } from "../modules/withdrawal/withdrawal.route";
 import { playerRouter } from "../modules/player/player.route";
 import { mastersRouter } from "../modules/masters/masters.route";
+import { expenseRouter } from "../modules/expense/expense.route";
+import { reasonRouter } from "../modules/reason/reason.route";
 
 const apiRouter = Router();
 
@@ -25,5 +27,7 @@ apiRouter.use("/users", userRouter);
 apiRouter.use("/reports", reportsRouter);
 apiRouter.use("/history", historyRouter);
 apiRouter.use("/masters", mastersRouter);
+apiRouter.use("/expense", expenseRouter);
+apiRouter.use("/reasons", reasonRouter);
 
 export { apiRouter };

@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
-import { createBank, exportBanksToBuffer, listBanks } from "./bank.service";
-import { listBankQuerySchema } from "./bank.validation";
+import { createBank, exportBanksToBuffer, getBankLedger, listBanks } from "./bank.service";
+import { bankIdParamSchema, bankLedgerQuerySchema, listBankQuerySchema } from "./bank.validation";
 
 export async function createBankController(req: Request, res: Response) {
   const data = await createBank(req.body, req.user!.userId, req.requestId);
@@ -23,4 +23,11 @@ export async function exportBankController(req: Request, res: Response) {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   );
   res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function bankLedgerController(req: Request, res: Response) {
+  const { id } = bankIdParamSchema.parse(req.params);
+  const query = bankLedgerQuerySchema.parse(req.query);
+  const data = await getBankLedger(id, query);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }

@@ -1,22 +1,47 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
-import { createWithdrawal, listWithdrawals, updateWithdrawalStatus } from "./withdrawal.service";
+import {
+  createWithdrawal,
+  listSavedAccountsForPlayer,
+  listWithdrawals,
+  updateWithdrawalByBanker,
+  updateWithdrawalStatus,
+} from "./withdrawal.service";
+import {
+  createWithdrawalBodySchema,
+  listWithdrawalQuerySchema,
+  updateWithdrawalStatusBodySchema,
+  withdrawalBankerPayoutBodySchema,
+} from "./withdrawal.validation";
 
 export async function createWithdrawalController(req: Request, res: Response) {
-  const data = await createWithdrawal(req.body, req.user!.userId, req.requestId);
+  const body = createWithdrawalBodySchema.parse(req.body);
+  const data = await createWithdrawal(body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
 }
 
 export async function listWithdrawalController(req: Request, res: Response) {
-  const stage = String(req.query.stage ?? "exchange") as "exchange" | "banker" | "final";
-  const page = parseInt(req.query.page as string) || 1;
-  const limit = parseInt(req.query.limit as string) || 20;
+  const query = listWithdrawalQuerySchema.parse(req.query);
+  const result = await listWithdrawals(query);
+  res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
+}
 
-  const result = await listWithdrawals(stage, { page, limit });
-  res.status(StatusCodes.OK).json({ success: true, ...result });
+export async function updateWithdrawalBankerController(req: Request, res: Response) {
+  const body = withdrawalBankerPayoutBodySchema.parse(req.body);
+  const id = String(req.params.id);
+  const data = await updateWithdrawalByBanker(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function updateWithdrawalStatusController(req: Request, res: Response) {
-  const data = await updateWithdrawalStatus(String(req.params.id), req.body.status, req.user!.userId, req.requestId);
+  const body = updateWithdrawalStatusBodySchema.parse(req.body);
+  const id = String(req.params.id);
+  const data = await updateWithdrawalStatus(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function listSavedAccountsController(req: Request, res: Response) {
+  const playerId = String(req.params.playerId);
+  const data = await listSavedAccountsForPlayer(playerId);
   res.status(StatusCodes.OK).json({ success: true, data });
 }

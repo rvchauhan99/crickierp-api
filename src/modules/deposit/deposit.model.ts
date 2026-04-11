@@ -16,6 +16,8 @@ export interface DepositDocument {
   bonusAmount?: number;
   totalAmount?: number;
   rejectReason?: string;
+  /** Master Reason row for rejection (optional for legacy). */
+  rejectReasonId?: Types.ObjectId;
   exchangeActionBy?: Types.ObjectId;
   exchangeActionAt?: Date;
   bankBalanceAfter?: number;
@@ -40,6 +42,7 @@ const depositSchema = new Schema<DepositDocument>(
     bonusAmount: { type: Number, min: 0 },
     totalAmount: { type: Number, min: 0 },
     rejectReason: { type: String, trim: true },
+    rejectReasonId: { type: Schema.Types.ObjectId, ref: "Reason" },
     exchangeActionBy: { type: Schema.Types.ObjectId, ref: "User" },
     exchangeActionAt: { type: Date },
     bankBalanceAfter: { type: Number, min: 0 },

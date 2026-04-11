@@ -5,6 +5,8 @@ import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
 import { PlayerModel } from "../player/player.model";
+import { REASON_TYPES } from "../../shared/constants/reasonTypes";
+import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { DepositModel, DepositStatus } from "./deposit.model";
 import { listDepositQuerySchema } from "./deposit.validation";
 
@@ -487,10 +489,13 @@ export async function exchangeApproveDeposit(
 
 export async function exchangeRejectDeposit(
   id: string,
-  remark: string,
+  input: { reasonId: string; remark?: string },
   actorId: string,
   requestId?: string,
 ) {
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.DEPOSIT_EXCHANGE_REJECT);
+  const rejectText = composeRejectReasonText(resolved.masterText, input.remark);
+
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
   if (doc.status !== "pending") {
@@ -498,7 +503,8 @@ export async function exchangeRejectDeposit(
   }
 
   doc.status = "rejected";
-  doc.rejectReason = remark.trim();
+  doc.rejectReason = rejectText;
+  doc.rejectReasonId = new Types.ObjectId(resolved.id);
   doc.exchangeActionBy = new Types.ObjectId(actorId);
   doc.exchangeActionAt = new Date();
   await doc.save();
@@ -508,7 +514,11 @@ export async function exchangeRejectDeposit(
     action: "deposit.exchange_reject",
     entity: "deposit",
     entityId: doc._id.toString(),
-    newValue: { rejectReason: remark },
+    newValue: {
+      rejectReason: rejectText,
+      rejectReasonId: resolved.id,
+      remark: input.remark?.trim() || undefined,
+    },
     requestId,
   });
   return doc;

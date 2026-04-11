@@ -35,3 +35,12 @@ export const listBankQuerySchema = z.object({
   openingBalance_to: z.string().optional(),
   openingBalance_op: z.string().optional(),
 });
+
+export const bankLedgerQuerySchema = z.object({
+  fromDate: z.string().optional(),
+  toDate: z.string().optional(),
+});
+
+export const bankIdParamSchema = z.object({
+  id: z.string().length(24),
+});

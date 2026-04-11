@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { getAuditContext } from "../../shared/context/auditContext";
 import { AuditLogModel } from "./audit.model";
 
 type AuditPayload = {
@@ -13,8 +14,10 @@ type AuditPayload = {
 };
 
 export async function createAuditLog(payload: AuditPayload) {
+  const { clientIp } = getAuditContext();
   return AuditLogModel.create({
     ...payload,
     actorId: new Types.ObjectId(payload.actorId),
+    ...(clientIp ? { ipAddress: clientIp } : {}),
   });
 }

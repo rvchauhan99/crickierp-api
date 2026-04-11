@@ -3,6 +3,8 @@ import type { z } from "zod";
 import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
+import { DepositModel } from "../deposit/deposit.model";
+import { ExpenseModel } from "../expense/expense.model";
 import { BankModel } from "./bank.model";
 import { listBankQuerySchema } from "./bank.validation";
 
@@ -310,4 +312,129 @@ export async function exportBanksToBuffer(query: ListBankQuery): Promise<Buffer>
   const workbook = xlsx.utils.book_new();
   xlsx.utils.book_append_sheet(workbook, worksheet, "Banks");
   return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+}
+
+type LedgerQuery = {
+  fromDate?: string;
+  toDate?: string;
+};
+
+function ledgerYmdStart(ymd: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0);
+}
+
+function ledgerYmdEnd(ymd: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d, 23, 59, 59, 999);
+}
+
+function depositEventTime(d: { settledAt?: Date; createdAt?: Date }): Date {
+  if (d.settledAt) return new Date(d.settledAt);
+  if (d.createdAt) return new Date(d.createdAt);
+  return new Date(0);
+}
+
+function expenseEventTime(e: { approvedAt?: Date; createdAt?: Date }): Date {
+  if (e.approvedAt) return new Date(e.approvedAt);
+  if (e.createdAt) return new Date(e.createdAt);
+  return new Date(0);
+}
+
+/** Merged deposit credits and approved expense debits for a bank account (chronological ledger). */
+export async function getBankLedger(bankId: string, query: LedgerQuery) {
+  if (!Types.ObjectId.isValid(bankId)) {
+    throw new AppError("validation_error", "Invalid bank id", 400);
+  }
+  const bid = new Types.ObjectId(bankId);
+  const bank = await BankModel.findById(bid).lean();
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+
+  const from = query.fromDate?.trim();
+  const to = query.toDate?.trim();
+  const fromD = from ? ledgerYmdStart(from) : null;
+  const toD = to ? ledgerYmdEnd(to) : null;
+
+  const [allDeposits, allExpenses] = await Promise.all([
+    DepositModel.find({ bankId: bid, status: "verified" }).lean(),
+    ExpenseModel.find({ bankId: bid, status: "approved" }).lean(),
+  ]);
+
+  let priorNet = 0;
+  if (fromD) {
+    for (const d of allDeposits) {
+      const at = depositEventTime(d);
+      if (at >= fromD) continue;
+      priorNet += d.totalAmount ?? d.amount;
+    }
+    for (const e of allExpenses) {
+      const at = expenseEventTime(e);
+      if (at >= fromD) continue;
+      priorNet -= e.amount;
+    }
+  }
+
+  type Ev =
+    | { kind: "deposit"; t: number; doc: (typeof allDeposits)[0] }
+    | { kind: "expense"; t: number; doc: (typeof allExpenses)[0] };
+
+  const events: Ev[] = [];
+  for (const d of allDeposits) {
+    const at = depositEventTime(d);
+    if (fromD && at < fromD) continue;
+    if (toD && at > toD) continue;
+    events.push({ kind: "deposit", t: at.getTime(), doc: d });
+  }
+  for (const e of allExpenses) {
+    const at = expenseEventTime(e);
+    if (fromD && at < fromD) continue;
+    if (toD && at > toD) continue;
+    events.push({ kind: "expense", t: at.getTime(), doc: e });
+  }
+  events.sort((a, b) => a.t - b.t);
+
+  let running = bank.openingBalance + priorNet;
+
+  const rows = events.map((ev) => {
+    if (ev.kind === "deposit") {
+      const d = ev.doc;
+      const amt = d.totalAmount ?? d.amount;
+      running += amt;
+      return {
+        kind: "deposit" as const,
+        refId: d._id.toString(),
+        at: new Date(ev.t).toISOString(),
+        label: `Deposit · UTR ${d.utr}`,
+        amount: amt,
+        direction: "credit" as const,
+        balanceAfter: d.bankBalanceAfter ?? running,
+      };
+    }
+    const e = ev.doc;
+    running -= e.amount;
+    return {
+      kind: "expense" as const,
+      refId: e._id.toString(),
+      at: new Date(ev.t).toISOString(),
+      label: e.description?.trim() ? e.description.trim() : "Expense",
+      amount: e.amount,
+      direction: "debit" as const,
+      balanceAfter: e.bankBalanceAfter ?? running,
+    };
+  });
+
+  return {
+    bank: {
+      _id: bank._id.toString(),
+      holderName: bank.holderName,
+      bankName: bank.bankName,
+      accountNumber: bank.accountNumber,
+      openingBalance: bank.openingBalance,
+      currentBalance: bank.currentBalance ?? bank.openingBalance,
+    },
+    periodOpeningBalance: bank.openingBalance + priorNet,
+    rows,
+  };
 }

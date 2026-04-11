@@ -282,6 +282,17 @@ export async function createPlayer(
   }
 }
 
+export async function getPlayerById(id: string) {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    throw new AppError("validation_error", "Invalid player id", 400);
+  }
+  const doc = await PlayerModel.findById(id).select("playerId phone bonusPercentage").lean();
+  if (!doc) {
+    throw new AppError("not_found", "Player not found", 404);
+  }
+  return doc;
+}
+
 export async function listPlayers(query: ListPlayerQuery) {
   const page = query.page ?? 1;
   const pageSize = query.pageSize ?? query.limit ?? 20;

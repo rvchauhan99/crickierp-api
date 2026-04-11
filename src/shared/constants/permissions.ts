@@ -34,12 +34,14 @@ export const PERMISSIONS = {
   WITHDRAWAL_FINAL_EDIT: "withdrawal.final_edit",
 
   REPORTS_TRANSACTION_HISTORY: "reports.transaction_history",
+  REPORTS_EXPENSE_ANALYSIS: "reports.expense_analysis",
   USER_HISTORY_VIEW: "user_history.view",
 
   EXPENSE_MASTER_LIST: "expense.master_list",
   EXPENSE_ADD: "expense.add",
   EXPENSE_EDIT: "expense.edit",
   EXPENSE_LIST: "expense.list",
+  EXPENSE_AUDIT: "expense.audit",
 } as const;
 
 export const DEFAULT_ADMIN_PERMISSIONS = Object.values(PERMISSIONS);

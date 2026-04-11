@@ -10,6 +10,7 @@ export interface AuditLogDocument {
   newValue?: Record<string, unknown>;
   reason?: string;
   requestId?: string;
+  ipAddress?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -24,6 +25,7 @@ const auditLogSchema = new Schema<AuditLogDocument>(
     newValue: { type: Schema.Types.Mixed },
     reason: { type: String, trim: true },
     requestId: { type: String, trim: true },
+    ipAddress: { type: String, trim: true },
   },
   { timestamps: true },
 );

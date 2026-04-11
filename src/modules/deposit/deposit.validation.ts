@@ -45,6 +45,7 @@ export const exchangeActionBodySchema = z.discriminatedUnion("action", [
   }),
   z.object({
     action: z.literal("reject"),
-    remark: z.string().min(1).max(2000).trim(),
+    reasonId: z.string().length(24),
+    remark: z.string().max(2000).trim().optional(),
   }),
 ]);

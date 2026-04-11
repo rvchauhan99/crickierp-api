@@ -7,7 +7,13 @@ import { env } from "../../config/env";
 import { AppError } from "../../shared/errors/AppError";
 import { signAccessToken } from "../../shared/utils/jwt";
 import { sendPasswordResetEmail } from "../../shared/services/email.service";
+import { createAuditLog } from "../audit/audit.service";
 import { UserModel } from "../users/user.model";
+import {
+  AUDIT_ACTION_LOGIN,
+  AUDIT_ACTION_LOGIN_2FA,
+  AUDIT_ENTITY_AUTH,
+} from "../../shared/constants/auditEntities";
 
 const LOGIN_RATE_MS = 15 * 60 * 1000;
 const OTP_RATE_MS = 10 * 60 * 1000;
@@ -63,6 +69,17 @@ export async function loginUser(username: string, password: string) {
   const refreshToken = jwt.sign(payload, env.jwtRefreshSecret, { expiresIn: "7d" });
   user.lastLoginAt = new Date();
   await user.save();
+
+  const actorId = user._id.toString();
+  void createAuditLog({
+    actorId,
+    action: AUDIT_ACTION_LOGIN,
+    entity: AUDIT_ENTITY_AUTH,
+    entityId: actorId,
+    newValue: { method: "password" },
+  }).catch(() => {
+    /* non-fatal */
+  });
 
   return {
     user: {
@@ -135,6 +152,17 @@ export async function verifyTwoFactor(tempToken: string, code: string) {
   const refreshToken = jwt.sign(payload, env.jwtRefreshSecret, { expiresIn: "7d" });
   user.lastLoginAt = new Date();
   await user.save();
+
+  const actorId = user._id.toString();
+  void createAuditLog({
+    actorId,
+    action: AUDIT_ACTION_LOGIN_2FA,
+    entity: AUDIT_ENTITY_AUTH,
+    entityId: actorId,
+    newValue: { method: "2fa" },
+  }).catch(() => {
+    /* non-fatal */
+  });
 
   return {
     user: {

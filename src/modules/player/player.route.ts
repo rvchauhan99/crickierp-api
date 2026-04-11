@@ -7,6 +7,7 @@ import { PERMISSIONS } from "../../shared/constants/permissions";
 import {
   createPlayerController,
   exportPlayerController,
+  getPlayerByIdController,
   importPlayerController,
   listPlayerController,
   samplePlayerCsvController,
@@ -60,6 +61,11 @@ playerRouter.get(
   "/export",
   permissionMiddleware(PERMISSIONS.PLAYER_LIST),
   exportPlayerController,
+);
+playerRouter.get(
+  "/:id",
+  permissionMiddleware(PERMISSIONS.PLAYER_LIST),
+  getPlayerByIdController,
 );
 playerRouter.get("/", permissionMiddleware(PERMISSIONS.PLAYER_LIST), listPlayerController);
 

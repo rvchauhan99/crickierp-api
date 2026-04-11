@@ -1,0 +1,47 @@
+import { z } from "zod";
+
+const ymd = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "expenseDate must be YYYY-MM-DD");
+
+export const createExpenseBodySchema = z.object({
+  expenseTypeId: z.string().length(24),
+  amount: z.number().min(0.01),
+  expenseDate: ymd,
+  description: z.string().trim().max(5000).optional(),
+  bankId: z.string().length(24).optional(),
+});
+
+export const updateExpenseBodySchema = z.object({
+  expenseTypeId: z.string().length(24).optional(),
+  amount: z.number().min(0.01).optional(),
+  expenseDate: ymd.optional(),
+  description: z.string().trim().max(5000).optional(),
+  bankId: z.union([z.string().length(24), z.literal(""), z.null()]).optional(),
+});
+
+export const listExpenseQuerySchema = z.object({
+  search: z.string().optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(500).default(20),
+  limit: z.coerce.number().int().positive().max(500).optional(),
+  sortBy: z
+    .enum(["createdAt", "expenseDate", "amount", "status", "bankName"])
+    .default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+  status: z.enum(["pending_audit", "approved", "rejected"]).optional(),
+  expenseTypeId: z.string().length(24).optional(),
+  bankId: z.string().length(24).optional(),
+  expenseDate_from: z.string().optional(),
+  expenseDate_to: z.string().optional(),
+  expenseDate_op: z.string().optional(),
+});
+
+export const approveExpenseBodySchema = z.object({
+  bankId: z.string().length(24),
+});
+
+export const rejectExpenseBodySchema = z.object({
+  reasonId: z.string().length(24),
+  remark: z.string().max(2000).trim().optional(),
+});

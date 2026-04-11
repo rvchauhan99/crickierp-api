@@ -2,7 +2,18 @@ import { Router } from "express";
 import { authMiddleware } from "../../shared/middlewares/auth.middleware";
 import { permissionMiddleware } from "../../shared/middlewares/permission.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
-import { dashboardSummaryController, transactionHistoryController } from "./reports.controller";
+import { validate } from "../../shared/middlewares/validate.middleware";
+import {
+  expenseAnalysisRecordsQuerySchema,
+  expenseAnalysisSummaryQuerySchema,
+} from "./reports.validation";
+import {
+  auditEntitiesController,
+  dashboardSummaryController,
+  expenseAnalysisRecordsController,
+  expenseAnalysisSummaryController,
+  transactionHistoryController,
+} from "./reports.controller";
 
 const reportsRouter = Router();
 
@@ -12,6 +23,23 @@ reportsRouter.get(
   "/transaction-history",
   permissionMiddleware(PERMISSIONS.REPORTS_TRANSACTION_HISTORY),
   transactionHistoryController,
+);
+reportsRouter.get(
+  "/audit-entities",
+  permissionMiddleware(PERMISSIONS.REPORTS_TRANSACTION_HISTORY),
+  auditEntitiesController,
+);
+reportsRouter.get(
+  "/expense-analysis/summary",
+  permissionMiddleware(PERMISSIONS.REPORTS_EXPENSE_ANALYSIS),
+  validate({ query: expenseAnalysisSummaryQuerySchema }),
+  expenseAnalysisSummaryController,
+);
+reportsRouter.get(
+  "/expense-analysis/records",
+  permissionMiddleware(PERMISSIONS.REPORTS_EXPENSE_ANALYSIS),
+  validate({ query: expenseAnalysisRecordsQuerySchema }),
+  expenseAnalysisRecordsController,
 );
 
 export { reportsRouter };

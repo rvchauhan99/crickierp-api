@@ -60,6 +60,11 @@ export async function exchangeActionController(req: Request, res: Response) {
     return;
   }
 
-  const data = await exchangeRejectDeposit(id, body.remark, req.user!.userId, req.requestId);
+  const data = await exchangeRejectDeposit(
+    id,
+    { reasonId: body.reasonId, remark: body.remark },
+    req.user!.userId,
+    req.requestId,
+  );
   res.status(StatusCodes.OK).json({ success: true, data });
 }

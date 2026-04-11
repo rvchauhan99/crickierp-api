@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from "express";
 import { ZodError, ZodTypeAny } from "zod";
 import { AppError } from "../errors/AppError";
+import { formatZodErrorMessage } from "../utils/zodErrorMessage";
 
 export function validate(schema: {
   body?: ZodTypeAny;
@@ -15,7 +16,9 @@ export function validate(schema: {
       next();
     } catch (error) {
       if (error instanceof ZodError) {
-        return next(new AppError("validation_error", "Validation failed", 400, error.flatten()));
+        return next(
+          new AppError("validation_error", formatZodErrorMessage(error), 400, error.flatten()),
+        );
       }
       next(error);
     }

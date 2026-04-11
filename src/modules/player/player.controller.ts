@@ -3,6 +3,7 @@ import { StatusCodes } from "http-status-codes";
 import {
   createPlayer,
   exportPlayersToBuffer,
+  getPlayerById,
   getSampleCsvBuffer,
   importPlayersFromFile,
   listPlayers,
@@ -13,6 +14,12 @@ export async function createPlayerController(req: Request, res: Response) {
   const actorId = req.user!.userId;
   const data = await createPlayer(req.body, actorId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
+}
+
+export async function getPlayerByIdController(req: Request, res: Response) {
+  const id = typeof req.params.id === "string" ? req.params.id : String(req.params.id ?? "");
+  const data = await getPlayerById(id);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function listPlayerController(req: Request, res: Response) {
