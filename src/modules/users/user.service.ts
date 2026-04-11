@@ -17,9 +17,9 @@ export async function createUser(
     permissions: string[];
   }
 ) {
-  // Role checks
-  if (creatorRole === "sub_admin") {
-    throw new AppError("auth_error", "Sub admins cannot create users", 403);
+  // Role checks (route layer enforces sub_admin.add etc.)
+  if (creatorRole === "sub_admin" && data.role !== "sub_admin") {
+    throw new AppError("auth_error", "Sub admins can only create sub admins", 403);
   }
 
   if (creatorRole === "admin" && data.role !== "sub_admin") {
@@ -80,10 +80,6 @@ export async function listUsers(
     username?: string;
   }
 ) {
-  if (creatorRole === "sub_admin") {
-    throw new AppError("auth_error", "Sub admins cannot list users", 403);
-  }
-
   const { page = 1, limit = 20, q, status, role, sortBy = "createdAt", sortOrder = "DESC", fullName, email, username } = query;
 
   const mongoQuery: any = {};
@@ -95,7 +91,11 @@ export async function listUsers(
     ];
   }
   if (status) mongoQuery.status = status;
-  if (role) mongoQuery.role = role;
+  if (creatorRole === "sub_admin") {
+    mongoQuery.role = "sub_admin";
+  } else if (role) {
+    mongoQuery.role = role;
+  }
   if (fullName) mongoQuery.fullName = { $regex: fullName, $options: "i" };
   if (email) mongoQuery.email = { $regex: email, $options: "i" };
   if (username) mongoQuery.username = { $regex: username, $options: "i" };
@@ -136,10 +136,6 @@ export async function exportUsers(
     username?: string;
   }
 ) {
-  if (creatorRole === "sub_admin") {
-    throw new AppError("auth_error", "Sub admins cannot list users", 403);
-  }
-
   const { q, status, role, fullName, email, username } = query;
 
   const mongoQuery: any = {};
@@ -151,7 +147,11 @@ export async function exportUsers(
     ];
   }
   if (status) mongoQuery.status = status;
-  if (role) mongoQuery.role = role;
+  if (creatorRole === "sub_admin") {
+    mongoQuery.role = "sub_admin";
+  } else if (role) {
+    mongoQuery.role = role;
+  }
   if (fullName) mongoQuery.fullName = { $regex: fullName, $options: "i" };
   if (email) mongoQuery.email = { $regex: email, $options: "i" };
   if (username) mongoQuery.username = { $regex: username, $options: "i" };
@@ -189,15 +189,19 @@ export async function updateUser(
     permissions: string[];
   }>
 ) {
-  if (creatorRole === "sub_admin") {
-    throw new AppError("auth_error", "Sub admins cannot update users", 403);
-  }
-
   const user = await UserModel.findById(id);
   if (!user) throw new AppError("not_found", "User not found", 404);
 
+  if (creatorRole === "sub_admin" && user.role !== "sub_admin") {
+    throw new AppError("auth_error", "Sub admins can only update sub admins", 403);
+  }
+
   if (creatorRole === "admin" && user.role !== "sub_admin") {
     throw new AppError("auth_error", "Admins can only update sub admins", 403);
+  }
+
+  if (creatorRole === "sub_admin" && data.role !== undefined) {
+    throw new AppError("auth_error", "Sub admins cannot change user role", 403);
   }
 
   if (data.email && data.email !== user.email) {
@@ -233,12 +237,12 @@ export async function updateUser(
 }
 
 export async function deleteUser(creatorRole: string, id: string) {
-  if (creatorRole === "sub_admin") {
-    throw new AppError("auth_error", "Sub admins cannot delete users", 403);
-  }
-
   const user = await UserModel.findById(id);
   if (!user) throw new AppError("not_found", "User not found", 404);
+
+  if (creatorRole === "sub_admin" && user.role !== "sub_admin") {
+    throw new AppError("auth_error", "Sub admins can only delete sub admins", 403);
+  }
 
   if (creatorRole === "admin" && user.role !== "sub_admin") {
     throw new AppError("auth_error", "Admins can only delete sub admins", 403);
@@ -249,12 +253,12 @@ export async function deleteUser(creatorRole: string, id: string) {
 }
 
 export async function resetUserPassword(creatorRole: string, id: string, newPasswordRaw: string) {
-  if (creatorRole === "sub_admin") {
-    throw new AppError("auth_error", "Sub admins cannot change other users' passwords", 403);
-  }
-
   const user = await UserModel.findById(id);
   if (!user) throw new AppError("not_found", "User not found", 404);
+
+  if (creatorRole === "sub_admin" && user.role !== "sub_admin") {
+    throw new AppError("auth_error", "Sub admins can only change passwords of sub admins", 403);
+  }
 
   if (creatorRole === "admin" && user.role !== "sub_admin") {
     throw new AppError("auth_error", "Admins can only change passwords of sub admins", 403);
@@ -266,6 +270,6 @@ export async function resetUserPassword(creatorRole: string, id: string, newPass
 }
 
 export async function listPermissions() {
-  const rows = await PermissionModel.find({}).sort({ module: 1, action: 1 });
+  const rows = await PermissionModel.find({ module: { $ne: "masters" } }).sort({ module: 1, action: 1 });
   return rows;
 }

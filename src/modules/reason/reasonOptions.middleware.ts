@@ -2,6 +2,7 @@ import { NextFunction, Request, Response } from "express";
 import { AppError } from "../../shared/errors/AppError";
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import { REASON_TYPES, type RejectionReasonType } from "../../shared/constants/reasonTypes";
+import { hasJwtPermission } from "../../shared/middlewares/permissionAccess";
 
 const REASON_TYPE_PERMISSION: Record<RejectionReasonType, string> = {
   [REASON_TYPES.DEPOSIT_EXCHANGE_REJECT]: PERMISSIONS.DEPOSIT_EXCHANGE,
@@ -17,8 +18,7 @@ export function reasonOptionsPermissionMiddleware(req: Request, _res: Response, 
   if (!required) {
     return next(new AppError("validation_error", "Invalid or missing reasonType", 400));
   }
-  const permissions = req.user?.permissions ?? [];
-  if (!permissions.includes(required)) {
+  if (!hasJwtPermission(req, required)) {
     return next(new AppError("auth_error", "Forbidden", 403));
   }
   return next();

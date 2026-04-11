@@ -20,6 +20,20 @@ export async function bootstrapData() {
     await PermissionModel.updateOne({ key: item.key }, item, { upsert: true });
   }
 
+  const obsoletePermissionKeys = [
+    "bank.edit",
+    "deposit.banker_edit",
+    "deposit.banker_list",
+    "deposit.final_edit",
+    "withdrawal.exchange_edit",
+    "withdrawal.exchange_list",
+    "withdrawal.banker_list",
+    "withdrawal.final_edit",
+    "expense.master_list",
+    "expense.edit",
+  ] as const;
+  await PermissionModel.deleteMany({ key: { $in: obsoletePermissionKeys } });
+
   const superadmin = await UserModel.findOne({ role: "superadmin" });
   if (!superadmin) {
     const passwordHash = await bcrypt.hash("SuperAdmin@123", 10);

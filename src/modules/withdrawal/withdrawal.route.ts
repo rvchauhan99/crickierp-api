@@ -32,7 +32,7 @@ withdrawalRouter.post(
 
 withdrawalRouter.get(
   "/player/:playerId/saved-accounts",
-  permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE_LIST),
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE),
   listSavedAccountsController,
 );
 

@@ -4,7 +4,8 @@ type EnvConfig = {
   mongoUri: string;
   jwtAccessSecret: string;
   jwtRefreshSecret: string;
-  corsOrigin: string;
+  /** Allowlist: one or more origins from `CORS_ORIGIN` (comma-separated). */
+  corsOrigin: string[];
   cookieSecure: boolean;
   cookieDomain?: string;
 
@@ -29,13 +30,24 @@ function required(name: string, fallback?: string): string {
   return value;
 }
 
+function parseCorsOrigin(raw: string | undefined): string[] {
+  const fallback = ["http://localhost:3000"];
+  if (!raw?.trim()) return fallback;
+  const parts = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return fallback;
+  return [...new Set(parts)];
+}
+
 export const env: EnvConfig = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   port: Number(process.env.PORT ?? 4000),
   mongoUri: required("MONGO_URI", "mongodb://127.0.0.1:27017/crickierp"),
   jwtAccessSecret: required("JWT_ACCESS_SECRET", "change_me_access_secret"),
   jwtRefreshSecret: required("JWT_REFRESH_SECRET", "change_me_refresh_secret"),
-  corsOrigin: process.env.CORS_ORIGIN ?? "http://localhost:3000",
+  corsOrigin: parseCorsOrigin(process.env.CORS_ORIGIN),
   cookieSecure: (process.env.COOKIE_SECURE ?? "false") === "true",
   cookieDomain: process.env.COOKIE_DOMAIN,
   

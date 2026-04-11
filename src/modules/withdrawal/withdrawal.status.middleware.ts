@@ -1,14 +1,14 @@
 import { NextFunction, Request, Response } from "express";
 import { AppError } from "../../shared/errors/AppError";
 import { PERMISSIONS } from "../../shared/constants/permissions";
+import { hasJwtPermission } from "../../shared/middlewares/permissionAccess";
 
 /** finalize: final edit; reject: exchange or final edit */
 export function withdrawalStatusPermissionMiddleware(req: Request, _res: Response, next: NextFunction) {
   const status = req.body?.status as string | undefined;
-  const permissions = req.user?.permissions ?? [];
 
   if (status === "finalized") {
-    if (!permissions.includes(PERMISSIONS.WITHDRAWAL_FINAL_EDIT)) {
+    if (!hasJwtPermission(req, PERMISSIONS.WITHDRAWAL_FINAL_VIEW)) {
       return next(new AppError("auth_error", "Forbidden", 403));
     }
     return next();
@@ -16,9 +16,9 @@ export function withdrawalStatusPermissionMiddleware(req: Request, _res: Respons
 
   if (status === "rejected") {
     if (
-      !permissions.includes(PERMISSIONS.WITHDRAWAL_EXCHANGE_EDIT) &&
-      !permissions.includes(PERMISSIONS.WITHDRAWAL_FINAL_EDIT) &&
-      !permissions.includes(PERMISSIONS.WITHDRAWAL_BANKER)
+      !hasJwtPermission(req, PERMISSIONS.WITHDRAWAL_EXCHANGE) &&
+      !hasJwtPermission(req, PERMISSIONS.WITHDRAWAL_FINAL_VIEW) &&
+      !hasJwtPermission(req, PERMISSIONS.WITHDRAWAL_BANKER)
     ) {
       return next(new AppError("auth_error", "Forbidden", 403));
     }

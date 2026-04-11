@@ -1,3 +1,4 @@
+import "dotenv/config";
 import mongoose from "mongoose";
 import { connectDb } from "../shared/db/connect";
 import { bootstrapData } from "../shared/db/bootstrap";

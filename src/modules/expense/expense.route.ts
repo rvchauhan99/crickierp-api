@@ -35,7 +35,7 @@ expenseRouter.post(
 
 expenseRouter.patch(
   "/:id",
-  permissionMiddleware(PERMISSIONS.EXPENSE_EDIT),
+  permissionMiddleware(PERMISSIONS.EXPENSE_LIST),
   validate({ body: updateExpenseBodySchema }),
   updateExpenseController,
 );
