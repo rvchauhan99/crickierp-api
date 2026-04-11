@@ -6,6 +6,8 @@ export const createDepositBodySchema = z.object({
   amount: z.number().min(1),
 });
 
+export const updateDepositBodySchema = createDepositBodySchema;
+
 export const listDepositQuerySchema = z.object({
   view: z.enum(["banker", "exchange", "final"]).default("banker"),
   search: z.string().optional(),

@@ -8,12 +8,14 @@ import {
   exchangeActionController,
   exportDepositController,
   listDepositController,
+  updateDepositController,
 } from "./deposit.controller";
 import { depositListPermissionMiddleware } from "./deposit.list.middleware";
 import {
   createDepositBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
+  updateDepositBodySchema,
 } from "./deposit.validation";
 
 const depositRouter = Router();
@@ -25,6 +27,13 @@ depositRouter.post(
   permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
   validate({ body: createDepositBodySchema }),
   createDepositController,
+);
+
+depositRouter.put(
+  "/:id",
+  permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
+  validate({ body: updateDepositBodySchema }),
+  updateDepositController,
 );
 
 depositRouter.get(

@@ -6,17 +6,26 @@ import {
   exchangeRejectDeposit,
   exportDepositsToBuffer,
   listDeposits,
+  updateDepositByBanker,
 } from "./deposit.service";
 import {
   createDepositBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
+  updateDepositBodySchema,
 } from "./deposit.validation";
 
 export async function createDepositController(req: Request, res: Response) {
   const body = createDepositBodySchema.parse(req.body);
   const data = await createDeposit(body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
+}
+
+export async function updateDepositController(req: Request, res: Response) {
+  const body = updateDepositBodySchema.parse(req.body);
+  const id = String(req.params.id);
+  const data = await updateDepositByBanker(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function listDepositController(req: Request, res: Response) {

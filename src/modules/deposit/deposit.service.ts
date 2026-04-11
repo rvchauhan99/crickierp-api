@@ -1,4 +1,4 @@
-import mongoose, { Types } from "mongoose";
+import { Types } from "mongoose";
 import type { z } from "zod";
 import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
@@ -159,14 +159,17 @@ function buildDepositListFilter(q: ListDepositQuery): Record<string, unknown> {
   }
 
   let statusFilter = trimUndef(q.status);
-  if (statusFilter == null && (q.view === "banker" || q.view === "exchange")) {
+  /** `all` = no status constraint (banker/exchange). Missing/empty still defaults to pending below. */
+  const statusShowAll = statusFilter === "all";
+  if (!statusShowAll && statusFilter == null && (q.view === "banker" || q.view === "exchange")) {
     statusFilter = "pending";
   }
   if (
-    statusFilter === "pending" ||
-    statusFilter === "verified" ||
-    statusFilter === "rejected" ||
-    statusFilter === "finalized"
+    !statusShowAll &&
+    (statusFilter === "pending" ||
+      statusFilter === "verified" ||
+      statusFilter === "rejected" ||
+      statusFilter === "finalized")
   ) {
     conditions.push({ status: statusFilter });
   }
@@ -239,12 +242,25 @@ function bankDisplayName(b: { holderName: string; bankName: string; accountNumbe
   return `${b.holderName} - ${b.bankName} - ${last4}`;
 }
 
+/** UTR must be unique among non-rejected deposits; rejected rows do not block reuse. */
+async function utrConflictsWithNonRejected(utr: string, excludeId?: Types.ObjectId) {
+  const trimmed = utr.trim();
+  const filter: { utr: string; status: { $ne: string }; _id?: { $ne: Types.ObjectId } } = {
+    utr: trimmed,
+    status: { $ne: "rejected" },
+  };
+  if (excludeId) {
+    filter._id = { $ne: excludeId };
+  }
+  return DepositModel.findOne(filter);
+}
+
 export async function createDeposit(
   input: { bankId: string; utr: string; amount: number },
   actorId: string,
   requestId?: string,
 ) {
-  const exists = await DepositModel.findOne({ utr: input.utr });
+  const exists = await utrConflictsWithNonRejected(input.utr);
   if (exists) throw new AppError("business_rule_error", "UTR already exists", 409);
 
   const bank = await BankModel.findById(input.bankId);
@@ -272,6 +288,58 @@ export async function createDeposit(
     } as unknown as Record<string, unknown>,
     requestId,
   });
+  return doc;
+}
+
+export async function updateDepositByBanker(
+  id: string,
+  input: { bankId: string; utr: string; amount: number },
+  actorId: string,
+  requestId?: string,
+) {
+  const doc = await DepositModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+  if (doc.status !== "pending") {
+    throw new AppError("business_rule_error", "Only pending deposits can be updated", 400);
+  }
+
+  const utrTrim = input.utr.trim();
+  if (utrTrim !== doc.utr) {
+    const exists = await utrConflictsWithNonRejected(utrTrim, doc._id);
+    if (exists) throw new AppError("business_rule_error", "UTR already exists", 409);
+  }
+
+  const bank = await BankModel.findById(input.bankId);
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+  if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+  const prev = {
+    bankId: doc.bankId?.toString(),
+    bankName: doc.bankName,
+    utr: doc.utr,
+    amount: doc.amount,
+  };
+
+  doc.bankId = new Types.ObjectId(input.bankId);
+  doc.bankName = bankDisplayName(bank);
+  doc.utr = utrTrim;
+  doc.amount = input.amount;
+  await doc.save();
+
+  await createAuditLog({
+    actorId,
+    action: "deposit.banker_update",
+    entity: "deposit",
+    entityId: doc._id.toString(),
+    oldValue: prev as unknown as Record<string, unknown>,
+    newValue: {
+      bankId: input.bankId,
+      utr: utrTrim,
+      amount: input.amount,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
   return doc;
 }
 
@@ -362,31 +430,29 @@ export async function exchangeApproveDeposit(
     throw new AppError("validation_error", "Invalid bonus amount", 400);
   }
 
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  const doc = await DepositModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+  if (doc.status !== "pending") {
+    throw new AppError("business_rule_error", "Deposit is not pending exchange action", 400);
+  }
+  if (!doc.bankId) {
+    throw new AppError("business_rule_error", "Deposit has no bank linked", 400);
+  }
+
+  const playerDoc = await PlayerModel.findById(input.playerId);
+  if (!playerDoc) throw new AppError("not_found", "Player not found", 404);
+
+  const totalAmount = doc.amount + bonus;
+  const bank = await BankModel.findById(doc.bankId);
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+
+  const prev = bank.currentBalance ?? bank.openingBalance;
+  const bankBalanceAfter = prev + totalAmount;
+
+  bank.currentBalance = bankBalanceAfter;
+  await bank.save();
+
   try {
-    const doc = await DepositModel.findById(id).session(session);
-    if (!doc) throw new AppError("not_found", "Deposit not found", 404);
-    if (doc.status !== "pending") {
-      throw new AppError("business_rule_error", "Deposit is not pending exchange action", 400);
-    }
-    if (!doc.bankId) {
-      throw new AppError("business_rule_error", "Deposit has no bank linked", 400);
-    }
-
-    const playerDoc = await PlayerModel.findById(input.playerId).session(session);
-    if (!playerDoc) throw new AppError("not_found", "Player not found", 404);
-
-    const totalAmount = doc.amount + bonus;
-    const bank = await BankModel.findById(doc.bankId).session(session);
-    if (!bank) throw new AppError("not_found", "Bank not found", 404);
-
-    const prev = bank.currentBalance ?? bank.openingBalance;
-    const bankBalanceAfter = prev + totalAmount;
-
-    bank.currentBalance = bankBalanceAfter;
-    await bank.save({ session });
-
     doc.status = "verified" as DepositStatus;
     doc.player = new Types.ObjectId(input.playerId);
     doc.bonusAmount = bonus;
@@ -395,30 +461,28 @@ export async function exchangeApproveDeposit(
     doc.exchangeActionAt = new Date();
     doc.bankBalanceAfter = bankBalanceAfter;
     doc.settledAt = new Date();
-    await doc.save({ session });
-
-    await createAuditLog({
-      actorId,
-      action: "deposit.exchange_approve",
-      entity: "deposit",
-      entityId: doc._id.toString(),
-      newValue: {
-        playerId: input.playerId,
-        bonusAmount: bonus,
-        totalAmount,
-        bankBalanceAfter,
-      },
-      requestId,
-    });
-
-    await session.commitTransaction();
-    return doc;
+    await doc.save();
   } catch (err) {
-    await session.abortTransaction();
+    bank.currentBalance = prev;
+    await bank.save();
     throw err;
-  } finally {
-    session.endSession();
   }
+
+  await createAuditLog({
+    actorId,
+    action: "deposit.exchange_approve",
+    entity: "deposit",
+    entityId: doc._id.toString(),
+    newValue: {
+      playerId: input.playerId,
+      bonusAmount: bonus,
+      totalAmount,
+      bankBalanceAfter,
+    },
+    requestId,
+  });
+
+  return doc;
 }
 
 export async function exchangeRejectDeposit(

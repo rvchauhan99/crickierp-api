@@ -28,7 +28,7 @@ const depositSchema = new Schema<DepositDocument>(
   {
     bankId: { type: Schema.Types.ObjectId, ref: "Bank" },
     bankName: { type: String, trim: true, default: "" },
-    utr: { type: String, required: true, trim: true, unique: true },
+    utr: { type: String, required: true, trim: true },
     amount: { type: Number, required: true, min: 1 },
     status: {
       type: String,
@@ -46,6 +46,12 @@ const depositSchema = new Schema<DepositDocument>(
     settledAt: { type: Date },
   },
   { timestamps: true },
+);
+
+/** Uniqueness only for non-rejected deposits so a UTR may repeat on rejected rows. */
+depositSchema.index(
+  { utr: 1 },
+  { unique: true, partialFilterExpression: { status: { $ne: "rejected" } } },
 );
 
 export const DepositModel = model<DepositDocument>("Deposit", depositSchema);
