@@ -47,7 +47,7 @@ exchangeRouter.get(
 );
 exchangeRouter.patch(
   "/:id",
-  permissionMiddleware(PERMISSIONS.EXCHANGE_EDIT),
+  permissionMiddleware(PERMISSIONS.EXCHANGE_LIST),
   validate({ params: exchangeIdParamSchema, body: updateExchangeBodySchema }),
   updateExchangeController,
 );

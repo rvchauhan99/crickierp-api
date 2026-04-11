@@ -21,6 +21,8 @@ export async function bootstrapData() {
   }
 
   const obsoletePermissionKeys = [
+    "exchange.edit",
+    "player.edit",
     "bank.edit",
     "deposit.banker_edit",
     "deposit.banker_list",
