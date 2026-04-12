@@ -35,20 +35,286 @@ function buildDateFilter(query: DateRangeQuery) {
   return { createdAt };
 }
 
+/** Format a Date to YYYY-MM-DD string */
+function formatYMD(d: Date): string {
+  return d.toISOString().split("T")[0];
+}
+
+/** Generate an array of YYYY-MM-DD strings between two dates (inclusive) */
+function dateRange(from: Date, to: Date): string[] {
+  const days: string[] = [];
+  const cur = new Date(from);
+  cur.setHours(0, 0, 0, 0);
+  const end = new Date(to);
+  end.setHours(23, 59, 59, 999);
+  while (cur <= end) {
+    days.push(formatYMD(cur));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return days;
+}
+
 export async function getDashboardSummary(query: DateRangeQuery) {
-  const filter = buildDateFilter(query);
-  const [totalExchanges, activeExchanges, totalUsers, recentAudits] = await Promise.all([
-    ExchangeModel.countDocuments({ ...filter }),
-    ExchangeModel.countDocuments({ ...filter, status: "active" }),
+  const { DepositModel } = await import("../deposit/deposit.model");
+  const { WithdrawalModel } = await import("../withdrawal/withdrawal.model");
+
+  const dateFilter = buildDateFilter(query);
+
+  /* ── Raw aggregation promises ──────────────────────────────────── */
+  const [
+    depositAgg,
+    withdrawalAgg,
+    expenseAgg,
+    exchangeStats,
+    totalUsers,
+    recentDeposits,
+    recentWithdrawals,
+    depositTrend,
+    withdrawalTrend,
+  ] = await Promise.all([
+    // Deposit: group by status → totalAmount, count, bonusTotal
+    DepositModel.aggregate([
+      { $match: { ...dateFilter } },
+      {
+        $group: {
+          _id: "$status",
+          totalAmount: { $sum: "$amount" },
+          bonusTotal: { $sum: { $ifNull: ["$bonusAmount", 0] } },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+
+    // Withdrawal: group by status → totalAmount, payableAmount, count
+    WithdrawalModel.aggregate([
+      { $match: { ...dateFilter } },
+      {
+        $group: {
+          _id: "$status",
+          totalAmount: { $sum: "$amount" },
+          payableTotal: { $sum: { $ifNull: ["$payableAmount", 0] } },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+
+    // Expense: group by status
+    ExpenseModel.aggregate([
+      { $match: { ...dateFilter } },
+      {
+        $group: {
+          _id: "$status",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+
+    // Exchange active/total
+    Promise.all([
+      ExchangeModel.countDocuments({}),
+      ExchangeModel.countDocuments({ status: "active" }),
+    ]),
+
+    // Total active users
     UserModel.countDocuments({ status: "active" }),
-    AuditLogModel.countDocuments({ ...filter }),
+
+    // Recent deposits (last 10, all statuses)
+    DepositModel.find({ ...dateFilter })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .populate("player", "playerId name")
+      .populate("createdBy", "fullName username")
+      .lean(),
+
+    // Recent withdrawals (last 10, all statuses)
+    WithdrawalModel.find({ ...dateFilter })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .populate("player", "playerId name")
+      .populate("createdBy", "fullName username")
+      .lean(),
+
+    // Deposit daily trend
+    DepositModel.aggregate([
+      { $match: { ...dateFilter, status: { $ne: "rejected" } } },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+          },
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+
+    // Withdrawal daily trend
+    WithdrawalModel.aggregate([
+      { $match: { ...dateFilter, status: { $ne: "rejected" } } },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+          },
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
   ]);
 
+  /* ── Aggregate deposit KPIs ────────────────────────────────────── */
+  let depositTotal = 0, depositCount = 0, depositPendingCount = 0,
+    depositPendingAmount = 0, depositVerifiedAmount = 0, depositVerifiedCount = 0,
+    depositRejectedCount = 0, bonusTotal = 0;
+
+  for (const row of depositAgg) {
+    depositTotal += row.totalAmount ?? 0;
+    depositCount += row.count ?? 0;
+    bonusTotal += row.bonusTotal ?? 0;
+    if (row._id === "pending") {
+      depositPendingCount = row.count ?? 0;
+      depositPendingAmount = row.totalAmount ?? 0;
+    }
+    if (row._id === "verified" || row._id === "finalized") {
+      depositVerifiedAmount += row.totalAmount ?? 0;
+      depositVerifiedCount += row.count ?? 0;
+    }
+    if (row._id === "rejected") {
+      depositRejectedCount = row.count ?? 0;
+    }
+  }
+
+  /* ── Aggregate withdrawal KPIs ─────────────────────────────────── */
+  let withdrawalTotal = 0, withdrawalCount = 0, withdrawalPendingCount = 0,
+    withdrawalPendingAmount = 0, withdrawalFinalizedAmount = 0,
+    withdrawalFinalizedCount = 0, withdrawalRejectedCount = 0;
+
+  for (const row of withdrawalAgg) {
+    withdrawalTotal += row.totalAmount ?? 0;
+    withdrawalCount += row.count ?? 0;
+    if (row._id === "requested") {
+      withdrawalPendingCount = row.count ?? 0;
+      withdrawalPendingAmount = row.totalAmount ?? 0;
+    }
+    if (row._id === "finalized") {
+      withdrawalFinalizedAmount = row.totalAmount ?? 0;
+      withdrawalFinalizedCount = row.count ?? 0;
+    }
+    if (row._id === "rejected") {
+      withdrawalRejectedCount = row.count ?? 0;
+    }
+  }
+
+  /* ── Aggregate expense KPIs ────────────────────────────────────── */
+  let expenseTotal = 0, expenseCount = 0, expensePendingCount = 0,
+    expenseApprovedAmount = 0;
+
+  for (const row of expenseAgg) {
+    expenseTotal += row.totalAmount ?? 0;
+    expenseCount += row.count ?? 0;
+    if (row._id === "pending_audit") expensePendingCount = row.count ?? 0;
+    if (row._id === "approved") expenseApprovedAmount = row.totalAmount ?? 0;
+  }
+
+  /* ── P&L calculations ──────────────────────────────────────────── */
+  const grossPL = depositVerifiedAmount - withdrawalFinalizedAmount;
+  const netPL = grossPL - expenseApprovedAmount;
+
+  /* ── Exchange stats ────────────────────────────────────────────── */
+  const [exchangeTotal, exchangeActive] = exchangeStats;
+
+  /* ── Build daily trend (fill missing days with 0) ──────────────── */
+  const fromDate = query.fromDate ? new Date(query.fromDate) : (() => { const d = new Date(); d.setDate(d.getDate() - 29); return d; })();
+  const toDate = query.toDate ? new Date(query.toDate) : new Date();
+  const allDays = dateRange(fromDate, toDate);
+
+  const depositTrendMap = new Map(depositTrend.map((r: { _id: string; totalAmount: number; count: number }) => [r._id, r]));
+  const withdrawalTrendMap = new Map(withdrawalTrend.map((r: { _id: string; totalAmount: number; count: number }) => [r._id, r]));
+
+  const trendData = allDays.map((day) => {
+    const dep = depositTrendMap.get(day) as { totalAmount: number; count: number } | undefined;
+    const wth = withdrawalTrendMap.get(day) as { totalAmount: number; count: number } | undefined;
+    return {
+      date: day,
+      depositAmount: dep?.totalAmount ?? 0,
+      depositCount: dep?.count ?? 0,
+      withdrawalAmount: wth?.totalAmount ?? 0,
+      withdrawalCount: wth?.count ?? 0,
+    };
+  });
+
+  /* ── Recent activity (merge + sort) ───────────────────────────── */
+  type AnyRow = Record<string, unknown>;
+  const recentActivity = [
+    ...(recentDeposits as unknown as AnyRow[]).map((d) => ({
+      _id: String(d._id),
+      type: "deposit" as const,
+      amount: Number(d.amount ?? 0),
+      status: String(d.status ?? ""),
+      playerName: (d.player as AnyRow | undefined)?.name ?? d.playerName ?? "",
+      createdBy: (d.createdBy as AnyRow | undefined)?.fullName ?? "",
+      bankName: String(d.bankName ?? ""),
+      utr: String(d.utr ?? ""),
+      createdAt: d.createdAt,
+    })),
+    ...(recentWithdrawals as unknown as AnyRow[]).map((w) => ({
+      _id: String(w._id),
+      type: "withdrawal" as const,
+      amount: Number(w.amount ?? 0),
+      status: String(w.status ?? ""),
+      playerName: String(w.playerName ?? ""),
+      createdBy: (w.createdBy as AnyRow | undefined)?.fullName ?? "",
+      bankName: String(w.bankName ?? ""),
+      utr: String(w.utr ?? ""),
+      createdAt: w.createdAt,
+    })),
+  ]
+    .sort((a, b) => new Date(b.createdAt as string).getTime() - new Date(a.createdAt as string).getTime())
+    .slice(0, 20);
+
   return {
-    totalExchanges,
-    activeExchanges,
-    totalUsers,
-    auditEvents: recentAudits,
+    deposit: {
+      totalAmount: depositTotal,
+      totalCount: depositCount,
+      pendingCount: depositPendingCount,
+      pendingAmount: depositPendingAmount,
+      verifiedAmount: depositVerifiedAmount,
+      verifiedCount: depositVerifiedCount,
+      rejectedCount: depositRejectedCount,
+      bonusTotal,
+    },
+    withdrawal: {
+      totalAmount: withdrawalTotal,
+      totalCount: withdrawalCount,
+      pendingCount: withdrawalPendingCount,
+      pendingAmount: withdrawalPendingAmount,
+      finalizedAmount: withdrawalFinalizedAmount,
+      finalizedCount: withdrawalFinalizedCount,
+      rejectedCount: withdrawalRejectedCount,
+    },
+    expense: {
+      totalAmount: expenseTotal,
+      totalCount: expenseCount,
+      pendingCount: expensePendingCount,
+      approvedAmount: expenseApprovedAmount,
+    },
+    pnl: {
+      gross: grossPL,
+      net: netPL,
+    },
+    exchanges: {
+      total: exchangeTotal,
+      active: exchangeActive,
+    },
+    users: {
+      total: totalUsers,
+    },
+    trendData,
+    recentActivity,
   };
 }
 

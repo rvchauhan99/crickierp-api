@@ -4,6 +4,7 @@ import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
+import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExpenseModel } from "../expense/expense.model";
 import { BankModel } from "./bank.model";
 import { listBankQuerySchema } from "./bank.validation";
@@ -317,6 +318,7 @@ export async function exportBanksToBuffer(query: ListBankQuery): Promise<Buffer>
 type LedgerQuery = {
   fromDate?: string;
   toDate?: string;
+  entryType?: "all" | "deposit" | "withdrawal" | "expense";
 };
 
 function ledgerYmdStart(ymd: string): Date | null {
@@ -337,13 +339,19 @@ function depositEventTime(d: { settledAt?: Date; createdAt?: Date }): Date {
   return new Date(0);
 }
 
+function withdrawalEventTime(w: { updatedAt?: Date; createdAt?: Date }): Date {
+  if (w.updatedAt) return new Date(w.updatedAt);
+  if (w.createdAt) return new Date(w.createdAt);
+  return new Date(0);
+}
+
 function expenseEventTime(e: { approvedAt?: Date; createdAt?: Date }): Date {
   if (e.approvedAt) return new Date(e.approvedAt);
   if (e.createdAt) return new Date(e.createdAt);
   return new Date(0);
 }
 
-/** Merged deposit credits and approved expense debits for a bank account (chronological ledger). */
+/** Merged deposit credits, withdrawal debits, and approved expense debits for a bank account (chronological ledger). */
 export async function getBankLedger(bankId: string, query: LedgerQuery) {
   if (!Types.ObjectId.isValid(bankId)) {
     throw new AppError("validation_error", "Invalid bank id", 400);
@@ -356,9 +364,17 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
   const to = query.toDate?.trim();
   const fromD = from ? ledgerYmdStart(from) : null;
   const toD = to ? ledgerYmdEnd(to) : null;
+  const entryType = query.entryType || "all";
 
-  const [allDeposits, allExpenses] = await Promise.all([
-    DepositModel.find({ bankId: bid, status: "verified" }).lean(),
+  const [allDeposits, allWithdrawals, allExpenses] = await Promise.all([
+    DepositModel.find({ bankId: bid, status: "verified" })
+      .populate("player", "name")
+      .populate("createdBy", "fullName")
+      .lean(),
+    WithdrawalModel.find({ payoutBankId: bid, status: "finalized" })
+      .populate("player", "name")
+      .populate("createdBy", "fullName")
+      .lean(),
     ExpenseModel.find({ bankId: bid, status: "approved" }).lean(),
   ]);
 
@@ -367,7 +383,14 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
     for (const d of allDeposits) {
       const at = depositEventTime(d);
       if (at >= fromD) continue;
-      priorNet += d.totalAmount ?? d.amount;
+      // Bonus is OFF balance sheet
+      priorNet += d.amount;
+    }
+    for (const w of allWithdrawals) {
+      const at = withdrawalEventTime(w);
+      if (at >= fromD) continue;
+      // Bonus is OFF balance sheet, so liability is what actually went out
+      priorNet -= w.payableAmount ?? w.amount;
     }
     for (const e of allExpenses) {
       const at = expenseEventTime(e);
@@ -378,6 +401,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
 
   type Ev =
     | { kind: "deposit"; t: number; doc: (typeof allDeposits)[0] }
+    | { kind: "withdrawal"; t: number; doc: (typeof allWithdrawals)[0] }
     | { kind: "expense"; t: number; doc: (typeof allExpenses)[0] };
 
   const events: Ev[] = [];
@@ -385,43 +409,104 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
     const at = depositEventTime(d);
     if (fromD && at < fromD) continue;
     if (toD && at > toD) continue;
-    events.push({ kind: "deposit", t: at.getTime(), doc: d });
+    if (entryType === "all" || entryType === "deposit") {
+      events.push({ kind: "deposit", t: at.getTime(), doc: d });
+    }
+  }
+  for (const w of allWithdrawals) {
+    const at = withdrawalEventTime(w);
+    if (fromD && at < fromD) continue;
+    if (toD && at > toD) continue;
+    if (entryType === "all" || entryType === "withdrawal") {
+      events.push({ kind: "withdrawal", t: at.getTime(), doc: w });
+    }
   }
   for (const e of allExpenses) {
     const at = expenseEventTime(e);
     if (fromD && at < fromD) continue;
     if (toD && at > toD) continue;
-    events.push({ kind: "expense", t: at.getTime(), doc: e });
+    if (entryType === "all" || entryType === "expense") {
+      events.push({ kind: "expense", t: at.getTime(), doc: e });
+    }
   }
   events.sort((a, b) => a.t - b.t);
 
-  let running = bank.openingBalance + priorNet;
+  const periodOpeningBalance = bank.openingBalance + priorNet;
+  let running = periodOpeningBalance;
+  let totalCredits = 0;
+  let totalDebits = 0;
+  let totalBonusGiven = 0;
+  let totalBonusReversed = 0;
 
   const rows = events.map((ev) => {
     if (ev.kind === "deposit") {
       const d = ev.doc;
-      const amt = d.totalAmount ?? d.amount;
+      const amt = d.amount; // Base amount only (cash in bank)
+      const bonus = d.bonusAmount ?? 0;
       running += amt;
+      totalCredits += amt;
+      totalBonusGiven += bonus;
+      
+      const playerObj = d.player as { name?: string } | undefined;
+      const createdByObj = d.createdBy as { fullName?: string } | undefined;
+
       return {
         kind: "deposit" as const,
         refId: d._id.toString(),
         at: new Date(ev.t).toISOString(),
-        label: `Deposit · UTR ${d.utr}`,
+        label: `Deposit`,
+        utr: d.utr,
+        playerName: playerObj?.name ?? "",
+        createdByName: createdByObj?.fullName ?? "",
         amount: amt,
         direction: "credit" as const,
-        balanceAfter: d.bankBalanceAfter ?? running,
+        balanceAfter: running,
+        bonusMemo: bonus > 0 ? bonus : undefined,
       };
     }
+    
+    if (ev.kind === "withdrawal") {
+      const w = ev.doc;
+      const amt = w.payableAmount ?? w.amount; // Actual cash paid
+      const reversal = w.reverseBonus ?? 0;
+      running -= amt;
+      totalDebits += amt;
+      totalBonusReversed += reversal;
+
+      const playerObj = w.player as { name?: string } | undefined;
+      const createdByObj = w.createdBy as { fullName?: string } | undefined;
+
+      return {
+        kind: "withdrawal" as const,
+        refId: w._id.toString(),
+        at: new Date(ev.t).toISOString(),
+        label: `Withdrawal`,
+        utr: w.utr,
+        playerName: playerObj?.name ?? w.playerName ?? "",
+        createdByName: createdByObj?.fullName ?? "",
+        amount: amt,
+        direction: "debit" as const,
+        balanceAfter: running,
+        bonusMemo: reversal > 0 ? reversal : undefined,
+      };
+    }
+    
+    // expense
     const e = ev.doc;
     running -= e.amount;
+    totalDebits += e.amount;
     return {
       kind: "expense" as const,
       refId: e._id.toString(),
       at: new Date(ev.t).toISOString(),
       label: e.description?.trim() ? e.description.trim() : "Expense",
+      utr: undefined,
+      playerName: "",
+      createdByName: "",
       amount: e.amount,
       direction: "debit" as const,
-      balanceAfter: e.bankBalanceAfter ?? running,
+      balanceAfter: running,
+      bonusMemo: undefined,
     };
   });
 
@@ -434,7 +519,12 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       openingBalance: bank.openingBalance,
       currentBalance: bank.currentBalance ?? bank.openingBalance,
     },
-    periodOpeningBalance: bank.openingBalance + priorNet,
+    periodOpeningBalance,
+    periodClosingBalance: running,
+    totalCredits,
+    totalDebits,
+    totalBonusGiven,
+    totalBonusReversed,
     rows,
   };
 }
