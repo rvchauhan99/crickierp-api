@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "lint": "eslint .",
     "test": "jest --runInBand",
-    "db:reset": "tsx src/scripts/reset-database.ts"
+    "db:reset": "tsx src/scripts/reset-database.ts",
+    "db:migrate": "tsx src/scripts/run-migrations-once.ts"
   },
   "repository": {
     "type": "git",
