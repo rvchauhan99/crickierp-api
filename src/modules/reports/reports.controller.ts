@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
+  dashboardSummaryQuerySchema,
   expenseAnalysisRecordsQuerySchema,
   expenseAnalysisSummaryQuerySchema,
   transactionHistoryQuerySchema,
@@ -14,11 +15,8 @@ import {
 } from "./reports.service";
 
 export async function dashboardSummaryController(req: Request, res: Response) {
-  const raw = req.query as Record<string, unknown>;
-  const data = await getDashboardSummary({
-    fromDate: typeof raw.fromDate === "string" ? raw.fromDate : undefined,
-    toDate: typeof raw.toDate === "string" ? raw.toDate : undefined,
-  });
+  const query = dashboardSummaryQuerySchema.parse(req.query);
+  const data = await getDashboardSummary(query);
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 

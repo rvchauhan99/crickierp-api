@@ -6,11 +6,13 @@ import { UserModel } from "../users/user.model";
 import { ExpenseModel, type ExpenseStatus } from "../expense/expense.model";
 import { AUDIT_ENTITY_AUTH } from "../../shared/constants/auditEntities";
 import {
+  dashboardSummaryQuerySchema,
   expenseAnalysisFilterQuerySchema,
   expenseAnalysisRecordsQuerySchema,
   transactionHistoryQuerySchema,
 } from "./reports.validation";
 
+type DashboardSummaryQuery = z.infer<typeof dashboardSummaryQuerySchema>;
 type ExpenseAnalysisFilterQuery = z.infer<typeof expenseAnalysisFilterQuerySchema>;
 type ExpenseAnalysisRecordsQuery = z.infer<typeof expenseAnalysisRecordsQuerySchema>;
 type TransactionHistoryQuery = z.infer<typeof transactionHistoryQuerySchema>;
@@ -35,30 +37,208 @@ function buildDateFilter(query: DateRangeQuery) {
   return { createdAt };
 }
 
-/** Format a Date to YYYY-MM-DD string */
-function formatYMD(d: Date): string {
-  return d.toISOString().split("T")[0];
+const DASHBOARD_DEFAULT_DAYS = 30;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+function ymdToUtcStart(ymd: string): Date {
+  return new Date(`${ymd}T00:00:00.000Z`);
 }
 
-/** Generate an array of YYYY-MM-DD strings between two dates (inclusive) */
-function dateRange(from: Date, to: Date): string[] {
+function ymdToUtcEnd(ymd: string): Date {
+  return new Date(`${ymd}T23:59:59.999Z`);
+}
+
+function toYMDUtc(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function resolveDashboardRange(query: DashboardSummaryQuery): { fromDate: string; toDate: string } {
+  const today = new Date();
+  const todayYmd = toYMDUtc(today);
+
+  const toDate = query.toDate ?? todayYmd;
+  const fromDate =
+    query.fromDate ??
+    toYMDUtc(new Date(new Date(`${toDate}T00:00:00.000Z`).getTime() - (DASHBOARD_DEFAULT_DAYS - 1) * ONE_DAY_MS));
+
+  if (fromDate <= toDate) return { fromDate, toDate };
+  return { fromDate: toDate, toDate: fromDate };
+}
+
+function dateRangeYmd(fromDate: string, toDate: string): string[] {
+  const startMs = new Date(`${fromDate}T00:00:00.000Z`).getTime();
+  const endMs = new Date(`${toDate}T00:00:00.000Z`).getTime();
   const days: string[] = [];
-  const cur = new Date(from);
-  cur.setHours(0, 0, 0, 0);
-  const end = new Date(to);
-  end.setHours(23, 59, 59, 999);
-  while (cur <= end) {
-    days.push(formatYMD(cur));
-    cur.setDate(cur.getDate() + 1);
+  for (let cursor = startMs; cursor <= endMs; cursor += ONE_DAY_MS) {
+    days.push(toYMDUtc(new Date(cursor)));
   }
   return days;
 }
 
-export async function getDashboardSummary(query: DateRangeQuery) {
+type DashboardStatusFilter = "all" | "pending" | "approved" | "rejected";
+type DashboardTxnTypeFilter = "all" | "deposit" | "withdrawal" | "expense";
+
+type DashboardFilterContext = {
+  dateFilter: Record<string, unknown>;
+  appliedRange: { fromDate: string; toDate: string };
+  exchangeObjectId: Types.ObjectId | null;
+  scopedPlayerIds: Types.ObjectId[] | null;
+  depositFilter: Record<string, unknown>;
+  withdrawalFilter: Record<string, unknown>;
+  expenseFilter: Record<string, unknown>;
+  exchangeStatsFilter: Record<string, unknown>;
+};
+
+function statusFilterForDeposit(status: DashboardStatusFilter | undefined): Record<string, unknown> {
+  if (status === "pending") return { status: "pending" };
+  if (status === "approved") return { status: { $in: ["verified", "finalized"] } };
+  if (status === "rejected") return { status: "rejected" };
+  return {};
+}
+
+function statusFilterForWithdrawal(status: DashboardStatusFilter | undefined): Record<string, unknown> {
+  if (status === "pending") return { status: "requested" };
+  if (status === "approved") return { status: "approved" };
+  if (status === "rejected") return { status: "rejected" };
+  return {};
+}
+
+function statusFilterForExpense(status: DashboardStatusFilter | undefined): Record<string, unknown> {
+  if (status === "pending") return { status: "pending_audit" };
+  if (status === "approved") return { status: "approved" };
+  if (status === "rejected") return { status: "rejected" };
+  return {};
+}
+
+async function buildDashboardFilterContext(query: DashboardSummaryQuery): Promise<DashboardFilterContext> {
+  const appliedRange = resolveDashboardRange(query);
+  const dateFilter = {
+    createdAt: {
+      $gte: ymdToUtcStart(appliedRange.fromDate),
+      $lte: ymdToUtcEnd(appliedRange.toDate),
+    },
+  };
+
+  const exchangeObjectId =
+    query.exchangeId && Types.ObjectId.isValid(query.exchangeId) ? new Types.ObjectId(query.exchangeId) : null;
+  const playerObjectId =
+    query.playerId && Types.ObjectId.isValid(query.playerId) ? new Types.ObjectId(query.playerId) : null;
+  const bankObjectId = query.bankId && Types.ObjectId.isValid(query.bankId) ? new Types.ObjectId(query.bankId) : null;
+  const scopedPlayerIds = exchangeObjectId
+    ? await (await import("../player/player.model")).PlayerModel.distinct("_id", { exchange: exchangeObjectId })
+    : null;
+
+  const playerFilter =
+    scopedPlayerIds && playerObjectId
+      ? { player: { $in: scopedPlayerIds.filter((id) => id.equals(playerObjectId)) } }
+      : scopedPlayerIds
+        ? { player: { $in: scopedPlayerIds } }
+        : playerObjectId
+          ? { player: playerObjectId }
+          : {};
+
+  const minAmount = query.amountFrom != null ? Number(query.amountFrom) : undefined;
+  const maxAmount = query.amountTo != null ? Number(query.amountTo) : undefined;
+  const amountFilter =
+    minAmount != null || maxAmount != null
+      ? {
+          amount: {
+            ...(minAmount != null ? { $gte: minAmount } : {}),
+            ...(maxAmount != null ? { $lte: maxAmount } : {}),
+          },
+        }
+      : {};
+
+  const search = query.search?.trim();
+  const depositSearchFilter = search
+    ? {
+        $or: [
+          { utr: { $regex: escapeRegexFragment(search), $options: "i" } },
+          { bankName: { $regex: escapeRegexFragment(search), $options: "i" } },
+        ],
+      }
+    : {};
+  const withdrawalSearchFilter = search
+    ? {
+        $or: [
+          { utr: { $regex: escapeRegexFragment(search), $options: "i" } },
+          { bankName: { $regex: escapeRegexFragment(search), $options: "i" } },
+          { playerName: { $regex: escapeRegexFragment(search), $options: "i" } },
+        ],
+      }
+    : {};
+  const expenseSearchFilter = search
+    ? {
+        $or: [
+          { description: { $regex: escapeRegexFragment(search), $options: "i" } },
+          { bankName: { $regex: escapeRegexFragment(search), $options: "i" } },
+        ],
+      }
+    : {};
+
+  const status = query.status as DashboardStatusFilter | undefined;
+  const transactionType = (query.transactionType as DashboardTxnTypeFilter | undefined) ?? "all";
+  const isDepositAllowed = transactionType === "all" || transactionType === "deposit";
+  const isWithdrawalAllowed = transactionType === "all" || transactionType === "withdrawal";
+  const isExpenseAllowed = transactionType === "all" || transactionType === "expense";
+
+  const depositFilter = isDepositAllowed
+    ? {
+        ...dateFilter,
+        ...playerFilter,
+        ...(bankObjectId ? { bankId: bankObjectId } : {}),
+        ...amountFilter,
+        ...statusFilterForDeposit(status),
+        ...depositSearchFilter,
+      }
+    : { _id: { $exists: false } };
+
+  const withdrawalFilter = isWithdrawalAllowed
+    ? {
+        ...dateFilter,
+        ...playerFilter,
+        ...amountFilter,
+        ...statusFilterForWithdrawal(status),
+        ...withdrawalSearchFilter,
+      }
+    : { _id: { $exists: false } };
+
+  const expenseFilter = isExpenseAllowed
+    ? {
+        ...dateFilter,
+        ...amountFilter,
+        ...(bankObjectId ? { bankId: bankObjectId } : {}),
+        ...statusFilterForExpense(status),
+        ...expenseSearchFilter,
+      }
+    : { _id: { $exists: false } };
+
+  const exchangeStatsFilter = exchangeObjectId ? { _id: exchangeObjectId } : {};
+
+  return {
+    dateFilter,
+    appliedRange,
+    exchangeObjectId,
+    scopedPlayerIds,
+    depositFilter,
+    withdrawalFilter,
+    expenseFilter,
+    exchangeStatsFilter,
+  };
+}
+
+export async function getDashboardSummary(query: DashboardSummaryQuery) {
   const { DepositModel } = await import("../deposit/deposit.model");
   const { WithdrawalModel } = await import("../withdrawal/withdrawal.model");
-
-  const dateFilter = buildDateFilter(query);
+  const {
+    appliedRange,
+    exchangeObjectId,
+    scopedPlayerIds,
+    depositFilter,
+    withdrawalFilter,
+    expenseFilter,
+    exchangeStatsFilter,
+  } = await buildDashboardFilterContext(query);
 
   /* ── Raw aggregation promises ──────────────────────────────────── */
   const [
@@ -71,10 +251,12 @@ export async function getDashboardSummary(query: DateRangeQuery) {
     recentWithdrawals,
     depositTrend,
     withdrawalTrend,
+    exchangeDeposits,
+    exchangeWithdrawals,
   ] = await Promise.all([
     // Deposit: group by status → totalAmount, count, bonusTotal
     DepositModel.aggregate([
-      { $match: { ...dateFilter } },
+      { $match: { ...depositFilter } },
       {
         $group: {
           _id: "$status",
@@ -87,12 +269,13 @@ export async function getDashboardSummary(query: DateRangeQuery) {
 
     // Withdrawal: group by status → totalAmount, payableAmount, count
     WithdrawalModel.aggregate([
-      { $match: { ...dateFilter } },
+      { $match: { ...withdrawalFilter } },
       {
         $group: {
           _id: "$status",
           totalAmount: { $sum: "$amount" },
-          payableTotal: { $sum: { $ifNull: ["$payableAmount", 0] } },
+          payableTotal: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+          reverseBonusTotal: { $sum: { $ifNull: ["$reverseBonus", 0] } },
           count: { $sum: 1 },
         },
       },
@@ -100,7 +283,7 @@ export async function getDashboardSummary(query: DateRangeQuery) {
 
     // Expense: group by status
     ExpenseModel.aggregate([
-      { $match: { ...dateFilter } },
+      { $match: { ...expenseFilter } },
       {
         $group: {
           _id: "$status",
@@ -111,16 +294,21 @@ export async function getDashboardSummary(query: DateRangeQuery) {
     ]),
 
     // Exchange active/total
-    Promise.all([
-      ExchangeModel.countDocuments({}),
-      ExchangeModel.countDocuments({ status: "active" }),
-    ]),
+    exchangeObjectId
+      ? Promise.all([
+          ExchangeModel.countDocuments({ ...exchangeStatsFilter }),
+          ExchangeModel.countDocuments({ ...exchangeStatsFilter, status: "active" }),
+        ])
+      : Promise.all([
+          ExchangeModel.countDocuments({}),
+          ExchangeModel.countDocuments({ status: "active" }),
+        ]),
 
     // Total active users
     UserModel.countDocuments({ status: "active" }),
 
     // Recent deposits (last 10, all statuses)
-    DepositModel.find({ ...dateFilter })
+    DepositModel.find({ ...depositFilter })
       .sort({ createdAt: -1 })
       .limit(10)
       .populate("player", "playerId name")
@@ -128,7 +316,7 @@ export async function getDashboardSummary(query: DateRangeQuery) {
       .lean(),
 
     // Recent withdrawals (last 10, all statuses)
-    WithdrawalModel.find({ ...dateFilter })
+    WithdrawalModel.find({ ...withdrawalFilter })
       .sort({ createdAt: -1 })
       .limit(10)
       .populate("player", "playerId name")
@@ -137,7 +325,7 @@ export async function getDashboardSummary(query: DateRangeQuery) {
 
     // Deposit daily trend
     DepositModel.aggregate([
-      { $match: { ...dateFilter, status: { $ne: "rejected" } } },
+      { $match: { ...depositFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
       {
         $group: {
           _id: {
@@ -152,17 +340,81 @@ export async function getDashboardSummary(query: DateRangeQuery) {
 
     // Withdrawal daily trend
     WithdrawalModel.aggregate([
-      { $match: { ...dateFilter, status: { $ne: "rejected" } } },
+      { $match: { ...withdrawalFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
       {
         $group: {
           _id: {
             $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
           },
-          totalAmount: { $sum: "$amount" },
+          totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
           count: { $sum: 1 },
         },
       },
       { $sort: { _id: 1 } },
+    ]),
+
+    // Exchange deposits breakdown
+    DepositModel.aggregate([
+      { $match: { ...depositFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
+      {
+        $lookup: {
+          from: "players",
+          localField: "player",
+          foreignField: "_id",
+          as: "playerDoc",
+        },
+      },
+      { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: "exchanges",
+          localField: "playerDoc.exchange",
+          foreignField: "_id",
+          as: "exchangeDoc",
+        },
+      },
+      { $unwind: { path: "$exchangeDoc", preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: { $ifNull: ["$exchangeDoc._id", "unknown"] },
+          name: { $first: { $ifNull: ["$exchangeDoc.name", "Unknown"] } },
+          depositTotal: { $sum: "$amount" },
+          depositVerified: { $sum: { $cond: [{ $in: ["$status", ["verified", "finalized"]] }, "$amount", 0] } },
+          bonusTotal: { $sum: { $ifNull: ["$bonusAmount", 0] } },
+        },
+      },
+    ]),
+
+    // Exchange withdrawals breakdown
+    WithdrawalModel.aggregate([
+      { $match: { ...withdrawalFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
+      {
+        $lookup: {
+          from: "players",
+          localField: "player",
+          foreignField: "_id",
+          as: "playerDoc",
+        },
+      },
+      { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: "exchanges",
+          localField: "playerDoc.exchange",
+          foreignField: "_id",
+          as: "exchangeDoc",
+        },
+      },
+      { $unwind: { path: "$exchangeDoc", preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: { $ifNull: ["$exchangeDoc._id", "unknown"] },
+          name: { $first: { $ifNull: ["$exchangeDoc.name", "Unknown"] } },
+          withdrawalTotal: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+          withdrawalApproved: { $sum: { $cond: [{ $eq: ["$status", "approved"] }, { $ifNull: ["$payableAmount", "$amount"] }, 0] } },
+          reverseBonusTotal: { $sum: { $ifNull: ["$reverseBonus", 0] } },
+        },
+      },
     ]),
   ]);
 
@@ -172,9 +424,15 @@ export async function getDashboardSummary(query: DateRangeQuery) {
     depositRejectedCount = 0, bonusTotal = 0;
 
   for (const row of depositAgg) {
+    if (row._id === "rejected") {
+      depositRejectedCount = row.count ?? 0;
+      continue;
+    }
+    
     depositTotal += row.totalAmount ?? 0;
     depositCount += row.count ?? 0;
     bonusTotal += row.bonusTotal ?? 0;
+    
     if (row._id === "pending") {
       depositPendingCount = row.count ?? 0;
       depositPendingAmount = row.totalAmount ?? 0;
@@ -183,29 +441,30 @@ export async function getDashboardSummary(query: DateRangeQuery) {
       depositVerifiedAmount += row.totalAmount ?? 0;
       depositVerifiedCount += row.count ?? 0;
     }
-    if (row._id === "rejected") {
-      depositRejectedCount = row.count ?? 0;
-    }
   }
 
   /* ── Aggregate withdrawal KPIs ─────────────────────────────────── */
   let withdrawalTotal = 0, withdrawalCount = 0, withdrawalPendingCount = 0,
-    withdrawalPendingAmount = 0, withdrawalFinalizedAmount = 0,
-    withdrawalFinalizedCount = 0, withdrawalRejectedCount = 0;
+    withdrawalPendingAmount = 0, withdrawalApprovedAmount = 0,
+    withdrawalApprovedCount = 0, withdrawalRejectedCount = 0, reverseBonusTotal = 0;
 
   for (const row of withdrawalAgg) {
-    withdrawalTotal += row.totalAmount ?? 0;
-    withdrawalCount += row.count ?? 0;
-    if (row._id === "requested") {
-      withdrawalPendingCount = row.count ?? 0;
-      withdrawalPendingAmount = row.totalAmount ?? 0;
-    }
-    if (row._id === "finalized") {
-      withdrawalFinalizedAmount = row.totalAmount ?? 0;
-      withdrawalFinalizedCount = row.count ?? 0;
-    }
     if (row._id === "rejected") {
       withdrawalRejectedCount = row.count ?? 0;
+      continue;
+    }
+    
+    withdrawalTotal += row.payableTotal ?? row.totalAmount ?? 0;
+    withdrawalCount += row.count ?? 0;
+    reverseBonusTotal += row.reverseBonusTotal ?? 0;
+    
+    if (row._id === "requested") {
+      withdrawalPendingCount = row.count ?? 0;
+      withdrawalPendingAmount = row.payableTotal ?? row.totalAmount ?? 0;
+    }
+    if (row._id === "approved") {
+      withdrawalApprovedAmount += row.payableTotal ?? row.totalAmount ?? 0;
+      withdrawalApprovedCount += row.count ?? 0;
     }
   }
 
@@ -214,23 +473,25 @@ export async function getDashboardSummary(query: DateRangeQuery) {
     expenseApprovedAmount = 0;
 
   for (const row of expenseAgg) {
+    if (row._id === "rejected") {
+      continue;
+    }
+    
     expenseTotal += row.totalAmount ?? 0;
     expenseCount += row.count ?? 0;
     if (row._id === "pending_audit") expensePendingCount = row.count ?? 0;
-    if (row._id === "approved") expenseApprovedAmount = row.totalAmount ?? 0;
+    if (row._id === "approved") expenseApprovedAmount += row.totalAmount ?? 0;
   }
 
   /* ── P&L calculations ──────────────────────────────────────────── */
-  const grossPL = depositVerifiedAmount - withdrawalFinalizedAmount;
+  const grossPL = depositVerifiedAmount - withdrawalApprovedAmount;
   const netPL = grossPL - expenseApprovedAmount;
 
   /* ── Exchange stats ────────────────────────────────────────────── */
   const [exchangeTotal, exchangeActive] = exchangeStats;
 
   /* ── Build daily trend (fill missing days with 0) ──────────────── */
-  const fromDate = query.fromDate ? new Date(query.fromDate) : (() => { const d = new Date(); d.setDate(d.getDate() - 29); return d; })();
-  const toDate = query.toDate ? new Date(query.toDate) : new Date();
-  const allDays = dateRange(fromDate, toDate);
+  const allDays = dateRangeYmd(appliedRange.fromDate, appliedRange.toDate);
 
   const depositTrendMap = new Map(depositTrend.map((r: { _id: string; totalAmount: number; count: number }) => [r._id, r]));
   const withdrawalTrendMap = new Map(withdrawalTrend.map((r: { _id: string; totalAmount: number; count: number }) => [r._id, r]));
@@ -276,7 +537,69 @@ export async function getDashboardSummary(query: DateRangeQuery) {
     .sort((a, b) => new Date(b.createdAt as string).getTime() - new Date(a.createdAt as string).getTime())
     .slice(0, 20);
 
+  /* ── Exchange Wise Breakdown (Merge & Sort) ───────────────────── */
+  const exchangeMap = new Map<
+    string,
+    {
+      exchangeId: string;
+      name: string;
+      depositTotal: number;
+      depositVerified: number;
+      withdrawalTotal: number;
+      withdrawalApproved: number;
+      bonusGiven: number;
+      bonusRecovered: number;
+    }
+  >();
+  const getExchangeObj = (id: string, name: string) => {
+    let current = exchangeMap.get(id);
+    if (!current) {
+      current = {
+        exchangeId: id,
+        name,
+        depositTotal: 0,
+        depositVerified: 0,
+        withdrawalTotal: 0,
+        withdrawalApproved: 0,
+        bonusGiven: 0,
+        bonusRecovered: 0,
+      };
+      exchangeMap.set(id, current);
+    }
+    return current;
+  };
+
+  for (const row of exchangeDeposits) {
+    const obj = getExchangeObj(String(row._id), String(row.name));
+    obj.depositTotal = row.depositTotal ?? 0;
+    obj.depositVerified = row.depositVerified ?? 0;
+    obj.bonusGiven = row.bonusTotal ?? 0;
+  }
+
+  for (const row of exchangeWithdrawals) {
+    const obj = getExchangeObj(String(row._id), String(row.name));
+    obj.withdrawalTotal = row.withdrawalTotal ?? 0;
+    obj.withdrawalApproved = row.withdrawalApproved ?? 0;
+    obj.bonusRecovered = row.reverseBonusTotal ?? 0;
+  }
+
+  const exchangesBreakdown = Array.from(exchangeMap.values())
+    .map((e) => ({
+      ...e,
+      netPL: e.depositVerified - e.withdrawalApproved,
+      netBonus: e.bonusGiven - e.bonusRecovered,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
   return {
+    meta: {
+      fromDate: appliedRange.fromDate,
+      toDate: appliedRange.toDate,
+      exchangeId: query.exchangeId ?? null,
+      status: query.status ?? "all",
+      transactionType: query.transactionType ?? "all",
+      scopedPlayerCount: scopedPlayerIds?.length ?? null,
+    },
     deposit: {
       totalAmount: depositTotal,
       totalCount: depositCount,
@@ -292,9 +615,10 @@ export async function getDashboardSummary(query: DateRangeQuery) {
       totalCount: withdrawalCount,
       pendingCount: withdrawalPendingCount,
       pendingAmount: withdrawalPendingAmount,
-      finalizedAmount: withdrawalFinalizedAmount,
-      finalizedCount: withdrawalFinalizedCount,
+      approvedAmount: withdrawalApprovedAmount,
+      approvedCount: withdrawalApprovedCount,
       rejectedCount: withdrawalRejectedCount,
+      reverseBonusTotal,
     },
     expense: {
       totalAmount: expenseTotal,
@@ -315,6 +639,7 @@ export async function getDashboardSummary(query: DateRangeQuery) {
     },
     trendData,
     recentActivity,
+    exchangesBreakdown,
   };
 }
 
