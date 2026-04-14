@@ -10,6 +10,7 @@ export const PERMISSIONS = {
 
   PLAYER_ADD: "player.add",
   PLAYER_LIST: "player.list",
+  PLAYER_EDIT: "player.edit",
 
   BANK_ADD: "bank.add",
   BANK_LIST: "bank.list",

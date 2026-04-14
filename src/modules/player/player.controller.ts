@@ -7,6 +7,7 @@ import {
   getSampleCsvBuffer,
   importPlayersFromFile,
   listPlayers,
+  updatePlayer,
 } from "./player.service";
 import { listPlayerQuerySchema } from "./player.validation";
 
@@ -55,4 +56,11 @@ export async function importPlayerController(req: Request, res: Response) {
   const actorId = req.user!.userId;
   const result = await importPlayersFromFile(file.buffer, file.originalname, actorId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data: result });
+}
+
+export async function updatePlayerController(req: Request, res: Response) {
+  const actorId = req.user!.userId;
+  const id = typeof req.params.id === "string" ? req.params.id : String(req.params.id ?? "");
+  const data = await updatePlayer(id, req.body, actorId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
