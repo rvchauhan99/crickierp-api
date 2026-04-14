@@ -6,6 +6,8 @@ import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExpenseModel } from "../expense/expense.model";
+import { LiabilityEntryModel } from "../liability/liability-entry.model";
+import { LiabilityPersonModel } from "../liability/liability-person.model";
 import { BankModel } from "./bank.model";
 import { listBankQuerySchema } from "./bank.validation";
 
@@ -318,7 +320,7 @@ export async function exportBanksToBuffer(query: ListBankQuery): Promise<Buffer>
 type LedgerQuery = {
   fromDate?: string;
   toDate?: string;
-  entryType?: "all" | "deposit" | "withdrawal" | "expense";
+  entryType?: "all" | "deposit" | "withdrawal" | "expense" | "liability";
 };
 
 function ledgerYmdStart(ymd: string): Date | null {
@@ -351,6 +353,12 @@ function expenseEventTime(e: { approvedAt?: Date; createdAt?: Date }): Date {
   return new Date(0);
 }
 
+function liabilityEventTime(e: { entryDate?: Date; createdAt?: Date }): Date {
+  if (e.entryDate) return new Date(e.entryDate);
+  if (e.createdAt) return new Date(e.createdAt);
+  return new Date(0);
+}
+
 /**
  * Merged deposit credits, withdrawal debits, and approved expense debits for a bank account (chronological ledger).
  * Withdrawal rows are sourced from banker-paid entries (status: approved) for the selected payout bank.
@@ -370,7 +378,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
   const toD = to ? ledgerYmdEnd(to) : null;
   const entryType = query.entryType || "all";
 
-  const [allDeposits, allWithdrawals, allExpenses] = await Promise.all([
+  const [allDeposits, allWithdrawals, allExpenses, allLiabilityEntries] = await Promise.all([
     DepositModel.find({ bankId: bid, status: "verified" })
       .populate("player", "name")
       .populate("createdBy", "fullName")
@@ -380,7 +388,27 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       .populate("createdBy", "fullName")
       .lean(),
     ExpenseModel.find({ bankId: bid, status: "approved" }).lean(),
+    LiabilityEntryModel.find({
+      $or: [
+        { fromAccountType: "bank", fromAccountId: bid },
+        { toAccountType: "bank", toAccountId: bid },
+      ],
+    })
+      .populate("createdBy", "fullName")
+      .lean(),
   ]);
+
+  const liabilityPersonIds = new Set<string>();
+  for (const e of allLiabilityEntries) {
+    if (e.fromAccountType === "person") liabilityPersonIds.add(String(e.fromAccountId));
+    if (e.toAccountType === "person") liabilityPersonIds.add(String(e.toAccountId));
+  }
+  const liabilityPersons = await LiabilityPersonModel.find({
+    _id: { $in: [...liabilityPersonIds].filter((id) => Types.ObjectId.isValid(id)).map((id) => new Types.ObjectId(id)) },
+  })
+    .select("_id name")
+    .lean();
+  const liabilityPersonMap = new Map(liabilityPersons.map((p) => [String(p._id), p.name]));
 
   let priorNet = 0;
   if (fromD) {
@@ -401,12 +429,21 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       if (at >= fromD) continue;
       priorNet -= e.amount;
     }
+    for (const le of allLiabilityEntries) {
+      const at = liabilityEventTime(le);
+      if (at >= fromD) continue;
+      const isBankFrom = le.fromAccountType === "bank" && String(le.fromAccountId) === String(bid);
+      const isBankTo = le.toAccountType === "bank" && String(le.toAccountId) === String(bid);
+      if (isBankFrom) priorNet -= le.amount;
+      if (isBankTo) priorNet += le.amount;
+    }
   }
 
   type Ev =
     | { kind: "deposit"; t: number; doc: (typeof allDeposits)[0] }
     | { kind: "withdrawal"; t: number; doc: (typeof allWithdrawals)[0] }
-    | { kind: "expense"; t: number; doc: (typeof allExpenses)[0] };
+    | { kind: "expense"; t: number; doc: (typeof allExpenses)[0] }
+    | { kind: "liability"; t: number; doc: (typeof allLiabilityEntries)[0] };
 
   const events: Ev[] = [];
   for (const d of allDeposits) {
@@ -431,6 +468,14 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
     if (toD && at > toD) continue;
     if (entryType === "all" || entryType === "expense") {
       events.push({ kind: "expense", t: at.getTime(), doc: e });
+    }
+  }
+  for (const le of allLiabilityEntries) {
+    const at = liabilityEventTime(le);
+    if (fromD && at < fromD) continue;
+    if (toD && at > toD) continue;
+    if (entryType === "all" || entryType === "liability") {
+      events.push({ kind: "liability", t: at.getTime(), doc: le });
     }
   }
   events.sort((a, b) => a.t - b.t);
@@ -495,6 +540,39 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       };
     }
     
+    if (ev.kind === "liability") {
+      const le = ev.doc;
+      const isBankFrom = le.fromAccountType === "bank" && String(le.fromAccountId) === String(bid);
+      const direction = isBankFrom ? "debit" : "credit";
+      if (direction === "debit") {
+        running -= le.amount;
+        totalDebits += le.amount;
+      } else {
+        running += le.amount;
+        totalCredits += le.amount;
+      }
+      const createdByObj = le.createdBy as { fullName?: string } | undefined;
+      const counterpartyName =
+        le.fromAccountType === "person"
+          ? liabilityPersonMap.get(String(le.fromAccountId)) ?? ""
+          : le.toAccountType === "person"
+            ? liabilityPersonMap.get(String(le.toAccountId)) ?? ""
+            : "";
+      return {
+        kind: "liability" as const,
+        refId: le._id.toString(),
+        at: new Date(ev.t).toISOString(),
+        label: `Liability ${le.entryType}`,
+        utr: le.referenceNo?.trim() || undefined,
+        playerName: counterpartyName,
+        createdByName: createdByObj?.fullName ?? "",
+        amount: le.amount,
+        direction,
+        balanceAfter: running,
+        bonusMemo: undefined,
+      };
+    }
+
     // expense
     const e = ev.doc;
     running -= e.amount;

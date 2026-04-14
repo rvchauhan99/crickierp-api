@@ -6,11 +6,14 @@ import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
 import { ExpenseTypeModel } from "../masters/expense-type.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
+import { LiabilityPersonModel } from "../liability/liability-person.model";
+import { createLiabilityEntry } from "../liability/liability.service";
 import { ExpenseModel, ExpenseStatus } from "./expense.model";
-import { listExpenseQuerySchema } from "./expense.validation";
+import { approveExpenseBodySchema, listExpenseQuerySchema } from "./expense.validation";
 import { deleteFile, getSignedUrl, uploadFile } from "../../shared/services/bucket.service";
 
 type ListExpenseQuery = z.infer<typeof listExpenseQuerySchema>;
+type ApproveExpenseInput = z.infer<typeof approveExpenseBodySchema>;
 
 function pageSizeFromQuery(q: ListExpenseQuery): number {
   return q.limit ?? q.pageSize;
@@ -270,7 +273,7 @@ export async function updateExpense(
 
 export async function approveExpense(
   id: string,
-  input: { bankId: string },
+  input: ApproveExpenseInput,
   actorId: string,
   requestId?: string,
 ) {
@@ -280,32 +283,104 @@ export async function approveExpense(
     throw new AppError("business_rule_error", "Expense is not pending audit", 400);
   }
 
-  const bank = await BankModel.findById(input.bankId);
-  if (!bank) throw new AppError("not_found", "Bank not found", 404);
-  if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
-
   const amount = doc.amount;
-  const prevBal = bank.currentBalance ?? bank.openingBalance;
-  if (amount > prevBal) {
-    throw new AppError("business_rule_error", "Insufficient bank balance for this expense", 400);
+  if (input.settlementAccountType === "bank") {
+    const bank = await BankModel.findById(input.bankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+    const prevBal = bank.currentBalance ?? bank.openingBalance;
+    if (amount > prevBal) {
+      throw new AppError("business_rule_error", "Insufficient bank balance for this expense", 400);
+    }
+
+    const bankBalanceAfter = prevBal - amount;
+    bank.currentBalance = bankBalanceAfter;
+    await bank.save();
+
+    try {
+      doc.bankId = bank._id;
+      doc.bankName = bankDisplayName(bank);
+      doc.settlementAccountType = "bank";
+      doc.liabilityPersonId = undefined;
+      doc.liabilityPersonName = "";
+      doc.liabilityEntryId = undefined;
+      doc.status = "approved";
+      doc.approvedBy = new Types.ObjectId(actorId);
+      doc.approvedAt = new Date();
+      doc.bankBalanceAfter = bankBalanceAfter;
+      doc.updatedBy = new Types.ObjectId(actorId);
+      await doc.save();
+    } catch (err) {
+      bank.currentBalance = prevBal;
+      await bank.save();
+      throw err;
+    }
+
+    await createAuditLog({
+      actorId,
+      action: "expense.approve",
+      entity: "expense",
+      entityId: doc._id.toString(),
+      newValue: {
+        settlementAccountType: "bank",
+        bankId: input.bankId,
+        bankBalanceAfter,
+        amount,
+      },
+      requestId,
+    });
+    return doc;
   }
 
-  const bankBalanceAfter = prevBal - amount;
-  bank.currentBalance = bankBalanceAfter;
-  await bank.save();
+  const person = await LiabilityPersonModel.findById(input.liabilityPersonId);
+  if (!person) throw new AppError("not_found", "Liability person not found", 404);
+  if (!person.isActive) throw new AppError("business_rule_error", "Liability person is inactive", 400);
+
+  doc.settlementAccountType = "person";
+  doc.liabilityPersonId = person._id;
+  doc.liabilityPersonName = person.name;
+  doc.liabilityEntryId = undefined;
+  doc.status = "approved";
+  doc.approvedBy = new Types.ObjectId(actorId);
+  doc.approvedAt = new Date();
+  doc.bankBalanceAfter = undefined;
+  doc.updatedBy = new Types.ObjectId(actorId);
+  await doc.save();
 
   try {
-    doc.bankId = bank._id;
-    doc.bankName = bankDisplayName(bank);
-    doc.status = "approved";
-    doc.approvedBy = new Types.ObjectId(actorId);
-    doc.approvedAt = new Date();
-    doc.bankBalanceAfter = bankBalanceAfter;
+    const referenceNo = `EXP-${String(doc._id).slice(-8).toUpperCase()}`;
+    const liabilityEntry = await createLiabilityEntry(
+      {
+        entryDate: doc.expenseDate.toISOString().slice(0, 10),
+        entryType: "journal",
+        amount: doc.amount,
+        fromAccountType: "person",
+        fromAccountId: String(person._id),
+        toAccountType: "expense",
+        toAccountId: String(doc._id),
+        sourceType: "expense",
+        sourceExpenseId: String(doc._id),
+        referenceNo,
+        remark: `Expense settlement for ${String(doc._id)}`,
+      },
+      actorId,
+      requestId,
+    );
+
+    doc.liabilityEntryId = liabilityEntry._id;
     doc.updatedBy = new Types.ObjectId(actorId);
     await doc.save();
   } catch (err) {
-    bank.currentBalance = prevBal;
-    await bank.save();
+    doc.status = "pending_audit";
+    doc.approvedBy = undefined;
+    doc.approvedAt = undefined;
+    doc.settlementAccountType = undefined;
+    doc.liabilityPersonId = undefined;
+    doc.liabilityPersonName = "";
+    doc.liabilityEntryId = undefined;
+    doc.updatedBy = new Types.ObjectId(actorId);
+    await doc.save();
     throw err;
   }
 
@@ -315,8 +390,9 @@ export async function approveExpense(
     entity: "expense",
     entityId: doc._id.toString(),
     newValue: {
-      bankId: input.bankId,
-      bankBalanceAfter,
+      settlementAccountType: "person",
+      liabilityPersonId: input.liabilityPersonId,
+      liabilityEntryId: doc.liabilityEntryId?.toString(),
       amount,
     },
     requestId,
@@ -373,6 +449,8 @@ export async function listExpenses(query: ListExpenseQuery) {
     ExpenseModel.find(filter)
       .populate("expenseTypeId", "name code isActive")
       .populate("bankId", "holderName bankName accountNumber")
+      .populate("liabilityPersonId", "name")
+      .populate("liabilityEntryId", "entryType amount entryDate sourceType sourceExpenseId")
       .populate("createdBy", "fullName username")
       .populate("approvedBy", "fullName username")
       .sort({ [query.sortBy]: sortValue })
@@ -407,6 +485,8 @@ export async function getExpenseById(id: string) {
   const doc = await ExpenseModel.findById(id)
     .populate("expenseTypeId", "name code isActive")
     .populate("bankId", "holderName bankName accountNumber ifsc")
+    .populate("liabilityPersonId", "name")
+    .populate("liabilityEntryId", "entryType amount entryDate sourceType sourceExpenseId")
     .populate("createdBy", "fullName username")
     .populate("approvedBy", "fullName username")
     .lean();

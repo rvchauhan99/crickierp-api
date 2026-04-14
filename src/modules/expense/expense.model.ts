@@ -19,6 +19,10 @@ export interface ExpenseDocument {
   bankId?: Types.ObjectId;
   /** Denormalized for lists */
   bankName: string;
+  settlementAccountType?: "bank" | "person";
+  liabilityPersonId?: Types.ObjectId;
+  liabilityPersonName?: string;
+  liabilityEntryId?: Types.ObjectId;
   status: ExpenseStatus;
   rejectReason?: string;
   /** Master Reason reference for rejection. */
@@ -41,6 +45,10 @@ const expenseSchema = new Schema<ExpenseDocument>(
     description: { type: String, trim: true, default: "" },
     bankId: { type: Schema.Types.ObjectId, ref: "Bank" },
     bankName: { type: String, trim: true, default: "" },
+    settlementAccountType: { type: String, enum: ["bank", "person"] },
+    liabilityPersonId: { type: Schema.Types.ObjectId, ref: "LiabilityPerson" },
+    liabilityPersonName: { type: String, trim: true, default: "" },
+    liabilityEntryId: { type: Schema.Types.ObjectId, ref: "LiabilityEntry" },
     status: {
       type: String,
       enum: ["pending_audit", "approved", "rejected"],

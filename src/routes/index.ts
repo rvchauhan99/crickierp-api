@@ -11,6 +11,7 @@ import { playerRouter } from "../modules/player/player.route";
 import { mastersRouter } from "../modules/masters/masters.route";
 import { expenseRouter } from "../modules/expense/expense.route";
 import { reasonRouter } from "../modules/reason/reason.route";
+import { liabilityRouter } from "../modules/liability/liability.route";
 
 const apiRouter = Router();
 
@@ -29,5 +30,6 @@ apiRouter.use("/history", historyRouter);
 apiRouter.use("/masters", mastersRouter);
 apiRouter.use("/expense", expenseRouter);
 apiRouter.use("/reasons", reasonRouter);
+apiRouter.use("/liability", liabilityRouter);
 
 export { apiRouter };

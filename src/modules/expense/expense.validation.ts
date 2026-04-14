@@ -37,9 +37,16 @@ export const listExpenseQuerySchema = z.object({
   expenseDate_op: z.string().optional(),
 });
 
-export const approveExpenseBodySchema = z.object({
-  bankId: z.string().length(24),
-});
+export const approveExpenseBodySchema = z.discriminatedUnion("settlementAccountType", [
+  z.object({
+    settlementAccountType: z.literal("bank"),
+    bankId: z.string().length(24),
+  }),
+  z.object({
+    settlementAccountType: z.literal("person"),
+    liabilityPersonId: z.string().length(24),
+  }),
+]);
 
 export const rejectExpenseBodySchema = z.object({
   reasonId: z.string().length(24),
