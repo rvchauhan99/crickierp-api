@@ -8,6 +8,7 @@ import { ExpenseTypeModel } from "../masters/expense-type.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { ExpenseModel, ExpenseStatus } from "./expense.model";
 import { listExpenseQuerySchema } from "./expense.validation";
+import { deleteFile, getSignedUrl, uploadFile } from "../../shared/services/bucket.service";
 
 type ListExpenseQuery = z.infer<typeof listExpenseQuerySchema>;
 
@@ -411,4 +412,105 @@ export async function getExpenseById(id: string) {
     .lean();
   if (!doc) throw new AppError("not_found", "Expense not found", 404);
   return doc;
+}
+
+type UploadableFile = {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+  size?: number;
+};
+
+export async function uploadExpenseDocuments(
+  id: string,
+  files: UploadableFile[],
+  actorId: string,
+  requestId?: string,
+) {
+  const doc = await ExpenseModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Expense not found", 404);
+  if (doc.status !== "pending_audit") {
+    throw new AppError("business_rule_error", "Only pending expenses can receive documents", 400);
+  }
+  if (!files || files.length === 0) {
+    throw new AppError("validation_error", "At least one document is required", 400);
+  }
+
+  const uploaded: Array<{
+    path: string;
+    filename: string;
+    size: number;
+    mime_type: string;
+    uploaded_at: string;
+  }> = [];
+  try {
+    for (const file of files) {
+      const uploadedFile = await uploadFile(file, {
+        prefix: `expenses/${id}`,
+        acl: "private",
+      });
+      uploaded.push(uploadedFile);
+    }
+  } catch (error) {
+    await Promise.all(
+      uploaded.map(async (f) => {
+        try {
+          await deleteFile(f.path);
+        } catch {
+          // Ignore cleanup errors and surface original upload failure.
+        }
+      }),
+    );
+    throw error;
+  }
+
+  const normalized = uploaded.map((f) => ({
+    path: f.path,
+    filename: f.filename,
+    size: f.size,
+    mime_type: f.mime_type,
+    uploaded_at: new Date(f.uploaded_at),
+  }));
+
+  doc.documents = [...(doc.documents || []), ...normalized];
+  doc.updatedBy = new Types.ObjectId(actorId);
+  await doc.save();
+
+  await createAuditLog({
+    actorId,
+    action: "expense.documents_upload",
+    entity: "expense",
+    entityId: doc._id.toString(),
+    newValue: {
+      uploadedCount: normalized.length,
+      documents: normalized.map((d) => ({
+        path: d.path,
+        filename: d.filename,
+        size: d.size,
+        mime_type: d.mime_type,
+      })),
+    },
+    requestId,
+  });
+
+  return doc;
+}
+
+export async function getExpenseDocumentSignedUrl(id: string, docIndex: number) {
+  const doc = await ExpenseModel.findById(id).select("documents").lean();
+  if (!doc) throw new AppError("not_found", "Expense not found", 404);
+
+  const documents = Array.isArray(doc.documents) ? doc.documents : [];
+  if (docIndex < 0 || docIndex >= documents.length) {
+    throw new AppError("not_found", "Document not found", 404);
+  }
+
+  const target = documents[docIndex];
+  const url = await getSignedUrl(target.path);
+  return {
+    url,
+    filename: target.filename,
+    mime_type: target.mime_type,
+    uploaded_at: target.uploaded_at,
+  };
 }

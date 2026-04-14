@@ -421,14 +421,27 @@ export async function exportDepositsToBuffer(query: ListDepositQuery): Promise<B
   return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
 }
 
+function bonusAmountFromPercent(amount: number, percent: number): number {
+  return Math.round(((amount * percent) / 100) * 100) / 100;
+}
+
+async function isFirstDepositForPlayer(playerId: Types.ObjectId, currentDepositId: Types.ObjectId): Promise<boolean> {
+  const prior = await DepositModel.exists({
+    _id: { $ne: currentDepositId },
+    player: playerId,
+    status: { $ne: "rejected" },
+  });
+  return prior == null;
+}
+
 export async function exchangeApproveDeposit(
   id: string,
   input: { playerId: string; bonusAmount: number },
   actorId: string,
   requestId?: string,
 ) {
-  const bonus = Number(input.bonusAmount);
-  if (!Number.isFinite(bonus) || bonus < 0) {
+  const requestedBonus = Number(input.bonusAmount);
+  if (!Number.isFinite(requestedBonus) || requestedBonus < 0) {
     throw new AppError("validation_error", "Invalid bonus amount", 400);
   }
 
@@ -441,9 +454,17 @@ export async function exchangeApproveDeposit(
     throw new AppError("business_rule_error", "Deposit has no bank linked", 400);
   }
 
-  const playerDoc = await PlayerModel.findById(input.playerId);
+  const playerDoc = await PlayerModel.findById(input.playerId).select(
+    "regularBonusPercentage firstDepositBonusPercentage",
+  );
   if (!playerDoc) throw new AppError("not_found", "Player not found", 404);
 
+  const playerObjectId = new Types.ObjectId(input.playerId);
+  const isFirstDeposit = await isFirstDepositForPlayer(playerObjectId, doc._id);
+  const appliedBonusPercent = isFirstDeposit
+    ? playerDoc.firstDepositBonusPercentage
+    : playerDoc.regularBonusPercentage;
+  const bonus = bonusAmountFromPercent(doc.amount, appliedBonusPercent);
   const totalAmount = doc.amount + bonus;
   const bank = await BankModel.findById(doc.bankId);
   if (!bank) throw new AppError("not_found", "Bank not found", 404);
@@ -456,7 +477,7 @@ export async function exchangeApproveDeposit(
 
   try {
     doc.status = "verified" as DepositStatus;
-    doc.player = new Types.ObjectId(input.playerId);
+    doc.player = playerObjectId;
     doc.bonusAmount = bonus;
     doc.totalAmount = totalAmount;
     doc.exchangeActionBy = new Types.ObjectId(actorId);
@@ -478,6 +499,9 @@ export async function exchangeApproveDeposit(
     newValue: {
       playerId: input.playerId,
       bonusAmount: bonus,
+      requestedBonusAmount: requestedBonus,
+      appliedBonusPercent,
+      appliedBonusType: isFirstDeposit ? "first_deposit" : "regular",
       totalAmount,
       bankBalanceAfter,
     },

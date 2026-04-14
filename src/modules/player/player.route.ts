@@ -11,8 +11,9 @@ import {
   importPlayerController,
   listPlayerController,
   samplePlayerCsvController,
+  updatePlayerController,
 } from "./player.controller";
-import { createPlayerBodySchema } from "./player.validation";
+import { createPlayerBodySchema, updatePlayerBodySchema } from "./player.validation";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -66,6 +67,12 @@ playerRouter.get(
   "/:id",
   permissionMiddleware(PERMISSIONS.PLAYER_LIST),
   getPlayerByIdController,
+);
+playerRouter.patch(
+  "/:id",
+  permissionMiddleware(PERMISSIONS.PLAYER_EDIT),
+  validate({ body: updatePlayerBodySchema }),
+  updatePlayerController,
 );
 playerRouter.get("/", permissionMiddleware(PERMISSIONS.PLAYER_LIST), listPlayerController);
 

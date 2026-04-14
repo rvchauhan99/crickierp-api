@@ -351,7 +351,11 @@ function expenseEventTime(e: { approvedAt?: Date; createdAt?: Date }): Date {
   return new Date(0);
 }
 
-/** Merged deposit credits, withdrawal debits, and approved expense debits for a bank account (chronological ledger). */
+/**
+ * Merged deposit credits, withdrawal debits, and approved expense debits for a bank account (chronological ledger).
+ * Withdrawal rows are sourced from banker-paid entries (status: approved) for the selected payout bank.
+ * Reverse bonus is memo-only and never posted as a separate cash ledger row.
+ */
 export async function getBankLedger(bankId: string, query: LedgerQuery) {
   if (!Types.ObjectId.isValid(bankId)) {
     throw new AppError("validation_error", "Invalid bank id", 400);
@@ -371,7 +375,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       .populate("player", "name")
       .populate("createdBy", "fullName")
       .lean(),
-    WithdrawalModel.find({ payoutBankId: bid, status: "finalized" })
+    WithdrawalModel.find({ payoutBankId: bid, status: "approved" })
       .populate("player", "name")
       .populate("createdBy", "fullName")
       .lean(),
@@ -389,7 +393,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
     for (const w of allWithdrawals) {
       const at = withdrawalEventTime(w);
       if (at >= fromD) continue;
-      // Bonus is OFF balance sheet, so liability is what actually went out
+      // Reverse bonus stays memo-only; cash movement is payable amount only.
       priorNet -= w.payableAmount ?? w.amount;
     }
     for (const e of allExpenses) {
@@ -467,7 +471,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
     
     if (ev.kind === "withdrawal") {
       const w = ev.doc;
-      const amt = w.payableAmount ?? w.amount; // Actual cash paid
+      const amt = w.payableAmount ?? w.amount; // Actual cash paid from company bank
       const reversal = w.reverseBonus ?? 0;
       running -= amt;
       totalDebits += amt;

@@ -191,14 +191,24 @@ async function buildPlayerListFilter(q: ListPlayerQuery): Promise<Record<string,
     conditions.push(dateCond);
   }
 
-  const bonusF = numberFieldCondition(
-    "bonusPercentage",
-    trimUndef(q.bonusPercentage),
-    trimUndef(q.bonusPercentage_op),
-    trimUndef(q.bonusPercentage_to),
+  const regularBonus = numberFieldCondition(
+    "regularBonusPercentage",
+    trimUndef(q.regularBonusPercentage ?? q.bonusPercentage),
+    trimUndef(q.regularBonusPercentage_op ?? q.bonusPercentage_op),
+    trimUndef(q.regularBonusPercentage_to ?? q.bonusPercentage_to),
   );
-  if (bonusF) {
-    conditions.push(bonusF);
+  if (regularBonus) {
+    conditions.push(regularBonus);
+  }
+
+  const firstDepositBonus = numberFieldCondition(
+    "firstDepositBonusPercentage",
+    trimUndef(q.firstDepositBonusPercentage),
+    trimUndef(q.firstDepositBonusPercentage_op),
+    trimUndef(q.firstDepositBonusPercentage_to),
+  );
+  if (firstDepositBonus) {
+    conditions.push(firstDepositBonus);
   }
 
   if (conditions.length === 0) {
@@ -235,7 +245,13 @@ export async function resolveExchangeIdByName(name: string): Promise<{
 }
 
 export async function createPlayer(
-  input: { exchangeId: string; playerId: string; phone: string; bonusPercentage: number },
+  input: {
+    exchangeId: string;
+    playerId: string;
+    phone: string;
+    regularBonusPercentage: number;
+    firstDepositBonusPercentage: number;
+  },
   actorId: string,
   requestId?: string,
 ) {
@@ -246,14 +262,16 @@ export async function createPlayer(
 
   const playerId = input.playerId.trim();
   const phone = input.phone.trim();
-  const bonusPercentage = input.bonusPercentage;
+  const regularBonusPercentage = input.regularBonusPercentage;
+  const firstDepositBonusPercentage = input.firstDepositBonusPercentage;
 
   try {
     const doc = await PlayerModel.create({
       exchange: new Types.ObjectId(input.exchangeId),
       playerId,
       phone,
-      bonusPercentage,
+      regularBonusPercentage,
+      firstDepositBonusPercentage,
       createdBy: new Types.ObjectId(actorId),
       updatedBy: new Types.ObjectId(actorId),
     });
@@ -267,7 +285,8 @@ export async function createPlayer(
         exchangeId: input.exchangeId,
         playerId,
         phone,
-        bonusPercentage,
+        regularBonusPercentage,
+        firstDepositBonusPercentage,
       },
       requestId,
     });
@@ -286,10 +305,63 @@ export async function getPlayerById(id: string) {
   if (!mongoose.Types.ObjectId.isValid(id)) {
     throw new AppError("validation_error", "Invalid player id", 400);
   }
-  const doc = await PlayerModel.findById(id).select("playerId phone bonusPercentage").lean();
+  const doc = await PlayerModel.findById(id)
+    .select("exchange playerId phone regularBonusPercentage firstDepositBonusPercentage")
+    .populate("exchange", "name provider")
+    .lean();
   if (!doc) {
     throw new AppError("not_found", "Player not found", 404);
   }
+  return {
+    ...doc,
+    bonusPercentage: doc.regularBonusPercentage,
+  };
+}
+
+export async function updatePlayer(
+  id: string,
+  input: {
+    phone: string;
+    regularBonusPercentage: number;
+    firstDepositBonusPercentage: number;
+  },
+  actorId: string,
+  requestId?: string,
+) {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    throw new AppError("validation_error", "Invalid player id", 400);
+  }
+  const doc = await PlayerModel.findById(id);
+  if (!doc) {
+    throw new AppError("not_found", "Player not found", 404);
+  }
+
+  const oldValue = {
+    phone: doc.phone,
+    regularBonusPercentage: doc.regularBonusPercentage,
+    firstDepositBonusPercentage: doc.firstDepositBonusPercentage,
+  };
+
+  doc.phone = input.phone.trim();
+  doc.regularBonusPercentage = input.regularBonusPercentage;
+  doc.firstDepositBonusPercentage = input.firstDepositBonusPercentage;
+  doc.updatedBy = new Types.ObjectId(actorId);
+  await doc.save();
+
+  await createAuditLog({
+    actorId,
+    action: "player.update",
+    entity: "player",
+    entityId: doc._id.toString(),
+    oldValue,
+    newValue: {
+      phone: doc.phone,
+      regularBonusPercentage: doc.regularBonusPercentage,
+      firstDepositBonusPercentage: doc.firstDepositBonusPercentage,
+    },
+    requestId,
+  });
+
   return doc;
 }
 
@@ -297,7 +369,8 @@ export async function listPlayers(query: ListPlayerQuery) {
   const page = query.page ?? 1;
   const pageSize = query.pageSize ?? query.limit ?? 20;
   const skip = (page - 1) * pageSize;
-  const sortBy = query.sortBy ?? "createdAt";
+  const requestedSortBy = query.sortBy ?? "createdAt";
+  const sortBy = requestedSortBy === "bonusPercentage" ? "regularBonusPercentage" : requestedSortBy;
   const sortOrder = query.sortOrder === "asc" ? 1 : -1;
 
   const filter = await buildPlayerListFilter(query);
@@ -314,8 +387,16 @@ export async function listPlayers(query: ListPlayerQuery) {
     PlayerModel.countDocuments(filter),
   ]);
 
+  const normalizedRows = rows.map((row) => ({
+    ...row,
+    bonusPercentage:
+      typeof row.regularBonusPercentage === "number"
+        ? row.regularBonusPercentage
+        : Number((row as { bonusPercentage?: unknown }).bonusPercentage ?? 0),
+  }));
+
   return {
-    rows,
+    rows: normalizedRows,
     meta: {
       total,
       page,
@@ -326,7 +407,8 @@ export async function listPlayers(query: ListPlayerQuery) {
 
 export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buffer> {
   const filter = await buildPlayerListFilter(query);
-  const sortBy = query.sortBy ?? "createdAt";
+  const requestedSortBy = query.sortBy ?? "createdAt";
+  const sortBy = requestedSortBy === "bonusPercentage" ? "regularBonusPercentage" : requestedSortBy;
   const sortOrder = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await PlayerModel.find(filter)
@@ -356,7 +438,8 @@ export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buf
       Provider: ex?.provider ?? "",
       "Player Id": r.playerId,
       Phone: r.phone,
-      "Bonus %": r.bonusPercentage ?? 0,
+      "Regular Bonus %": r.regularBonusPercentage ?? 0,
+      "First Deposit Bonus %": r.firstDepositBonusPercentage ?? 0,
       "Created By": formatCreatedBy(r.createdBy),
       "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
     };
@@ -369,8 +452,8 @@ export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buf
 }
 
 export function getSampleCsvBuffer(): Buffer {
-  const header = "exchange_name,player_id,phone,bonus_percentage\n";
-  const example = "Example Exchange,PLAYER001,9876543210,5\n";
+  const header = "exchange_name,player_id,phone,bonus_percentage,first_deposit_bonus_percentage\n";
+  const example = "Example Exchange,PLAYER001,9876543210,5,10\n";
   return Buffer.from(header + example, "utf-8");
 }
 
@@ -402,9 +485,10 @@ function pickCellRaw(row: Record<string, unknown>, ...aliases: string[]): string
 
 export type ImportRowError = { row: number; message: string };
 
-function parseBonusPercentageCell(
+function parsePercentageCell(
   raw: string,
   rowNum: number,
+  fieldName: string,
 ): { ok: true; value: number } | { ok: false; error: ImportRowError } {
   const t = raw.trim();
   if (t === "") {
@@ -414,13 +498,13 @@ function parseBonusPercentageCell(
   if (!Number.isFinite(n)) {
     return {
       ok: false,
-      error: { row: rowNum, message: "bonus_percentage must be a valid number" },
+      error: { row: rowNum, message: `${fieldName} must be a valid number` },
     };
   }
   if (n < 0 || n > 100) {
     return {
       ok: false,
-      error: { row: rowNum, message: "bonus_percentage must be between 0 and 100" },
+      error: { row: rowNum, message: `${fieldName} must be between 0 and 100` },
     };
   }
   return { ok: true, value: n };
@@ -435,7 +519,8 @@ type ParsedImportRow = {
   exchangeId: Types.ObjectId;
   playerId: string;
   phone: string;
-  bonusPercentage: number;
+  regularBonusPercentage: number;
+  firstDepositBonusPercentage: number;
 };
 
 function throwImportValidation(message: string, errors: ImportRowError[]): never {
@@ -449,6 +534,7 @@ export async function importPlayersFromFile(
   requestId?: string,
 ): Promise<{
   created: number;
+  updated: number;
   skipped: number;
 }> {
   const lower = originalName.toLowerCase();
@@ -514,7 +600,7 @@ export async function importPlayersFromFile(
       continue;
     }
 
-    const bonusRaw = pickCellRaw(
+    const regularBonusRaw = pickCellRaw(
       row,
       "bonus_percentage",
       "bonus_percent",
@@ -522,9 +608,27 @@ export async function importPlayersFromFile(
       "bonus percentage",
       "bonus%",
     );
-    const bonusParsed = parseBonusPercentageCell(bonusRaw, rowNum);
-    if (!bonusParsed.ok) {
-      errors.push(bonusParsed.error);
+    const regularBonusParsed = parsePercentageCell(regularBonusRaw, rowNum, "bonus_percentage");
+    if (!regularBonusParsed.ok) {
+      errors.push(regularBonusParsed.error);
+      continue;
+    }
+
+    const firstDepositBonusRaw = pickCellRaw(
+      row,
+      "first_deposit_bonus_percentage",
+      "first_deposit_bonus_percent",
+      "first deposit bonus percentage",
+      "first deposit bonus%",
+      "firstdepositbonuspercentage",
+    );
+    const firstDepositBonusParsed = parsePercentageCell(
+      firstDepositBonusRaw,
+      rowNum,
+      "first_deposit_bonus_percentage",
+    );
+    if (!firstDepositBonusParsed.ok) {
+      errors.push(firstDepositBonusParsed.error);
       continue;
     }
 
@@ -533,7 +637,8 @@ export async function importPlayersFromFile(
       exchangeId: resolved.id,
       playerId,
       phone,
-      bonusPercentage: bonusParsed.value,
+      regularBonusPercentage: regularBonusParsed.value,
+      firstDepositBonusPercentage: firstDepositBonusParsed.value,
     });
   }
 
@@ -563,51 +668,76 @@ export async function importPlayersFromFile(
     throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", dupErrors);
   }
 
+  const actorOid = new Types.ObjectId(actorId);
   const orConditions = parsedRows.map((p) => ({
     exchange: p.exchangeId,
     playerId: p.playerId,
   }));
+  const existing = await PlayerModel.find({ $or: orConditions }).select("_id exchange playerId").lean();
+  const existingByKey = new Map<string, Types.ObjectId>();
+  for (const doc of existing) {
+    const exId = (doc.exchange as Types.ObjectId).toString();
+    existingByKey.set(`${exId}:${doc.playerId}`, doc._id as Types.ObjectId);
+  }
 
-  const existingKeys = new Set<string>();
-  const chunkSize = 200;
-  for (let i = 0; i < orConditions.length; i += chunkSize) {
-    const chunk = orConditions.slice(i, i + chunkSize);
-    const found = await PlayerModel.find({ $or: chunk }).select("exchange playerId").lean();
-    for (const doc of found) {
-      const exId = (doc.exchange as Types.ObjectId).toString();
-      existingKeys.add(`${exId}:${doc.playerId}`);
+  const docsToCreate = parsedRows
+    .filter((p) => !existingByKey.has(`${p.exchangeId.toString()}:${p.playerId}`))
+    .map((p) => ({
+      exchange: p.exchangeId,
+      playerId: p.playerId,
+      phone: p.phone,
+      regularBonusPercentage: p.regularBonusPercentage,
+      firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+      createdBy: actorOid,
+      updatedBy: actorOid,
+    }));
+
+  const updateOps = parsedRows
+    .map((p) => {
+      const key = `${p.exchangeId.toString()}:${p.playerId}`;
+      const existingId = existingByKey.get(key);
+      if (!existingId) return null;
+      return {
+        updateOne: {
+          filter: { _id: existingId },
+          update: {
+            $set: {
+              phone: p.phone,
+              regularBonusPercentage: p.regularBonusPercentage,
+              firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+              updatedBy: actorOid,
+            },
+          },
+        },
+      };
+    })
+    .filter((op): op is NonNullable<typeof op> => op !== null);
+
+  const created = docsToCreate.length;
+  const updated = updateOps.length;
+
+  const transactionalWrite = async (session?: mongoose.ClientSession) => {
+    if (docsToCreate.length > 0) {
+      if (session) {
+        await PlayerModel.insertMany(docsToCreate, { session });
+      } else {
+        await PlayerModel.insertMany(docsToCreate);
+      }
     }
-  }
-
-  const dbErrors: ImportRowError[] = [];
-  for (const p of parsedRows) {
-    const key = `${p.exchangeId.toString()}:${p.playerId}`;
-    if (existingKeys.has(key)) {
-      dbErrors.push({
-        row: p.rowNum,
-        message: `Player already exists for this exchange`,
-      });
+    if (updateOps.length > 0) {
+      if (session) {
+        await PlayerModel.bulkWrite(updateOps, { session });
+      } else {
+        await PlayerModel.bulkWrite(updateOps);
+      }
     }
-  }
-  if (dbErrors.length > 0) {
-    throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", dbErrors);
-  }
-
-  const actorOid = new Types.ObjectId(actorId);
-  const docs = parsedRows.map((p) => ({
-    exchange: p.exchangeId,
-    playerId: p.playerId,
-    phone: p.phone,
-    bonusPercentage: p.bonusPercentage,
-    createdBy: actorOid,
-    updatedBy: actorOid,
-  }));
+  };
 
   try {
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
-        await PlayerModel.insertMany(docs, { session });
+        await transactionalWrite(session);
       });
     } finally {
       await session.endSession();
@@ -615,7 +745,7 @@ export async function importPlayersFromFile(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (/replica set|Transaction numbers|multi-document transactions/i.test(msg)) {
-      await PlayerModel.insertMany(docs);
+      await transactionalWrite();
     } else {
       throw err;
     }
@@ -627,12 +757,13 @@ export async function importPlayersFromFile(
     entity: "player",
     entityId: "bulk",
     newValue: {
-      created: parsedRows.length,
+      created,
+      updated,
       skipped,
       fileName: originalName,
     },
     requestId,
   });
 
-  return { created: parsedRows.length, skipped };
+  return { created, updated, skipped };
 }

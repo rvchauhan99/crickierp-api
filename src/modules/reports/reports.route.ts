@@ -4,6 +4,7 @@ import { permissionMiddleware } from "../../shared/middlewares/permission.middle
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import { validate } from "../../shared/middlewares/validate.middleware";
 import {
+  dashboardSummaryQuerySchema,
   expenseAnalysisRecordsQuerySchema,
   expenseAnalysisSummaryQuerySchema,
 } from "./reports.validation";
@@ -18,7 +19,12 @@ import {
 const reportsRouter = Router();
 
 reportsRouter.use(authMiddleware);
-reportsRouter.get("/dashboard-summary", permissionMiddleware(PERMISSIONS.DASHBOARD_VIEW), dashboardSummaryController);
+reportsRouter.get(
+  "/dashboard-summary",
+  permissionMiddleware(PERMISSIONS.DASHBOARD_VIEW),
+  validate({ query: dashboardSummaryQuerySchema }),
+  dashboardSummaryController,
+);
 reportsRouter.get(
   "/transaction-history",
   permissionMiddleware(PERMISSIONS.REPORTS_TRANSACTION_HISTORY),

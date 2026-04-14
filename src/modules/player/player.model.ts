@@ -5,7 +5,8 @@ export interface PlayerDocument {
   exchange: Types.ObjectId;
   playerId: string;
   phone: string;
-  bonusPercentage: number;
+  regularBonusPercentage: number;
+  firstDepositBonusPercentage: number;
   createdBy: Types.ObjectId;
   updatedBy: Types.ObjectId;
   createdAt: Date;
@@ -17,7 +18,8 @@ const playerSchema = new Schema<PlayerDocument>(
     exchange: { type: Schema.Types.ObjectId, required: true, ref: "Exchange" },
     playerId: { type: String, required: true, trim: true },
     phone: { type: String, required: true, trim: true },
-    bonusPercentage: { type: Number, required: true, min: 0, max: 100, default: 0 },
+    regularBonusPercentage: { type: Number, required: true, min: 0, max: 100, default: 0 },
+    firstDepositBonusPercentage: { type: Number, required: true, min: 0, max: 100, default: 0 },
     createdBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },
     updatedBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },
   },

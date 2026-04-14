@@ -2,6 +2,14 @@ import { Schema, model, Types } from "mongoose";
 
 export type ExpenseStatus = "pending_audit" | "approved" | "rejected";
 
+export interface ExpenseDocumentFile {
+  path: string;
+  filename: string;
+  size: number;
+  mime_type: string;
+  uploaded_at: Date;
+}
+
 export interface ExpenseDocument {
   _id: Types.ObjectId;
   expenseTypeId: Types.ObjectId;
@@ -18,6 +26,7 @@ export interface ExpenseDocument {
   approvedBy?: Types.ObjectId;
   approvedAt?: Date;
   bankBalanceAfter?: number;
+  documents: ExpenseDocumentFile[];
   createdBy: Types.ObjectId;
   updatedBy?: Types.ObjectId;
   createdAt: Date;
@@ -42,6 +51,15 @@ const expenseSchema = new Schema<ExpenseDocument>(
     approvedBy: { type: Schema.Types.ObjectId, ref: "User" },
     approvedAt: { type: Date },
     bankBalanceAfter: { type: Number, min: 0 },
+    documents: [
+      {
+        path: { type: String, required: true, trim: true },
+        filename: { type: String, required: true, trim: true },
+        size: { type: Number, required: true, min: 0 },
+        mime_type: { type: String, required: true, trim: true },
+        uploaded_at: { type: Date, required: true, default: Date.now },
+      },
+    ],
     createdBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },
     updatedBy: { type: Schema.Types.ObjectId, ref: "User" },
   },

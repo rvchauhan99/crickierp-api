@@ -63,3 +63,43 @@ export const transactionHistoryQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(500).default(20),
 });
+
+export const dashboardSummaryQuerySchema = z.object({
+  fromDate: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  ),
+  toDate: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  ),
+  exchangeId: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.string().length(24).optional(),
+  ),
+  status: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.enum(["all", "pending", "approved", "rejected"]).optional(),
+  ),
+  transactionType: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.enum(["all", "deposit", "withdrawal", "expense"]).optional(),
+  ),
+  playerId: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.string().length(24).optional(),
+  ),
+  bankId: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.string().length(24).optional(),
+  ),
+  amountFrom: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : Number(v)),
+    z.number().nonnegative().optional(),
+  ),
+  amountTo: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : Number(v)),
+    z.number().nonnegative().optional(),
+  ),
+  search: optionalTrimmed,
+});
