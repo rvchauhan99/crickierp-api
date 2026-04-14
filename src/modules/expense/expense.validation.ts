@@ -45,3 +45,12 @@ export const rejectExpenseBodySchema = z.object({
   reasonId: z.string().length(24),
   remark: z.string().max(2000).trim().optional(),
 });
+
+export const expenseIdParamSchema = z.object({
+  id: z.string().length(24),
+});
+
+export const expenseDocumentViewParamsSchema = z.object({
+  id: z.string().length(24),
+  docIndex: z.coerce.number().int().nonnegative(),
+});

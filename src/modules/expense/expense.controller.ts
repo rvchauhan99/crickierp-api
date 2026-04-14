@@ -3,10 +3,12 @@ import { StatusCodes } from "http-status-codes";
 import {
   approveExpense,
   createExpense,
+  getExpenseDocumentSignedUrl,
   getExpenseById,
   listActiveExpenseTypes,
   listExpenses,
   rejectExpense,
+  uploadExpenseDocuments,
   updateExpense,
 } from "./expense.service";
 import {
@@ -60,5 +62,19 @@ export async function rejectExpenseController(req: Request, res: Response) {
     req.user!.userId,
     req.requestId,
   );
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function uploadExpenseDocumentsController(req: Request, res: Response) {
+  const id = String(req.params.id);
+  const files = Array.isArray(req.files) ? req.files : [];
+  const data = await uploadExpenseDocuments(id, files, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function expenseDocumentViewUrlController(req: Request, res: Response) {
+  const id = String(req.params.id);
+  const docIndex = Number(req.params.docIndex);
+  const data = await getExpenseDocumentSignedUrl(id, docIndex);
   res.status(StatusCodes.OK).json({ success: true, data });
 }
