@@ -454,6 +454,9 @@ export async function exchangeApproveDeposit(
     "regularBonusPercentage firstDepositBonusPercentage exchange",
   );
   if (!playerDoc) throw new AppError("not_found", "Player not found", 404);
+  if (!playerDoc.exchange) {
+    throw new AppError("business_rule_error", "Player has no exchange assigned", 400);
+  }
 
   const playerObjectId = new Types.ObjectId(input.playerId);
   const isFirstDeposit = await isFirstDepositForPlayer(playerObjectId, doc._id);
@@ -504,7 +507,7 @@ export async function exchangeApproveDeposit(
     requestId,
   });
 
-  await recomputeExchangeCurrentBalance(playerDoc.exchange.toString());
+  await recomputeExchangeCurrentBalance(String(playerDoc.exchange));
 
   return doc;
 }
