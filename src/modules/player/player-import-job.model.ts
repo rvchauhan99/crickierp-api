@@ -10,6 +10,14 @@ export type PlayerImportJobStatus =
 export interface PlayerImportJobErrorItem {
   row: number;
   message: string;
+  reason: string;
+  rowData: {
+    exchange_name: string;
+    player_id: string;
+    phone: string;
+    bonus_percentage: string;
+    first_deposit_bonus_percentage: string;
+  };
 }
 
 export interface PlayerImportJobProgress {
@@ -33,6 +41,7 @@ export interface PlayerImportJobDocument {
   failureReason?: string;
   progress: PlayerImportJobProgress;
   errorSample: PlayerImportJobErrorItem[];
+  errorRows: PlayerImportJobErrorItem[];
   lock?: {
     lockedBy: string;
     lockedAt: Date;
@@ -57,6 +66,14 @@ const errorItemSchema = new Schema<PlayerImportJobErrorItem>(
   {
     row: { type: Number, required: true },
     message: { type: String, required: true },
+    reason: { type: String, required: true },
+    rowData: {
+      exchange_name: { type: String, required: true, default: "" },
+      player_id: { type: String, required: true, default: "" },
+      phone: { type: String, required: true, default: "" },
+      bonus_percentage: { type: String, required: true, default: "" },
+      first_deposit_bonus_percentage: { type: String, required: true, default: "" },
+    },
   },
   { _id: false },
 );
@@ -89,6 +106,7 @@ const playerImportJobSchema = new Schema<PlayerImportJobDocument>(
     failureReason: { type: String },
     progress: { type: progressSchema, default: () => ({}) },
     errorSample: { type: [errorItemSchema], default: [] },
+    errorRows: { type: [errorItemSchema], default: [] },
     lock: { type: lockSchema, required: false },
   },
   { timestamps: true },

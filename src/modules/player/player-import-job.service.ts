@@ -2,7 +2,12 @@ import { Types } from "mongoose";
 import { AppError } from "../../shared/errors/AppError";
 import { logger } from "../../shared/logger";
 import { createAuditLog } from "../audit/audit.service";
-import { applyPlayerImportRows, parsePlayerImportFile, type ImportRowError } from "./player.service";
+import {
+  applyPlayerImportRows,
+  buildPlayerImportErrorCsvBuffer,
+  parsePlayerImportFile,
+  type ImportRowError,
+} from "./player.service";
 import { closePlayerImportEventStream, emitPlayerImportEvent } from "./player-import-events";
 import { PlayerImportJobModel, type PlayerImportJobDocument } from "./player-import-job.model";
 
@@ -36,6 +41,7 @@ type PlayerImportJobLean = Pick<
   | "failureReason"
   | "progress"
   | "errorSample"
+  | "errorRows"
 >;
 
 export type PlayerImportJobStatusDto = {
@@ -55,6 +61,7 @@ export type PlayerImportJobStatusDto = {
     skippedRows: number;
   };
   errorSample: ImportRowError[];
+  errorCsvAvailable: boolean;
 };
 
 function statusDtoFromLean(job: PlayerImportJobLean | null) {
@@ -76,6 +83,7 @@ function statusDtoFromLean(job: PlayerImportJobLean | null) {
       skippedRows: job.progress.skippedRows,
     },
     errorSample: job.errorSample ?? [],
+    errorCsvAvailable: (job.errorRows?.length ?? 0) > 0,
   } satisfies PlayerImportJobStatusDto;
 }
 
@@ -116,6 +124,31 @@ export async function getPlayerImportJobStatus(jobId: string, actorId: string) {
     throw new AppError("auth_error", "You do not have access to this import job", 403);
   }
   return statusDtoFromLean(job as unknown as PlayerImportJobLean | null);
+}
+
+export async function getPlayerImportJobErrorCsv(jobId: string, actorId: string) {
+  if (!Types.ObjectId.isValid(jobId)) {
+    throw new AppError("validation_error", "Invalid job id", 400);
+  }
+  const job = await PlayerImportJobModel.findById(jobId).lean();
+  if (!job) {
+    throw new AppError("not_found", "Import job not found", 404);
+  }
+  if (String(job.createdBy) !== actorId) {
+    throw new AppError("auth_error", "You do not have access to this import job", 403);
+  }
+  if (job.status !== "failed") {
+    throw new AppError("validation_error", "Error CSV is available only for failed import jobs", 409);
+  }
+  const errors = (job.errorRows ?? []) as ImportRowError[];
+  if (errors.length === 0) {
+    throw new AppError("not_found", "No row-level validation errors found for this import job", 404);
+  }
+
+  return {
+    fileName: `player-import-errors-${jobId}.csv`,
+    buffer: buildPlayerImportErrorCsvBuffer(errors),
+  };
 }
 
 async function claimNextJob() {
@@ -207,6 +240,8 @@ async function processSingleJob(jobId: string) {
           "progress.successRows": created + updated,
           "progress.failedRows": 0,
           "progress.processedRows": totalRows,
+          errorRows: [],
+          errorSample: [],
           fileBuffer: Buffer.alloc(0),
         },
         $unset: { lock: 1 },
@@ -238,6 +273,7 @@ async function processSingleJob(jobId: string) {
           "progress.failedRows": details.length,
           "progress.processedRows": Math.max(job.progress.processedRows, details.length),
           errorSample: details.slice(0, MAX_ERROR_SAMPLE),
+          errorRows: details,
           fileBuffer: Buffer.alloc(0),
         },
         $unset: { lock: 1 },

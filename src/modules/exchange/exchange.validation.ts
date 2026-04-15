@@ -36,6 +36,9 @@ export const listExchangeQuerySchema = z.object({
   openingBalance: z.string().optional(),
   openingBalance_to: z.string().optional(),
   openingBalance_op: z.string().optional(),
+  currentBalance: z.string().optional(),
+  currentBalance_to: z.string().optional(),
+  currentBalance_op: z.string().optional(),
   bonus: z.string().optional(),
   bonus_to: z.string().optional(),
   bonus_op: z.string().optional(),
@@ -49,5 +52,5 @@ export const exchangeStatementQuerySchema = z.object({
   fromDate: z.string().optional(),
   toDate: z.string().optional(),
   playerId: z.string().length(24).optional(),
-  entryType: z.enum(["all", "deposit", "withdrawal"]).default("all"),
+  entryType: z.enum(["all", "deposit", "withdrawal", "topup"]).default("all"),
 });

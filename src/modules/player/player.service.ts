@@ -483,12 +483,66 @@ function pickCellRaw(row: Record<string, unknown>, ...aliases: string[]): string
   return "";
 }
 
-export type ImportRowError = { row: number; message: string };
+export type ImportErrorRowData = {
+  exchange_name: string;
+  player_id: string;
+  phone: string;
+  bonus_percentage: string;
+  first_deposit_bonus_percentage: string;
+};
+
+export type ImportRowError = {
+  row: number;
+  message: string;
+  reason: string;
+  rowData: ImportErrorRowData;
+};
+
+function buildImportError(
+  rowNum: number,
+  reason: string,
+  rowData: ImportErrorRowData,
+): ImportRowError {
+  return { row: rowNum, message: reason, reason, rowData };
+}
+
+function quoteCsvValue(value: string): string {
+  const escaped = value.replace(/"/g, "\"\"");
+  return `"${escaped}"`;
+}
+
+export function buildPlayerImportErrorCsvBuffer(errors: ImportRowError[]): Buffer {
+  const header = [
+    "row",
+    "exchange_name",
+    "player_id",
+    "phone",
+    "bonus_percentage",
+    "first_deposit_bonus_percentage",
+    "error_reason",
+  ];
+  const lines = [header.join(",")];
+  for (const error of errors) {
+    lines.push(
+      [
+        String(error.row),
+        quoteCsvValue(error.rowData.exchange_name),
+        quoteCsvValue(error.rowData.player_id),
+        quoteCsvValue(error.rowData.phone),
+        quoteCsvValue(error.rowData.bonus_percentage),
+        quoteCsvValue(error.rowData.first_deposit_bonus_percentage),
+        quoteCsvValue(error.reason),
+      ].join(","),
+    );
+  }
+  return Buffer.from(lines.join("\n"), "utf-8");
+}
 
 function parsePercentageCell(
   raw: string,
   rowNum: number,
   fieldName: string,
+  rowData: ImportErrorRowData,
 ): { ok: true; value: number } | { ok: false; error: ImportRowError } {
   const t = raw.trim();
   if (t === "") {
@@ -498,13 +552,13 @@ function parsePercentageCell(
   if (!Number.isFinite(n)) {
     return {
       ok: false,
-      error: { row: rowNum, message: `${fieldName} must be a valid number` },
+      error: buildImportError(rowNum, `${fieldName} must be a valid number`, rowData),
     };
   }
   if (n < 0 || n > 100) {
     return {
       ok: false,
-      error: { row: rowNum, message: `${fieldName} must be between 0 and 100` },
+      error: buildImportError(rowNum, `${fieldName} must be between 0 and 100`, rowData),
     };
   }
   return { ok: true, value: n };
@@ -516,6 +570,7 @@ function sheetRowsToObjects(sheet: xlsx.WorkSheet): Record<string, unknown>[] {
 
 type ParsedImportRow = {
   rowNum: number;
+  exchangeName: string;
   exchangeId: Types.ObjectId;
   playerId: string;
   phone: string;
@@ -610,6 +665,7 @@ export async function parsePlayerImportFile(
     phone: string;
     regularBonusRaw: string;
     firstDepositBonusRaw: string;
+    rowData: ImportErrorRowData;
   }> = [];
 
   for (let i = 0; i < rows.length; i++) {
@@ -618,6 +674,29 @@ export async function parsePlayerImportFile(
     const exchangeName = pickCell(row, "exchange_name", "exchange", "exchange name");
     const playerId = pickCell(row, "player_id", "playerid", "player id");
     const phone = pickCell(row, "phone", "phone_number", "phone number", "mobile");
+    const regularBonusRaw = pickCellRaw(
+      row,
+      "bonus_percentage",
+      "bonus_percent",
+      "bonus",
+      "bonus percentage",
+      "bonus%",
+    );
+    const firstDepositBonusRaw = pickCellRaw(
+      row,
+      "first_deposit_bonus_percentage",
+      "first_deposit_bonus_percent",
+      "first deposit bonus percentage",
+      "first deposit bonus%",
+      "firstdepositbonuspercentage",
+    );
+    const rowData: ImportErrorRowData = {
+      exchange_name: exchangeName,
+      player_id: playerId,
+      phone,
+      bonus_percentage: regularBonusRaw,
+      first_deposit_bonus_percentage: firstDepositBonusRaw,
+    };
 
     if (!exchangeName && !playerId && !phone) {
       skipped += 1;
@@ -625,15 +704,15 @@ export async function parsePlayerImportFile(
     }
 
     if (!exchangeName) {
-      errors.push({ row: rowNum, message: "exchange_name is required" });
+      errors.push(buildImportError(rowNum, "exchange_name is required", rowData));
       continue;
     }
     if (!playerId) {
-      errors.push({ row: rowNum, message: "player_id is required" });
+      errors.push(buildImportError(rowNum, "player_id is required", rowData));
       continue;
     }
     if (!phone) {
-      errors.push({ row: rowNum, message: "phone is required" });
+      errors.push(buildImportError(rowNum, "phone is required", rowData));
       continue;
     }
 
@@ -643,22 +722,9 @@ export async function parsePlayerImportFile(
       exchangeName,
       playerId,
       phone,
-      regularBonusRaw: pickCellRaw(
-        row,
-        "bonus_percentage",
-        "bonus_percent",
-        "bonus",
-        "bonus percentage",
-        "bonus%",
-      ),
-      firstDepositBonusRaw: pickCellRaw(
-        row,
-        "first_deposit_bonus_percentage",
-        "first_deposit_bonus_percent",
-        "first deposit bonus percentage",
-        "first deposit bonus%",
-        "firstdepositbonuspercentage",
-      ),
+      regularBonusRaw,
+      firstDepositBonusRaw,
+      rowData,
     });
   }
 
@@ -669,17 +735,25 @@ export async function parsePlayerImportFile(
     if (!exchangeId) {
       const resolved = await resolveExchangeIdByName(row.exchangeName);
       if (resolved.notFound) {
-        errors.push({ row: row.rowNum, message: `No exchange found for name "${row.exchangeName}"` });
+        errors.push(buildImportError(row.rowNum, `No exchange found for name "${row.exchangeName}"`, row.rowData));
       } else if (resolved.ambiguous) {
-        errors.push({
-          row: row.rowNum,
-          message: `Multiple exchanges match "${row.exchangeName}"; names must be unique for import`,
-        });
+        errors.push(
+          buildImportError(
+            row.rowNum,
+            `Multiple exchanges match "${row.exchangeName}"; names must be unique for import`,
+            row.rowData,
+          ),
+        );
       }
       continue;
     }
 
-    const regularBonusParsed = parsePercentageCell(row.regularBonusRaw, row.rowNum, "bonus_percentage");
+    const regularBonusParsed = parsePercentageCell(
+      row.regularBonusRaw,
+      row.rowNum,
+      "bonus_percentage",
+      row.rowData,
+    );
     if (!regularBonusParsed.ok) {
       errors.push(regularBonusParsed.error);
       continue;
@@ -688,6 +762,7 @@ export async function parsePlayerImportFile(
       row.firstDepositBonusRaw,
       row.rowNum,
       "first_deposit_bonus_percentage",
+      row.rowData,
     );
     if (!firstDepositBonusParsed.ok) {
       errors.push(firstDepositBonusParsed.error);
@@ -696,6 +771,7 @@ export async function parsePlayerImportFile(
 
     parsedRows.push({
       rowNum: row.rowNum,
+      exchangeName: row.exchangeName,
       exchangeId,
       playerId: row.playerId,
       phone: row.phone,
@@ -712,6 +788,14 @@ export async function parsePlayerImportFile(
       errors.push({
         row: p.rowNum,
         message: `Duplicate player_id "${p.playerId}" for this exchange (same as row ${first})`,
+        reason: `Duplicate player_id "${p.playerId}" for this exchange (same as row ${first})`,
+        rowData: {
+          exchange_name: p.exchangeName,
+          player_id: p.playerId,
+          phone: p.phone,
+          bonus_percentage: String(p.regularBonusPercentage),
+          first_deposit_bonus_percentage: String(p.firstDepositBonusPercentage),
+        },
       });
     } else {
       seenFirstRow.set(key, p.rowNum);

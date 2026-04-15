@@ -7,6 +7,7 @@ export interface ExchangeDocument {
   name: string;
   provider: string;
   openingBalance: number;
+  currentBalance: number;
   bonus: number;
   status: ExchangeStatus;
   version: number;
@@ -21,6 +22,7 @@ const exchangeSchema = new Schema<ExchangeDocument>(
     name: { type: String, required: true, trim: true },
     provider: { type: String, required: true, trim: true },
     openingBalance: { type: Number, required: true, min: 0 },
+    currentBalance: { type: Number, required: true, min: 0, default: 0 },
     bonus: { type: Number, required: true, min: 0, default: 0 },
     status: { type: String, enum: ["active", "deactive"], default: "active" },
     version: { type: Number, default: 1 },

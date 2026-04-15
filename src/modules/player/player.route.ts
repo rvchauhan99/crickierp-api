@@ -7,6 +7,7 @@ import { PERMISSIONS } from "../../shared/constants/permissions";
 import {
   createPlayerController,
   createPlayerImportJobController,
+  downloadPlayerImportJobErrorsCsvController,
   exportPlayerController,
   getPlayerByIdController,
   getPlayerImportJobStatusController,
@@ -74,6 +75,11 @@ playerRouter.get(
   "/import-jobs/:jobId",
   permissionMiddleware(PERMISSIONS.PLAYER_LIST),
   getPlayerImportJobStatusController,
+);
+playerRouter.get(
+  "/import-jobs/:jobId/errors.csv",
+  permissionMiddleware(PERMISSIONS.PLAYER_LIST),
+  downloadPlayerImportJobErrorsCsvController,
 );
 playerRouter.get(
   "/import-jobs/:jobId/events",

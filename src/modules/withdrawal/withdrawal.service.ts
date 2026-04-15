@@ -4,6 +4,7 @@ import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
+import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
@@ -240,6 +241,13 @@ export async function createWithdrawal(
     requestId,
   });
 
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      await recomputeExchangeCurrentBalance(String(player.exchange));
+    }
+  }
+
   return doc;
 }
 
@@ -368,6 +376,15 @@ export async function updateWithdrawalStatus(
     newValue,
     requestId,
   });
+
+  if (status === "finalized" || status === "rejected") {
+    if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+      const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+      if (player?.exchange) {
+        await recomputeExchangeCurrentBalance(String(player.exchange));
+      }
+    }
+  }
   return doc;
 }
 

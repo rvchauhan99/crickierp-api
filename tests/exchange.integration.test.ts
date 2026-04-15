@@ -3,8 +3,10 @@ import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { createApp } from "../src/app";
 import { DepositModel } from "../src/modules/deposit/deposit.model";
+import { ExchangeTopupModel } from "../src/modules/exchange-topup/exchange-topup.model";
 import { ExchangeModel } from "../src/modules/exchange/exchange.model";
 import { PlayerModel } from "../src/modules/player/player.model";
+import { PlayerImportJobModel } from "../src/modules/player/player-import-job.model";
 import { UserModel } from "../src/modules/users/user.model";
 import { WithdrawalModel } from "../src/modules/withdrawal/withdrawal.model";
 import { bootstrapData } from "../src/shared/db/bootstrap";
@@ -199,5 +201,177 @@ describe("Exchange API integration", () => {
     expect(res.body.data.rows[1].kind).toBe("withdrawal");
     expect(res.body.data.rows[1].direction).toBe("credit");
     expect(res.body.data.rows[1].amount).toBe(250);
+  });
+
+  it("creates topup, updates current balance and includes topup in statement", async () => {
+    const actor = await UserModel.findOne({ username: "superadmin" }).select("_id").lean();
+    expect(actor?._id).toBeDefined();
+    const actorId = actor!._id;
+
+    const exchange = await ExchangeModel.create({
+      name: "E2E Topup",
+      provider: "Provider T",
+      openingBalance: 500,
+      currentBalance: 500,
+      bonus: 0,
+      status: "active",
+      createdBy: actorId,
+      updatedBy: actorId,
+    });
+
+    const player = await PlayerModel.create({
+      exchange: exchange._id,
+      playerId: "PL-T",
+      phone: "9000000003",
+      regularBonusPercentage: 0,
+      firstDepositBonusPercentage: 0,
+      createdBy: actorId,
+      updatedBy: actorId,
+    });
+
+    await DepositModel.create({
+      bankName: "Bank T",
+      utr: "UTR-T-DEP-1",
+      amount: 100,
+      totalAmount: 110,
+      bonusAmount: 10,
+      status: "verified",
+      createdBy: actorId,
+      player: player._id,
+      settledAt: new Date("2026-04-12T09:00:00.000Z"),
+    });
+    await WithdrawalModel.create({
+      player: player._id,
+      playerName: "PL-T",
+      bankName: "Payout Bank",
+      amount: 80,
+      payableAmount: 70,
+      reverseBonus: 10,
+      status: "approved",
+      createdBy: actorId,
+      updatedAt: new Date("2026-04-12T10:00:00.000Z"),
+      createdAt: new Date("2026-04-12T10:00:00.000Z"),
+    });
+
+    const topupRes = await request(app)
+      .post("/api/v1/exchange-topup")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        exchangeId: exchange._id.toString(),
+        amount: 40,
+        remark: "Manual topup",
+      });
+
+    expect(topupRes.status).toBe(201);
+    expect(topupRes.body.success).toBe(true);
+    expect(topupRes.body.data.amount).toBe(40);
+    expect(topupRes.body.data.currentBalance).toBe(500 - 110 + 70 + 40);
+
+    const topupCount = await ExchangeTopupModel.countDocuments({ exchangeId: exchange._id });
+    expect(topupCount).toBe(1);
+
+    const refreshedExchange = await ExchangeModel.findById(exchange._id).lean();
+    expect(refreshedExchange?.currentBalance).toBe(500 - 110 + 70 + 40);
+
+    const statementRes = await request(app)
+      .get(`/api/v1/exchange/${exchange._id.toString()}/statement`)
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(statementRes.status).toBe(200);
+    expect(statementRes.body.data.exchange.currentBalance).toBe(500 - 110 + 70 + 40);
+    expect(statementRes.body.data.totalTopUpCredits).toBe(40);
+    expect(statementRes.body.data.totalCredits).toBe(110);
+    expect(statementRes.body.data.totalDebits).toBe(110);
+    expect(statementRes.body.data.periodClosingBalance).toBe(500);
+    expect(statementRes.body.data.rows.map((r: { kind: string }) => r.kind)).toEqual([
+      "deposit",
+      "withdrawal",
+      "topup",
+    ]);
+    const topupRow = statementRes.body.data.rows.find((r: { kind: string }) => r.kind === "topup");
+    expect(topupRow.direction).toBe("credit");
+    expect(topupRow.amount).toBe(40);
+  });
+
+  it("returns downloadable CSV when sync player import has invalid rows", async () => {
+    const invalidCsv = [
+      "exchange_name,player_id,phone,bonus_percentage,first_deposit_bonus_percentage",
+      "E2E,PLAYER-1,,abc,10",
+    ].join("\n");
+
+    const res = await request(app)
+      .post("/api/v1/players/import")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .attach("file", Buffer.from(invalidCsv, "utf-8"), "players.csv");
+
+    expect(res.status).toBe(400);
+    expect(String(res.headers["content-type"] ?? "")).toContain("text/csv");
+    expect(String(res.headers["content-disposition"] ?? "")).toContain("attachment");
+    const body = Buffer.isBuffer(res.body) ? res.body.toString("utf-8") : String(res.text ?? "");
+    expect(body).toContain("error_reason");
+    expect(body).toContain("phone is required");
+    expect(body).toContain("PLAYER-1");
+  });
+
+  it("downloads async player import job error CSV after job failure", async () => {
+    const actor = await UserModel.findOne({ username: "superadmin" }).select("_id").lean();
+    expect(actor?._id).toBeDefined();
+
+    const failedJob = await PlayerImportJobModel.create({
+      status: "failed",
+      fileName: "players.csv",
+      fileSize: 256,
+      fileMimeType: "text/csv",
+      fileBuffer: Buffer.from("x"),
+      createdBy: actor!._id,
+      failureReason: "Import failed",
+      progress: {
+        totalRows: 1,
+        processedRows: 1,
+        successRows: 0,
+        failedRows: 1,
+        skippedRows: 0,
+      },
+      errorSample: [
+        {
+          row: 2,
+          message: "phone is required",
+          reason: "phone is required",
+          rowData: {
+            exchange_name: "E2E",
+            player_id: "PLAYER-2",
+            phone: "(empty)",
+            bonus_percentage: "5",
+            first_deposit_bonus_percentage: "10",
+          },
+        },
+      ],
+      errorRows: [
+        {
+          row: 2,
+          message: "phone is required",
+          reason: "phone is required",
+          rowData: {
+            exchange_name: "E2E",
+            player_id: "PLAYER-2",
+            phone: "(empty)",
+            bonus_percentage: "5",
+            first_deposit_bonus_percentage: "10",
+          },
+        },
+      ],
+    });
+
+    const res = await request(app)
+      .get(`/api/v1/players/import-jobs/${failedJob._id.toString()}/errors.csv`)
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(res.status).toBe(200);
+    expect(String(res.headers["content-type"] ?? "")).toContain("text/csv");
+    expect(String(res.headers["content-disposition"] ?? "")).toContain(`player-import-errors-${failedJob._id.toString()}.csv`);
+    const body = Buffer.isBuffer(res.body) ? res.body.toString("utf-8") : String(res.text ?? "");
+    expect(body).toContain("error_reason");
+    expect(body).toContain("phone is required");
+    expect(body).toContain("PLAYER-2");
   });
 });

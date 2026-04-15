@@ -4,6 +4,7 @@ import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
+import { ExchangeTopupModel } from "../exchange-topup/exchange-topup.model";
 import { PlayerModel } from "../player/player.model";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExchangeModel } from "./exchange.model";
@@ -202,6 +203,16 @@ function buildExchangeListFilter(q: ListExchangeQuery): Record<string, unknown> 
     conditions.push(ob);
   }
 
+  const cb = numberFieldCondition(
+    "currentBalance",
+    trimUndef(q.currentBalance),
+    trimUndef(q.currentBalance_op),
+    trimUndef(q.currentBalance_to),
+  );
+  if (cb) {
+    conditions.push(cb);
+  }
+
   const bonus = numberFieldCondition("bonus", trimUndef(q.bonus), trimUndef(q.bonus_op), trimUndef(q.bonus_to));
   if (bonus) {
     conditions.push(bonus);
@@ -228,6 +239,7 @@ export async function createExchange(
 
   const payload = {
     ...input,
+    currentBalance: input.openingBalance,
     createdBy: new Types.ObjectId(actorId),
     updatedBy: new Types.ObjectId(actorId),
   };
@@ -242,6 +254,7 @@ export async function createExchange(
       name: doc.name,
       provider: doc.provider,
       openingBalance: doc.openingBalance,
+      currentBalance: doc.currentBalance,
       bonus: doc.bonus,
       status: doc.status,
     },
@@ -306,6 +319,7 @@ export async function exportExchangesToBuffer(query: ListExchangeQuery): Promise
     "Exchange Name": r.name,
     Provider: r.provider,
     "Opening Balance": r.openingBalance,
+    "Current Balance": r.currentBalance ?? r.openingBalance,
     Bonus: r.bonus,
     Version: r.version ?? "",
     Status: r.status,
@@ -342,6 +356,7 @@ export async function updateExchange(
     name: existing.name,
     provider: existing.provider,
     openingBalance: existing.openingBalance,
+    currentBalance: existing.currentBalance,
     bonus: existing.bonus,
     status: existing.status,
     version: existing.version,
@@ -351,6 +366,14 @@ export async function updateExchange(
   existing.updatedBy = new Types.ObjectId(actorId);
   existing.version += 1;
   await existing.save();
+
+  if (input.openingBalance !== undefined) {
+    await recomputeExchangeCurrentBalance(existing._id.toString());
+    const refreshed = await ExchangeModel.findById(existing._id);
+    if (refreshed) {
+      existing.currentBalance = refreshed.currentBalance;
+    }
+  }
 
   await createAuditLog({
     actorId,
@@ -362,6 +385,7 @@ export async function updateExchange(
       name: existing.name,
       provider: existing.provider,
       openingBalance: existing.openingBalance,
+      currentBalance: existing.currentBalance,
       bonus: existing.bonus,
       status: existing.status,
       version: existing.version,
@@ -370,6 +394,55 @@ export async function updateExchange(
   });
 
   return existing;
+}
+
+export async function recomputeExchangeCurrentBalance(exchangeId: string): Promise<number> {
+  if (!Types.ObjectId.isValid(exchangeId)) {
+    throw new AppError("validation_error", "Invalid exchange id", 400);
+  }
+  const exchangeObjectId = new Types.ObjectId(exchangeId);
+  const exchange = await ExchangeModel.findById(exchangeObjectId);
+  if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
+
+  const scopedPlayerIds = await PlayerModel.distinct("_id", { exchange: exchangeObjectId });
+
+  const [depositAgg, withdrawalAgg, topupAgg] = await Promise.all([
+    scopedPlayerIds.length
+      ? DepositModel.aggregate<{ total: number }>([
+          { $match: { player: { $in: scopedPlayerIds }, status: { $in: ["verified", "finalized"] } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $ifNull: ["$totalAmount", "$amount"] } },
+            },
+          },
+        ])
+      : Promise.resolve([] as { total: number }[]),
+    scopedPlayerIds.length
+      ? WithdrawalModel.aggregate<{ total: number }>([
+          { $match: { player: { $in: scopedPlayerIds }, status: { $in: ["approved", "finalized"] } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+            },
+          },
+        ])
+      : Promise.resolve([] as { total: number }[]),
+    ExchangeTopupModel.aggregate<{ total: number }>([
+      { $match: { exchangeId: exchangeObjectId } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]),
+  ]);
+
+  const depositTotal = Number(depositAgg[0]?.total ?? 0);
+  const withdrawalTotal = Number(withdrawalAgg[0]?.total ?? 0);
+  const topupTotal = Number(topupAgg[0]?.total ?? 0);
+  const nextCurrentBalance = exchange.openingBalance - depositTotal + withdrawalTotal + topupTotal;
+
+  exchange.currentBalance = nextCurrentBalance;
+  await exchange.save();
+  return nextCurrentBalance;
 }
 
 function ledgerYmdStart(ymd: string): Date | null {
@@ -434,13 +507,37 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
   const playerIds = players.map((p) => p._id);
   const playerMap = new Map(players.map((p) => [String(p._id), p.playerId]));
 
-  if (playerIds.length === 0) {
+  const [allDeposits, allWithdrawals, allTopups] = await Promise.all([
+    playerIds.length
+      ? DepositModel.find({
+          player: { $in: playerIds },
+          status: { $in: ["verified", "finalized"] },
+        })
+          .select("_id player amount bonusAmount totalAmount utr settledAt exchangeActionAt updatedAt createdAt")
+          .lean()
+      : Promise.resolve([]),
+    playerIds.length
+      ? WithdrawalModel.find({
+          player: { $in: playerIds },
+          status: { $in: ["approved", "finalized"] },
+        })
+          .select("_id player playerName amount payableAmount reverseBonus utr updatedAt createdAt")
+          .lean()
+      : Promise.resolve([]),
+    ExchangeTopupModel.find({ exchangeId: exchangeObjectId })
+      .populate("createdBy", "fullName username")
+      .select("_id exchangeId amount remark createdBy createdAt updatedAt")
+      .lean(),
+  ]);
+
+  if (playerIds.length === 0 && allTopups.length === 0) {
     return {
       exchange: {
         _id: exchange._id.toString(),
         name: exchange.name,
         provider: exchange.provider,
         openingBalance: exchange.openingBalance,
+        currentBalance: exchange.currentBalance ?? exchange.openingBalance,
       },
       periodOpeningBalance: exchange.openingBalance,
       periodClosingBalance: exchange.openingBalance,
@@ -448,24 +545,10 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
       totalDebits: 0,
       totalDepositOutflow: 0,
       totalWithdrawalInflow: 0,
+      totalTopUpCredits: 0,
       rows: [],
     };
   }
-
-  const [allDeposits, allWithdrawals] = await Promise.all([
-    DepositModel.find({
-      player: { $in: playerIds },
-      status: { $in: ["verified", "finalized"] },
-    })
-      .select("_id player amount bonusAmount totalAmount utr settledAt exchangeActionAt updatedAt createdAt")
-      .lean(),
-    WithdrawalModel.find({
-      player: { $in: playerIds },
-      status: { $in: ["approved", "finalized"] },
-    })
-      .select("_id player playerName amount payableAmount reverseBonus utr updatedAt createdAt")
-      .lean(),
-  ]);
 
   let priorNet = 0;
   if (from) {
@@ -477,11 +560,16 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
       if (withdrawalEventTime(w) >= from) continue;
       priorNet += w.payableAmount ?? w.amount;
     }
+    for (const t of allTopups) {
+      if (new Date(t.createdAt) >= from) continue;
+      priorNet += t.amount;
+    }
   }
 
   type StatementEvent =
     | { kind: "deposit"; t: number; doc: (typeof allDeposits)[0] }
-    | { kind: "withdrawal"; t: number; doc: (typeof allWithdrawals)[0] };
+    | { kind: "withdrawal"; t: number; doc: (typeof allWithdrawals)[0] }
+    | { kind: "topup"; t: number; doc: (typeof allTopups)[0] };
 
   const events: StatementEvent[] = [];
   const entryType = query.entryType || "all";
@@ -502,6 +590,14 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
       events.push({ kind: "withdrawal", t: at.getTime(), doc: w });
     }
   }
+  for (const t of allTopups) {
+    const at = new Date(t.createdAt);
+    if (from && at < from) continue;
+    if (to && at > to) continue;
+    if (entryType === "all" || entryType === "topup") {
+      events.push({ kind: "topup", t: at.getTime(), doc: t });
+    }
+  }
   events.sort((a, b) => a.t - b.t);
 
   const periodOpeningBalance = exchange.openingBalance + priorNet;
@@ -510,6 +606,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
   let totalDebits = 0;
   let totalDepositOutflow = 0;
   let totalWithdrawalInflow = 0;
+  let totalTopUpCredits = 0;
 
   const rows = events.map((ev) => {
     if (ev.kind === "deposit") {
@@ -533,23 +630,48 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
       };
     }
 
-    const w = ev.doc;
-    const amount = w.payableAmount ?? w.amount;
-    running += amount;
-    totalCredits += amount;
-    totalWithdrawalInflow += amount;
+    if (ev.kind === "withdrawal") {
+      const w = ev.doc;
+      const amount = w.payableAmount ?? w.amount;
+      running += amount;
+      totalCredits += amount;
+      totalWithdrawalInflow += amount;
+
+      return {
+        kind: "withdrawal" as const,
+        refId: w._id.toString(),
+        at: new Date(ev.t).toISOString(),
+        label: "Withdrawal",
+        playerId: playerMap.get(String(w.player)) ?? w.playerName ?? "",
+        amount,
+        direction: "credit" as const,
+        balanceAfter: running,
+        bonusMemo: w.reverseBonus ?? 0,
+        utr: w.utr,
+      };
+    }
+
+    const topup = ev.doc;
+    running += topup.amount;
+    totalCredits += topup.amount;
+    totalTopUpCredits += topup.amount;
+    const createdByObj = topup.createdBy as { fullName?: string; username?: string } | undefined;
+    const createdByLabel =
+      createdByObj?.fullName?.trim() || createdByObj?.username?.trim() || "";
 
     return {
-      kind: "withdrawal" as const,
-      refId: w._id.toString(),
+      kind: "topup" as const,
+      refId: topup._id.toString(),
       at: new Date(ev.t).toISOString(),
-      label: "Withdrawal",
-      playerId: playerMap.get(String(w.player)) ?? w.playerName ?? "",
-      amount,
+      label: "Top Up",
+      playerId: "",
+      amount: topup.amount,
       direction: "credit" as const,
       balanceAfter: running,
-      bonusMemo: w.reverseBonus ?? 0,
-      utr: w.utr,
+      bonusMemo: 0,
+      utr: undefined,
+      remark: topup.remark ?? "",
+      createdByName: createdByLabel,
     };
   });
 
@@ -559,6 +681,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
       name: exchange.name,
       provider: exchange.provider,
       openingBalance: exchange.openingBalance,
+      currentBalance: exchange.currentBalance ?? exchange.openingBalance,
     },
     periodOpeningBalance,
     periodClosingBalance: running,
@@ -566,6 +689,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
     totalDebits,
     totalDepositOutflow,
     totalWithdrawalInflow,
+    totalTopUpCredits,
     rows,
   };
 }

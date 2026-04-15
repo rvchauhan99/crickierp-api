@@ -4,6 +4,7 @@ import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
+import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
@@ -455,7 +456,7 @@ export async function exchangeApproveDeposit(
   }
 
   const playerDoc = await PlayerModel.findById(input.playerId).select(
-    "regularBonusPercentage firstDepositBonusPercentage",
+    "regularBonusPercentage firstDepositBonusPercentage exchange",
   );
   if (!playerDoc) throw new AppError("not_found", "Player not found", 404);
 
@@ -507,6 +508,8 @@ export async function exchangeApproveDeposit(
     },
     requestId,
   });
+
+  await recomputeExchangeCurrentBalance(playerDoc.exchange.toString());
 
   return doc;
 }
