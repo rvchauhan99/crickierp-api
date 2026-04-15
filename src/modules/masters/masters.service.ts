@@ -220,7 +220,7 @@ export async function updateMaster(modelKey: string, id: string, body: Record<st
   const updated = await Model.findOneAndUpdate(
     { _id: id, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
     { $set: { ...payload, updatedBy: userId } },
-    { new: true },
+    { returnDocument: "after" },
   )
     .lean()
     .exec();
@@ -242,7 +242,7 @@ export async function softDeleteMaster(modelKey: string, id: string, actorId: st
   const updated = await Model.findOneAndUpdate(
     { _id: id, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
     { $set: { deletedAt: new Date(), updatedBy: userId, isActive: false } },
-    { new: true },
+    { returnDocument: "after" },
   )
     .lean()
     .exec();

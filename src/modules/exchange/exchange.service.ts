@@ -3,8 +3,11 @@ import type { z } from "zod";
 import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
+import { DepositModel } from "../deposit/deposit.model";
+import { PlayerModel } from "../player/player.model";
+import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExchangeModel } from "./exchange.model";
-import { listExchangeQuerySchema } from "./exchange.validation";
+import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
 
 type CreateExchangeInput = {
   name: string;
@@ -15,6 +18,7 @@ type CreateExchangeInput = {
 };
 
 type ListExchangeQuery = z.infer<typeof listExchangeQuerySchema>;
+type ExchangeStatementQuery = z.infer<typeof exchangeStatementQuerySchema>;
 
 function trimUndef(s: string | undefined): string | undefined {
   if (s == null) return undefined;
@@ -366,4 +370,202 @@ export async function updateExchange(
   });
 
   return existing;
+}
+
+function ledgerYmdStart(ymd: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0);
+}
+
+function ledgerYmdEnd(ymd: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d, 23, 59, 59, 999);
+}
+
+function depositEventTime(d: { settledAt?: Date; exchangeActionAt?: Date; updatedAt?: Date; createdAt?: Date }): Date {
+  if (d.settledAt) return new Date(d.settledAt);
+  if (d.exchangeActionAt) return new Date(d.exchangeActionAt);
+  if (d.updatedAt) return new Date(d.updatedAt);
+  if (d.createdAt) return new Date(d.createdAt);
+  return new Date(0);
+}
+
+function withdrawalEventTime(w: { updatedAt?: Date; createdAt?: Date }): Date {
+  if (w.updatedAt) return new Date(w.updatedAt);
+  if (w.createdAt) return new Date(w.createdAt);
+  return new Date(0);
+}
+
+/**
+ * Exchange-perspective statement:
+ * - deposit -> debit (money withdrawn from exchange)
+ * - withdrawal -> credit (money deposited into exchange)
+ */
+export async function getExchangeStatement(exchangeId: string, query: ExchangeStatementQuery) {
+  if (!Types.ObjectId.isValid(exchangeId)) {
+    throw new AppError("validation_error", "Invalid exchange id", 400);
+  }
+  const exchangeObjectId = new Types.ObjectId(exchangeId);
+  const exchange = await ExchangeModel.findById(exchangeObjectId).lean();
+  if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
+
+  const fromDate = query.fromDate?.trim();
+  const toDate = query.toDate?.trim();
+  const from = fromDate ? ledgerYmdStart(fromDate) : null;
+  const to = toDate ? ledgerYmdEnd(toDate) : null;
+  if (fromDate && !from) {
+    throw new AppError("validation_error", "fromDate must be in YYYY-MM-DD format", 400);
+  }
+  if (toDate && !to) {
+    throw new AppError("validation_error", "toDate must be in YYYY-MM-DD format", 400);
+  }
+
+  const playerFilter: Record<string, unknown> = { exchange: exchangeObjectId };
+  if (query.playerId) {
+    if (!Types.ObjectId.isValid(query.playerId)) {
+      throw new AppError("validation_error", "Invalid player id", 400);
+    }
+    playerFilter._id = new Types.ObjectId(query.playerId);
+  }
+
+  const players = await PlayerModel.find(playerFilter).select("_id playerId").lean();
+  const playerIds = players.map((p) => p._id);
+  const playerMap = new Map(players.map((p) => [String(p._id), p.playerId]));
+
+  if (playerIds.length === 0) {
+    return {
+      exchange: {
+        _id: exchange._id.toString(),
+        name: exchange.name,
+        provider: exchange.provider,
+        openingBalance: exchange.openingBalance,
+      },
+      periodOpeningBalance: exchange.openingBalance,
+      periodClosingBalance: exchange.openingBalance,
+      totalCredits: 0,
+      totalDebits: 0,
+      totalDepositOutflow: 0,
+      totalWithdrawalInflow: 0,
+      rows: [],
+    };
+  }
+
+  const [allDeposits, allWithdrawals] = await Promise.all([
+    DepositModel.find({
+      player: { $in: playerIds },
+      status: { $in: ["verified", "finalized"] },
+    })
+      .select("_id player amount bonusAmount totalAmount utr settledAt exchangeActionAt updatedAt createdAt")
+      .lean(),
+    WithdrawalModel.find({
+      player: { $in: playerIds },
+      status: { $in: ["approved", "finalized"] },
+    })
+      .select("_id player playerName amount payableAmount reverseBonus utr updatedAt createdAt")
+      .lean(),
+  ]);
+
+  let priorNet = 0;
+  if (from) {
+    for (const d of allDeposits) {
+      if (depositEventTime(d) >= from) continue;
+      priorNet -= d.totalAmount ?? d.amount;
+    }
+    for (const w of allWithdrawals) {
+      if (withdrawalEventTime(w) >= from) continue;
+      priorNet += w.payableAmount ?? w.amount;
+    }
+  }
+
+  type StatementEvent =
+    | { kind: "deposit"; t: number; doc: (typeof allDeposits)[0] }
+    | { kind: "withdrawal"; t: number; doc: (typeof allWithdrawals)[0] };
+
+  const events: StatementEvent[] = [];
+  const entryType = query.entryType || "all";
+
+  for (const d of allDeposits) {
+    const at = depositEventTime(d);
+    if (from && at < from) continue;
+    if (to && at > to) continue;
+    if (entryType === "all" || entryType === "deposit") {
+      events.push({ kind: "deposit", t: at.getTime(), doc: d });
+    }
+  }
+  for (const w of allWithdrawals) {
+    const at = withdrawalEventTime(w);
+    if (from && at < from) continue;
+    if (to && at > to) continue;
+    if (entryType === "all" || entryType === "withdrawal") {
+      events.push({ kind: "withdrawal", t: at.getTime(), doc: w });
+    }
+  }
+  events.sort((a, b) => a.t - b.t);
+
+  const periodOpeningBalance = exchange.openingBalance + priorNet;
+  let running = periodOpeningBalance;
+  let totalCredits = 0;
+  let totalDebits = 0;
+  let totalDepositOutflow = 0;
+  let totalWithdrawalInflow = 0;
+
+  const rows = events.map((ev) => {
+    if (ev.kind === "deposit") {
+      const d = ev.doc;
+      const amount = d.totalAmount ?? d.amount;
+      running -= amount;
+      totalDebits += amount;
+      totalDepositOutflow += amount;
+
+      return {
+        kind: "deposit" as const,
+        refId: d._id.toString(),
+        at: new Date(ev.t).toISOString(),
+        label: "Deposit",
+        playerId: playerMap.get(String(d.player)) ?? "",
+        amount,
+        direction: "debit" as const,
+        balanceAfter: running,
+        bonusMemo: d.bonusAmount ?? 0,
+        utr: d.utr,
+      };
+    }
+
+    const w = ev.doc;
+    const amount = w.payableAmount ?? w.amount;
+    running += amount;
+    totalCredits += amount;
+    totalWithdrawalInflow += amount;
+
+    return {
+      kind: "withdrawal" as const,
+      refId: w._id.toString(),
+      at: new Date(ev.t).toISOString(),
+      label: "Withdrawal",
+      playerId: playerMap.get(String(w.player)) ?? w.playerName ?? "",
+      amount,
+      direction: "credit" as const,
+      balanceAfter: running,
+      bonusMemo: w.reverseBonus ?? 0,
+      utr: w.utr,
+    };
+  });
+
+  return {
+    exchange: {
+      _id: exchange._id.toString(),
+      name: exchange.name,
+      provider: exchange.provider,
+      openingBalance: exchange.openingBalance,
+    },
+    periodOpeningBalance,
+    periodClosingBalance: running,
+    totalCredits,
+    totalDebits,
+    totalDepositOutflow,
+    totalWithdrawalInflow,
+    rows,
+  };
 }

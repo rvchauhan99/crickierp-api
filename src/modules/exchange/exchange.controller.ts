@@ -3,11 +3,12 @@ import { StatusCodes } from "http-status-codes";
 import {
   createExchange,
   exportExchangesToBuffer,
+  getExchangeStatement,
   getExchangeById,
   listExchanges,
   updateExchange,
 } from "./exchange.service";
-import { listExchangeQuerySchema } from "./exchange.validation";
+import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
 
 export async function createExchangeController(req: Request, res: Response) {
   const actorId = req.user!.userId;
@@ -40,5 +41,11 @@ export async function getExchangeController(req: Request, res: Response) {
 export async function updateExchangeController(req: Request, res: Response) {
   const actorId = req.user!.userId;
   const data = await updateExchange(String(req.params.id), req.body, actorId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function exchangeStatementController(req: Request, res: Response) {
+  const query = exchangeStatementQuerySchema.parse(req.query);
+  const data = await getExchangeStatement(String(req.params.id), query);
   res.status(StatusCodes.OK).json({ success: true, data });
 }

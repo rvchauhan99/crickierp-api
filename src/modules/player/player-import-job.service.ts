@@ -4,7 +4,7 @@ import { logger } from "../../shared/logger";
 import { createAuditLog } from "../audit/audit.service";
 import { applyPlayerImportRows, parsePlayerImportFile, type ImportRowError } from "./player.service";
 import { closePlayerImportEventStream, emitPlayerImportEvent } from "./player-import-events";
-import { PlayerImportJobModel } from "./player-import-job.model";
+import { PlayerImportJobModel, type PlayerImportJobDocument } from "./player-import-job.model";
 
 const WORKER_ID = `pid-${process.pid}`;
 const LOCK_STALE_MS = 60_000;
@@ -23,6 +23,20 @@ type CreateJobInput = {
   actorId: string;
   requestId?: string;
 };
+
+type PlayerImportJobLean = Pick<
+  PlayerImportJobDocument,
+  | "_id"
+  | "status"
+  | "fileName"
+  | "createdBy"
+  | "createdAt"
+  | "startedAt"
+  | "finishedAt"
+  | "failureReason"
+  | "progress"
+  | "errorSample"
+>;
 
 export type PlayerImportJobStatusDto = {
   id: string;
@@ -43,7 +57,7 @@ export type PlayerImportJobStatusDto = {
   errorSample: ImportRowError[];
 };
 
-function statusDtoFromLean(job: Awaited<ReturnType<typeof PlayerImportJobModel.findOneAndUpdate>>) {
+function statusDtoFromLean(job: PlayerImportJobLean | null) {
   if (!job) return null;
   return {
     id: job._id.toString(),
@@ -101,7 +115,7 @@ export async function getPlayerImportJobStatus(jobId: string, actorId: string) {
   if (String(job.createdBy) !== actorId) {
     throw new AppError("auth_error", "You do not have access to this import job", 403);
   }
-  return statusDtoFromLean(job);
+  return statusDtoFromLean(job as unknown as PlayerImportJobLean | null);
 }
 
 async function claimNextJob() {
@@ -119,7 +133,7 @@ async function claimNextJob() {
         lock: { lockedBy: WORKER_ID, lockedAt: now, heartbeatAt: now },
       },
     },
-    { sort: { createdAt: 1 }, new: true },
+    { sort: { createdAt: 1 }, returnDocument: "after" },
   );
 }
 

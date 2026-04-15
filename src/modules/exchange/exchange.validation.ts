@@ -44,3 +44,10 @@ export const listExchangeQuerySchema = z.object({
 export const exchangeIdParamSchema = z.object({
   id: z.string().min(24).max(24),
 });
+
+export const exchangeStatementQuerySchema = z.object({
+  fromDate: z.string().optional(),
+  toDate: z.string().optional(),
+  playerId: z.string().length(24).optional(),
+  entryType: z.enum(["all", "deposit", "withdrawal"]).default("all"),
+});
