@@ -5,6 +5,7 @@ import { connectDb } from "./shared/db/connect";
 import { bootstrapData } from "./shared/db/bootstrap";
 import { runMigrations } from "./migrations";
 import { logger } from "./shared/logger";
+import { startPlayerImportWorker, stopPlayerImportWorker } from "./modules/player/player-import-job.service";
 
 async function start() {
   await connectDb();
@@ -12,6 +13,7 @@ async function start() {
   await bootstrapData();
 
   const app = createApp();
+  startPlayerImportWorker();
   app.listen(env.port, () => {
     logger.info(`API server running on port ${env.port}`);
   });
@@ -19,5 +21,6 @@ async function start() {
 
 start().catch((error) => {
   logger.error(error);
+  stopPlayerImportWorker();
   process.exit(1);
 });

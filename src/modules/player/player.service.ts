@@ -523,44 +523,94 @@ type ParsedImportRow = {
   firstDepositBonusPercentage: number;
 };
 
+export type PlayerImportProgress = {
+  totalRows: number;
+  processedRows: number;
+  successRows: number;
+  failedRows: number;
+  skippedRows: number;
+};
+
+type ParsedImportPayload = {
+  parsedRows: ParsedImportRow[];
+  skipped: number;
+  totalRows: number;
+  errorSample: ImportRowError[];
+};
+
 function throwImportValidation(message: string, errors: ImportRowError[]): never {
   throw new AppError("validation_error", message, 400, { errors });
 }
 
-export async function importPlayersFromFile(
-  buffer: Buffer,
-  originalName: string,
-  actorId: string,
-  requestId?: string,
-): Promise<{
-  created: number;
-  updated: number;
-  skipped: number;
-}> {
+function readRowsFromBuffer(buffer: Buffer, originalName: string): Record<string, unknown>[] {
   const lower = originalName.toLowerCase();
-  let rows: Record<string, unknown>[];
-
-  if (lower.endsWith(".csv")) {
-    const wb = xlsx.read(buffer, { type: "buffer", raw: false });
-    const sheetName = wb.SheetNames[0];
-    if (!sheetName) {
+  const wb = xlsx.read(buffer, { type: "buffer", raw: false });
+  const sheetName = wb.SheetNames[0];
+  if (!sheetName) {
+    if (lower.endsWith(".csv")) {
       throw new AppError("validation_error", "CSV file is empty", 400);
     }
-    rows = sheetRowsToObjects(wb.Sheets[sheetName]);
-  } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
-    const wb = xlsx.read(buffer, { type: "buffer", raw: false });
-    const sheetName = wb.SheetNames[0];
-    if (!sheetName) {
-      throw new AppError("validation_error", "Spreadsheet has no sheets", 400);
-    }
-    rows = sheetRowsToObjects(wb.Sheets[sheetName]);
-  } else {
+    throw new AppError("validation_error", "Spreadsheet has no sheets", 400);
+  }
+  if (!lower.endsWith(".csv") && !lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
     throw new AppError("validation_error", "Unsupported file type. Use .csv, .xlsx, or .xls", 400);
   }
+  return sheetRowsToObjects(wb.Sheets[sheetName]);
+}
 
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  if (size <= 0) return [arr];
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function resolveExchangeMapByName(names: string[]): Promise<Map<string, Types.ObjectId>> {
+  if (names.length === 0) return new Map();
+  const uniqueByLower = new Map<string, string>();
+  for (const rawName of names) {
+    const normalized = rawName.trim().toLowerCase();
+    if (!normalized || uniqueByLower.has(normalized)) continue;
+    uniqueByLower.set(normalized, rawName.trim());
+  }
+  const uniqueNames = Array.from(uniqueByLower.values());
+  const conditions = uniqueNames.map((name) => ({ name: { $regex: new RegExp(`^${escapeRegex(name)}$`, "i") } }));
+  const exchanges = await ExchangeModel.find({ $or: conditions }).select("_id name").lean();
+
+  const bucket = new Map<string, Types.ObjectId[]>();
+  for (const ex of exchanges) {
+    const key = String(ex.name).trim().toLowerCase();
+    const list = bucket.get(key) ?? [];
+    list.push(ex._id as Types.ObjectId);
+    bucket.set(key, list);
+  }
+
+  const resolved = new Map<string, Types.ObjectId>();
+  for (const [k, list] of bucket.entries()) {
+    if (list.length === 1) resolved.set(k, list[0]);
+  }
+  return resolved;
+}
+
+export async function parsePlayerImportFile(
+  buffer: Buffer,
+  originalName: string,
+): Promise<ParsedImportPayload> {
+  const rows = readRowsFromBuffer(buffer, originalName);
   const errors: ImportRowError[] = [];
   let skipped = 0;
   const parsedRows: ParsedImportRow[] = [];
+  const exchangeNames: string[] = [];
+  const rowInputCache: Array<{
+    rowNum: number;
+    exchangeName: string;
+    playerId: string;
+    phone: string;
+    regularBonusRaw: string;
+    firstDepositBonusRaw: string;
+  }> = [];
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
@@ -587,44 +637,56 @@ export async function importPlayersFromFile(
       continue;
     }
 
-    const resolved = await resolveExchangeIdByName(exchangeName);
-    if (resolved.notFound) {
-      errors.push({ row: rowNum, message: `No exchange found for name "${exchangeName}"` });
-      continue;
-    }
-    if (resolved.ambiguous) {
-      errors.push({
-        row: rowNum,
-        message: `Multiple exchanges match "${exchangeName}"; names must be unique for import`,
-      });
+    exchangeNames.push(exchangeName);
+    rowInputCache.push({
+      rowNum,
+      exchangeName,
+      playerId,
+      phone,
+      regularBonusRaw: pickCellRaw(
+        row,
+        "bonus_percentage",
+        "bonus_percent",
+        "bonus",
+        "bonus percentage",
+        "bonus%",
+      ),
+      firstDepositBonusRaw: pickCellRaw(
+        row,
+        "first_deposit_bonus_percentage",
+        "first_deposit_bonus_percent",
+        "first deposit bonus percentage",
+        "first deposit bonus%",
+        "firstdepositbonuspercentage",
+      ),
+    });
+  }
+
+  const exchangeMap = await resolveExchangeMapByName(exchangeNames);
+  for (const row of rowInputCache) {
+    const exchangeKey = row.exchangeName.trim().toLowerCase();
+    const exchangeId = exchangeMap.get(exchangeKey);
+    if (!exchangeId) {
+      const resolved = await resolveExchangeIdByName(row.exchangeName);
+      if (resolved.notFound) {
+        errors.push({ row: row.rowNum, message: `No exchange found for name "${row.exchangeName}"` });
+      } else if (resolved.ambiguous) {
+        errors.push({
+          row: row.rowNum,
+          message: `Multiple exchanges match "${row.exchangeName}"; names must be unique for import`,
+        });
+      }
       continue;
     }
 
-    const regularBonusRaw = pickCellRaw(
-      row,
-      "bonus_percentage",
-      "bonus_percent",
-      "bonus",
-      "bonus percentage",
-      "bonus%",
-    );
-    const regularBonusParsed = parsePercentageCell(regularBonusRaw, rowNum, "bonus_percentage");
+    const regularBonusParsed = parsePercentageCell(row.regularBonusRaw, row.rowNum, "bonus_percentage");
     if (!regularBonusParsed.ok) {
       errors.push(regularBonusParsed.error);
       continue;
     }
-
-    const firstDepositBonusRaw = pickCellRaw(
-      row,
-      "first_deposit_bonus_percentage",
-      "first_deposit_bonus_percent",
-      "first deposit bonus percentage",
-      "first deposit bonus%",
-      "firstdepositbonuspercentage",
-    );
     const firstDepositBonusParsed = parsePercentageCell(
-      firstDepositBonusRaw,
-      rowNum,
+      row.firstDepositBonusRaw,
+      row.rowNum,
       "first_deposit_bonus_percentage",
     );
     if (!firstDepositBonusParsed.ok) {
@@ -633,30 +695,21 @@ export async function importPlayersFromFile(
     }
 
     parsedRows.push({
-      rowNum,
-      exchangeId: resolved.id,
-      playerId,
-      phone,
+      rowNum: row.rowNum,
+      exchangeId,
+      playerId: row.playerId,
+      phone: row.phone,
       regularBonusPercentage: regularBonusParsed.value,
       firstDepositBonusPercentage: firstDepositBonusParsed.value,
     });
   }
 
-  if (errors.length > 0) {
-    throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", errors);
-  }
-
-  if (parsedRows.length === 0) {
-    throw new AppError("validation_error", "No data rows to import. Add at least one row with exchange_name, player_id, and phone.", 400);
-  }
-
   const seenFirstRow = new Map<string, number>();
-  const dupErrors: ImportRowError[] = [];
   for (const p of parsedRows) {
     const key = `${p.exchangeId.toString()}:${p.playerId}`;
     const first = seenFirstRow.get(key);
     if (first !== undefined) {
-      dupErrors.push({
+      errors.push({
         row: p.rowNum,
         message: `Duplicate player_id "${p.playerId}" for this exchange (same as row ${first})`,
       });
@@ -664,92 +717,124 @@ export async function importPlayersFromFile(
       seenFirstRow.set(key, p.rowNum);
     }
   }
-  if (dupErrors.length > 0) {
-    throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", dupErrors);
+
+  if (errors.length > 0) {
+    throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", errors);
+  }
+  if (parsedRows.length === 0) {
+    throw new AppError(
+      "validation_error",
+      "No data rows to import. Add at least one row with exchange_name, player_id, and phone.",
+      400,
+    );
   }
 
+  return { parsedRows, skipped, totalRows: rows.length, errorSample: [] };
+}
+
+export async function applyPlayerImportRows(
+  parsedRows: ParsedImportRow[],
+  actorId: string,
+  options?: {
+    chunkSize?: number;
+    skippedRows?: number;
+    onProgress?: (progress: PlayerImportProgress) => Promise<void> | void;
+  },
+): Promise<{
+  created: number;
+  updated: number;
+  skipped: number;
+}> {
   const actorOid = new Types.ObjectId(actorId);
-  const orConditions = parsedRows.map((p) => ({
-    exchange: p.exchangeId,
-    playerId: p.playerId,
-  }));
-  const existing = await PlayerModel.find({ $or: orConditions }).select("_id exchange playerId").lean();
-  const existingByKey = new Map<string, Types.ObjectId>();
-  for (const doc of existing) {
-    const exId = (doc.exchange as Types.ObjectId).toString();
-    existingByKey.set(`${exId}:${doc.playerId}`, doc._id as Types.ObjectId);
-  }
+  const chunkSize = options?.chunkSize ?? 750;
+  let created = 0;
+  let updated = 0;
+  let processedRows = 0;
+  const totalRows = parsedRows.length + (options?.skippedRows ?? 0);
+  const skipped = options?.skippedRows ?? 0;
+  const chunks = chunkArray(parsedRows, chunkSize);
 
-  const docsToCreate = parsedRows
-    .filter((p) => !existingByKey.has(`${p.exchangeId.toString()}:${p.playerId}`))
-    .map((p) => ({
+  for (const chunk of chunks) {
+    const orConditions = chunk.map((p) => ({
       exchange: p.exchangeId,
       playerId: p.playerId,
-      phone: p.phone,
-      regularBonusPercentage: p.regularBonusPercentage,
-      firstDepositBonusPercentage: p.firstDepositBonusPercentage,
-      createdBy: actorOid,
-      updatedBy: actorOid,
     }));
+    const existing = await PlayerModel.find({ $or: orConditions }).select("_id exchange playerId").lean();
+    const existingByKey = new Map<string, Types.ObjectId>();
+    for (const doc of existing) {
+      const exId = (doc.exchange as Types.ObjectId).toString();
+      existingByKey.set(`${exId}:${doc.playerId}`, doc._id as Types.ObjectId);
+    }
 
-  const updateOps = parsedRows
-    .map((p) => {
-      const key = `${p.exchangeId.toString()}:${p.playerId}`;
-      const existingId = existingByKey.get(key);
-      if (!existingId) return null;
-      return {
-        updateOne: {
-          filter: { _id: existingId },
-          update: {
-            $set: {
-              phone: p.phone,
-              regularBonusPercentage: p.regularBonusPercentage,
-              firstDepositBonusPercentage: p.firstDepositBonusPercentage,
-              updatedBy: actorOid,
+    const docsToCreate = chunk
+      .filter((p) => !existingByKey.has(`${p.exchangeId.toString()}:${p.playerId}`))
+      .map((p) => ({
+        exchange: p.exchangeId,
+        playerId: p.playerId,
+        phone: p.phone,
+        regularBonusPercentage: p.regularBonusPercentage,
+        firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+        createdBy: actorOid,
+        updatedBy: actorOid,
+      }));
+
+    const updateOps = chunk
+      .map((p) => {
+        const key = `${p.exchangeId.toString()}:${p.playerId}`;
+        const existingId = existingByKey.get(key);
+        if (!existingId) return null;
+        return {
+          updateOne: {
+            filter: { _id: existingId },
+            update: {
+              $set: {
+                phone: p.phone,
+                regularBonusPercentage: p.regularBonusPercentage,
+                firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+                updatedBy: actorOid,
+              },
             },
           },
-        },
-      };
-    })
-    .filter((op): op is NonNullable<typeof op> => op !== null);
+        };
+      })
+      .filter((op): op is NonNullable<typeof op> => op !== null);
 
-  const created = docsToCreate.length;
-  const updated = updateOps.length;
-
-  const transactionalWrite = async (session?: mongoose.ClientSession) => {
     if (docsToCreate.length > 0) {
-      if (session) {
-        await PlayerModel.insertMany(docsToCreate, { session });
-      } else {
-        await PlayerModel.insertMany(docsToCreate);
-      }
+      await PlayerModel.insertMany(docsToCreate, { ordered: false });
+      created += docsToCreate.length;
     }
     if (updateOps.length > 0) {
-      if (session) {
-        await PlayerModel.bulkWrite(updateOps, { session });
-      } else {
-        await PlayerModel.bulkWrite(updateOps);
-      }
+      await PlayerModel.bulkWrite(updateOps, { ordered: false });
+      updated += updateOps.length;
     }
-  };
 
-  try {
-    const session = await mongoose.startSession();
-    try {
-      await session.withTransaction(async () => {
-        await transactionalWrite(session);
+    processedRows += chunk.length;
+    if (options?.onProgress) {
+      await options.onProgress({
+        totalRows,
+        processedRows: processedRows + skipped,
+        successRows: created + updated,
+        failedRows: 0,
+        skippedRows: skipped,
       });
-    } finally {
-      await session.endSession();
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/replica set|Transaction numbers|multi-document transactions/i.test(msg)) {
-      await transactionalWrite();
-    } else {
-      throw err;
     }
   }
+
+  return { created, updated, skipped };
+}
+
+export async function importPlayersFromFile(
+  buffer: Buffer,
+  originalName: string,
+  actorId: string,
+  requestId?: string,
+): Promise<{
+  created: number;
+  updated: number;
+  skipped: number;
+}> {
+  const { parsedRows, skipped } = await parsePlayerImportFile(buffer, originalName);
+  const { created, updated } = await applyPlayerImportRows(parsedRows, actorId, { skippedRows: skipped });
 
   await createAuditLog({
     actorId,
