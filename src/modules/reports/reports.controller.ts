@@ -7,6 +7,9 @@ import {
   transactionHistoryQuerySchema,
 } from "./reports.validation";
 import {
+  exportDashboardSummaryToBuffer,
+  exportExpenseAnalysisToBuffer,
+  exportTransactionHistoryToBuffer,
   getDashboardSummary,
   getExpenseAnalysisRecords,
   getExpenseAnalysisSummary,
@@ -20,10 +23,32 @@ export async function dashboardSummaryController(req: Request, res: Response) {
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
+export async function exportDashboardReportController(req: Request, res: Response) {
+  const query = dashboardSummaryQuerySchema.parse(req.query);
+  const buffer = await exportDashboardSummaryToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="dashboard-operational-report.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
+}
+
 export async function transactionHistoryController(req: Request, res: Response) {
   const query = transactionHistoryQuerySchema.parse(req.query);
   const data = await getTransactionHistory(query, { scope: "transactions" });
   res.status(StatusCodes.OK).json({ success: true, data: data.rows, meta: data.meta });
+}
+
+export async function exportTransactionHistoryController(req: Request, res: Response) {
+  const query = transactionHistoryQuerySchema.parse(req.query);
+  const buffer = await exportTransactionHistoryToBuffer(query, { scope: "transactions" });
+  res.setHeader("Content-Disposition", 'attachment; filename="audit-history-export.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
 }
 
 export async function auditEntitiesController(_req: Request, res: Response) {
@@ -45,4 +70,15 @@ export async function expenseAnalysisRecordsController(req: Request, res: Respon
     data: result.rows,
     meta: result.meta,
   });
+}
+
+export async function exportExpenseAnalysisController(req: Request, res: Response) {
+  const query = expenseAnalysisRecordsQuerySchema.parse(req.query);
+  const buffer = await exportExpenseAnalysisToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="expense-analysis-export.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
 }

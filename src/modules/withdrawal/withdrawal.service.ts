@@ -1,5 +1,6 @@
 import { Types } from "mongoose";
 import type { z } from "zod";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
@@ -425,4 +426,36 @@ export async function listSavedAccountsForPlayer(playerId: string) {
   }
 
   return out;
+}
+
+const EXPORT_MAX_ROWS = 10_000;
+
+export async function exportWithdrawalsToBuffer(query: ListWithdrawalQuery): Promise<Buffer> {
+  const filter = buildWithdrawalListFilter(query);
+  const sortValue = query.sortOrder === "asc" ? 1 : -1;
+
+  const rows = await WithdrawalModel.find(filter)
+    .populate("player", "playerId phone")
+    .populate("payoutBankId", "holderName bankName accountNumber")
+    .populate("createdBy", "fullName username")
+    .sort({ [query.sortBy]: sortValue })
+    .limit(EXPORT_MAX_ROWS)
+    .lean();
+
+  return generateExcelBuffer(rows, [
+    { header: "Player ID", transform: (r) => (r.player as any)?.playerId ?? "" },
+    { header: "Player Phone", transform: (r) => (r.player as any)?.phone ?? "" },
+    { header: "Account Number", key: "accountNumber" },
+    { header: "Account Holder", key: "accountHolderName" },
+    { header: "Bank", key: "bankName" },
+    { header: "IFSC", key: "ifsc" },
+    { header: "Amount", key: "amount" },
+    { header: "Reverse Bonus", key: "reverseBonus" },
+    { header: "Payable Amount", key: "payableAmount" },
+    { header: "Status", key: "status" },
+    { header: "UTR", key: "utr" },
+    { header: "Payout Bank", key: "payoutBankName" },
+    { header: "Created By", transform: (r) => (r.createdBy as any)?.fullName ?? "" },
+    { header: "Created At", transform: (r) => (r.createdAt ? new Date(r.createdAt).toISOString() : "") },
+  ], "Withdrawals");
 }

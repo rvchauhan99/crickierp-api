@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
@@ -11,6 +12,8 @@ import { liabilityLedgerQuerySchema, listLiabilityEntryQuerySchema, listLiabilit
 type ListLiabilityPersonQuery = z.infer<typeof listLiabilityPersonQuerySchema>;
 type ListLiabilityEntryQuery = z.infer<typeof listLiabilityEntryQuerySchema>;
 type LedgerQuery = z.infer<typeof liabilityLedgerQuerySchema>;
+
+const EXPORT_MAX_ROWS = 10_000;
 
 function pageSizeFromQuery(q: { pageSize: number; limit?: number }): number {
   return q.limit ?? q.pageSize;
@@ -525,6 +528,74 @@ export async function getLiabilityPersonLedger(personId: string, query: LedgerQu
     rows,
     closingBalance: running,
   };
+}
+
+function formatUserForExport(user: unknown): string {
+  if (user == null) return "";
+  if (typeof user === "object" && user !== null && "fullName" in user) {
+    const u = user as { fullName?: string; username?: string };
+    const fn = u.fullName?.trim();
+    const un = u.username?.trim();
+    if (fn && un) return `${fn} (${un})`;
+    if (fn) return fn;
+    if (un) return un;
+  }
+  return "";
+}
+
+export async function exportLiabilityPersonsToBuffer(query: ListLiabilityPersonQuery): Promise<Buffer> {
+  const result = await listLiabilityPersons({ ...query, page: 1, limit: EXPORT_MAX_ROWS });
+  const exportData = result.rows.map((r) => ({
+    Name: r.name,
+    Phone: r.phone ?? "",
+    Email: r.email ?? "",
+    Status: r.isActive ? "Active" : "Inactive",
+    "Opening Balance": r.openingBalance ?? 0,
+    "Total Credits": r.totalCredits ?? 0,
+    "Total Debits": r.totalDebits ?? 0,
+    "Closing Balance": r.closingBalance ?? 0,
+    Notes: r.notes ?? "",
+    "Created By": formatUserForExport(r.createdBy),
+    "Updated By": formatUserForExport(r.updatedBy),
+    "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+  }));
+
+  return generateExcelBuffer(exportData, "Liability Persons");
+}
+
+export async function exportLiabilityEntriesToBuffer(query: ListLiabilityEntryQuery): Promise<Buffer> {
+  const result = await listLiabilityEntries({ ...query, page: 1, limit: EXPORT_MAX_ROWS });
+  const exportData = result.rows.map((r) => ({
+    Date: r.entryDate ? new Date(r.entryDate).toISOString().split("T")[0] : "",
+    Type: r.entryType,
+    Amount: r.amount,
+    "From Account": r.fromAccountName,
+    "To Account": r.toAccountName,
+    "Reference No": r.referenceNo ?? "",
+    Remark: r.remark ?? "",
+    "Source Type": r.sourceType ?? "",
+    "Created By": formatUserForExport(r.createdBy),
+    "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+  }));
+
+  return generateExcelBuffer(exportData, "Liability Entries");
+}
+
+export async function exportLiabilityLedgerToBuffer(personId: string, query: LedgerQuery): Promise<Buffer> {
+  const result = await getLiabilityPersonLedger(personId, query);
+  const exportData = result.rows.map((r) => ({
+    Date: r.at ? new Date(r.at).toISOString().split("T")[0] : "",
+    "Entry Type": r.entryType,
+    From: r.from,
+    To: r.to,
+    Debit: r.debit,
+    Credit: r.credit,
+    "Running Balance": r.runningBalance,
+    "Reference No": r.referenceNo ?? "",
+    Remark: r.remark ?? "",
+  }));
+
+  return generateExcelBuffer(exportData, `Ledger - ${result.person.name}`);
 }
 export async function getLiabilityReportSummary() {
   const persons = await LiabilityPersonModel.find({ isActive: true }).lean();

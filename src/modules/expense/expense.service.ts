@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
@@ -468,6 +469,64 @@ export async function listExpenses(query: ListExpenseQuery) {
       pageSize,
     },
   };
+}
+
+const EXPORT_MAX_ROWS = 10_000;
+
+function formatUserForExport(user: unknown): string {
+  if (user == null) return "";
+  if (typeof user === "object" && user !== null && "fullName" in user) {
+    const u = user as { fullName?: string; username?: string };
+    const fn = u.fullName?.trim();
+    const un = u.username?.trim();
+    if (fn && un) return `${fn} (${un})`;
+    if (fn) return fn;
+    if (un) return un;
+  }
+  return "";
+}
+
+export async function exportExpensesToBuffer(query: ListExpenseQuery): Promise<Buffer> {
+  const filter = buildListFilter(query);
+  const sortValue = query.sortOrder === "asc" ? 1 : -1;
+
+  const rows = await ExpenseModel.find(filter)
+    .populate("expenseTypeId", "name code")
+    .populate("bankId", "holderName bankName accountNumber")
+    .populate("liabilityPersonId", "name")
+    .populate("createdBy", "fullName username")
+    .populate("approvedBy", "fullName username")
+    .sort({ [query.sortBy]: sortValue })
+    .limit(EXPORT_MAX_ROWS)
+    .lean();
+
+  const exportData = rows.map((r) => {
+    const et = r.expenseTypeId as { name?: string; code?: string } | null;
+    const b = r.bankId as { holderName?: string; bankName?: string; accountNumber?: string } | null;
+    const p = r.liabilityPersonId as { name?: string } | null;
+
+    let settlement = "";
+    if (r.settlementAccountType === "bank" && b) {
+      settlement = `Bank: ${b.holderName} (${b.bankName})`;
+    } else if (r.settlementAccountType === "person" && p) {
+      settlement = `Person: ${p.name}`;
+    }
+
+    return {
+      "Expense Date": r.expenseDate ? new Date(r.expenseDate).toISOString().split("T")[0] : "",
+      Type: et?.name ?? "",
+      Amount: r.amount,
+      Description: r.description ?? "",
+      Status: r.status,
+      "Settlement Via": settlement,
+      "Reject Reason": r.rejectReason ?? "",
+      "Created By": formatUserForExport(r.createdBy),
+      "Approved By": formatUserForExport(r.approvedBy),
+      "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    };
+  });
+
+  return generateExcelBuffer(exportData, "Expenses");
 }
 
 export async function listActiveExpenseTypes() {

@@ -1,4 +1,5 @@
 import mongoose, { Types } from "mongoose";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import xlsx from "xlsx";
 import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
@@ -445,10 +446,7 @@ export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buf
     };
   });
 
-  const worksheet = xlsx.utils.json_to_sheet(exportData);
-  const workbook = xlsx.utils.book_new();
-  xlsx.utils.book_append_sheet(workbook, worksheet, "Players");
-  return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  return generateExcelBuffer(exportData, "Players");
 }
 
 export function getSampleCsvBuffer(): Buffer {

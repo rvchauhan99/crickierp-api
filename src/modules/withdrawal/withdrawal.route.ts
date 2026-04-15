@@ -9,6 +9,7 @@ import {
   listWithdrawalController,
   updateWithdrawalBankerController,
   updateWithdrawalStatusController,
+  exportWithdrawalController,
 } from "./withdrawal.controller";
 import { withdrawalListPermissionMiddleware } from "./withdrawal.list.middleware";
 import { withdrawalStatusPermissionMiddleware } from "./withdrawal.status.middleware";
@@ -48,6 +49,13 @@ withdrawalRouter.patch(
   withdrawalStatusPermissionMiddleware,
   validate({ body: updateWithdrawalStatusBodySchema }),
   updateWithdrawalStatusController,
+);
+
+withdrawalRouter.get(
+  "/export",
+  withdrawalListPermissionMiddleware,
+  validate({ query: listWithdrawalQuerySchema }),
+  exportWithdrawalController,
 );
 
 withdrawalRouter.get(

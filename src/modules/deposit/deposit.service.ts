@@ -1,6 +1,6 @@
 import { Types } from "mongoose";
 import type { z } from "zod";
-import xlsx from "xlsx";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
@@ -403,23 +403,18 @@ export async function exportDepositsToBuffer(query: ListDepositQuery): Promise<B
     .limit(EXPORT_MAX_ROWS)
     .lean();
 
-  const exportData = rows.map((r) => ({
-    UTR: r.utr,
-    "Bank label": r.bankName,
-    Amount: r.amount,
-    Status: r.status,
-    "Bonus amount": r.bonusAmount ?? "",
-    "Total amount": r.totalAmount ?? "",
-    "Reject reason": r.rejectReason ?? "",
-    "Bank balance after": r.bankBalanceAfter ?? "",
-    "Settled at": r.settledAt ? new Date(r.settledAt).toISOString() : "",
-    "Created at": r.createdAt ? new Date(r.createdAt).toISOString() : "",
-  }));
-
-  const worksheet = xlsx.utils.json_to_sheet(exportData);
-  const workbook = xlsx.utils.book_new();
-  xlsx.utils.book_append_sheet(workbook, worksheet, "Deposits");
-  return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  return generateExcelBuffer(rows, [
+    { header: "UTR", key: "utr" },
+    { header: "Bank label", key: "bankName" },
+    { header: "Amount", key: "amount" },
+    { header: "Status", key: "status" },
+    { header: "Bonus amount", key: "bonusAmount" },
+    { header: "Total amount", key: "totalAmount" },
+    { header: "Reject reason", key: "rejectReason" },
+    { header: "Bank balance after", key: "bankBalanceAfter" },
+    { header: "Settled at", transform: (r) => (r.settledAt ? new Date(r.settledAt).toISOString() : "") },
+    { header: "Created at", transform: (r) => (r.createdAt ? new Date(r.createdAt).toISOString() : "") },
+  ], "Deposits");
 }
 
 function bonusAmountFromPercent(amount: number, percent: number): number {

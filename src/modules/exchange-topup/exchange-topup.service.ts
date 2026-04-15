@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { ExchangeModel } from "../exchange/exchange.model";
@@ -82,4 +83,38 @@ export async function listExchangeTopups(query: {
       total,
     },
   };
+}
+
+const EXPORT_MAX_ROWS = 10_000;
+
+export async function exportExchangeTopupsToBuffer(query: {
+  exchangeId?: string;
+  sortOrder: "asc" | "desc";
+}): Promise<Buffer> {
+  const result = await listExchangeTopups({
+    ...query,
+    page: 1,
+    pageSize: EXPORT_MAX_ROWS,
+  });
+
+  const exportData = result.rows.map((r) => {
+    const exchange = r.exchangeId as { name?: string; provider?: string } | null;
+    const author = r.createdBy as { fullName?: string; username?: string } | null;
+
+    let authorName = author?.fullName || author?.username || "";
+    if (author?.fullName && author?.username) {
+      authorName = `${author.fullName} (${author.username})`;
+    }
+
+    return {
+      Date: r.createdAt ? new Date(r.createdAt).toISOString() : "",
+      Exchange: exchange?.name || "",
+      Provider: exchange?.provider || "",
+      Amount: r.amount,
+      Remark: r.remark || "",
+      "Created By": authorName,
+    };
+  });
+
+  return generateExcelBuffer(exportData, "Exchange Topups");
 }

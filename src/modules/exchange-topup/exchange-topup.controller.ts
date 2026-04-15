@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
-import { createExchangeTopup, listExchangeTopups } from "./exchange-topup.service";
+import { createExchangeTopup, exportExchangeTopupsToBuffer, listExchangeTopups } from "./exchange-topup.service";
 import { createExchangeTopupBodySchema, listExchangeTopupQuerySchema } from "./exchange-topup.validation";
 
 export async function createExchangeTopupController(req: Request, res: Response) {
@@ -13,4 +13,15 @@ export async function listExchangeTopupController(req: Request, res: Response) {
   const query = listExchangeTopupQuerySchema.parse(req.query);
   const data = await listExchangeTopups(query);
   res.status(StatusCodes.OK).json({ success: true, data: data.rows, meta: data.meta });
+}
+
+export async function exportExchangeTopupController(req: Request, res: Response) {
+  const query = listExchangeTopupQuerySchema.parse(req.query);
+  const buffer = await exportExchangeTopupsToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="exchange-topups-export.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
 }

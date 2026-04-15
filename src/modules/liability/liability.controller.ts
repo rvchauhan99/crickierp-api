@@ -12,6 +12,9 @@ import {
 import {
   createLiabilityEntry,
   createLiabilityPerson,
+  exportLiabilityEntriesToBuffer,
+  exportLiabilityLedgerToBuffer,
+  exportLiabilityPersonsToBuffer,
   getLiabilityPersonLedger,
   getLiabilityReportPersonWise,
   getLiabilityReportSummary,
@@ -39,6 +42,14 @@ export async function listLiabilityPersonController(req: Request, res: Response)
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
+export async function exportLiabilityPersonController(req: Request, res: Response) {
+  const query = listLiabilityPersonQuerySchema.parse(req.query);
+  const buffer = await exportLiabilityPersonsToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="liability-persons-export.xlsx"');
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.status(StatusCodes.OK).send(buffer);
+}
+
 export async function createLiabilityEntryController(req: Request, res: Response) {
   const body = createLiabilityEntryBodySchema.parse(req.body);
   const data = await createLiabilityEntry(body, req.user!.userId, req.requestId);
@@ -51,11 +62,28 @@ export async function listLiabilityEntryController(req: Request, res: Response) 
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
+export async function exportLiabilityEntryController(req: Request, res: Response) {
+  const query = listLiabilityEntryQuerySchema.parse(req.query);
+  const buffer = await exportLiabilityEntriesToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="liability-entries-export.xlsx"');
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.status(StatusCodes.OK).send(buffer);
+}
+
 export async function liabilityPersonLedgerController(req: Request, res: Response) {
   const { id } = liabilityPersonIdParamSchema.parse(req.params);
   const query = liabilityLedgerQuerySchema.parse(req.query);
   const data = await getLiabilityPersonLedger(id, query);
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function exportLiabilityLedgerController(req: Request, res: Response) {
+  const { id } = liabilityPersonIdParamSchema.parse(req.params);
+  const query = liabilityLedgerQuerySchema.parse(req.query);
+  const buffer = await exportLiabilityLedgerToBuffer(id, query);
+  res.setHeader("Content-Disposition", `attachment; filename="liability-ledger-${id}.xlsx"`);
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.status(StatusCodes.OK).send(buffer);
 }
 
 export async function liabilitySummaryReportController(_req: Request, res: Response) {

@@ -1,6 +1,6 @@
 import { Types } from "mongoose";
 import type { z } from "zod";
-import xlsx from "xlsx";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
@@ -300,21 +300,16 @@ export async function exportBanksToBuffer(query: ListBankQuery): Promise<Buffer>
     .limit(EXPORT_MAX_ROWS)
     .lean();
 
-  const exportData = rows.map((r) => ({
-    "Holder Name": r.holderName,
-    "Bank Name": r.bankName,
-    "Account Number": r.accountNumber,
-    IFSC: r.ifsc,
-    "Opening Balance": r.openingBalance,
-    Status: r.status,
-    "Created By": formatCreatedByForExport(r.createdBy),
-    "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
-  }));
-
-  const worksheet = xlsx.utils.json_to_sheet(exportData);
-  const workbook = xlsx.utils.book_new();
-  xlsx.utils.book_append_sheet(workbook, worksheet, "Banks");
-  return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  return generateExcelBuffer(rows, [
+    { header: "Holder Name", key: "holderName" },
+    { header: "Bank Name", key: "bankName" },
+    { header: "Account Number", key: "accountNumber" },
+    { header: "IFSC", key: "ifsc" },
+    { header: "Opening Balance", key: "openingBalance" },
+    { header: "Status", key: "status" },
+    { header: "Created By", transform: (r) => formatCreatedByForExport(r.createdBy) },
+    { header: "Created At", transform: (r) => (r.createdAt ? new Date(r.createdAt).toISOString() : "") },
+  ], "Banks");
 }
 
 type LedgerQuery = {

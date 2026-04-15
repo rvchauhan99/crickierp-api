@@ -6,6 +6,7 @@ import {
   listWithdrawals,
   updateWithdrawalByBanker,
   updateWithdrawalStatus,
+  exportWithdrawalsToBuffer,
 } from "./withdrawal.service";
 import {
   createWithdrawalBodySchema,
@@ -31,6 +32,17 @@ export async function updateWithdrawalBankerController(req: Request, res: Respon
   const id = String(req.params.id);
   const data = await updateWithdrawalByBanker(id, body, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function exportWithdrawalController(req: Request, res: Response) {
+  const query = listWithdrawalQuerySchema.parse(req.query);
+  const buffer = await exportWithdrawalsToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="withdrawals-export.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
 }
 
 export async function updateWithdrawalStatusController(req: Request, res: Response) {

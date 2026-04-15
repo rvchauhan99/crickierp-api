@@ -1,6 +1,6 @@
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { Types } from "mongoose";
 import type { z } from "zod";
-import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
@@ -327,10 +327,7 @@ export async function exportExchangesToBuffer(query: ListExchangeQuery): Promise
     "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
   }));
 
-  const worksheet = xlsx.utils.json_to_sheet(exportData);
-  const workbook = xlsx.utils.book_new();
-  xlsx.utils.book_append_sheet(workbook, worksheet, "Exchanges");
-  return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  return generateExcelBuffer(exportData, "Exchanges");
 }
 
 export async function getExchangeById(id: string) {

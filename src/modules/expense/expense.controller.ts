@@ -3,6 +3,7 @@ import { StatusCodes } from "http-status-codes";
 import {
   approveExpense,
   createExpense,
+  exportExpensesToBuffer,
   getExpenseDocumentSignedUrl,
   getExpenseById,
   listActiveExpenseTypes,
@@ -41,6 +42,17 @@ export async function listExpenseController(req: Request, res: Response) {
   const query = listExpenseQuerySchema.parse(req.query);
   const result = await listExpenses(query);
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
+}
+
+export async function exportExpenseController(req: Request, res: Response) {
+  const query = listExpenseQuerySchema.parse(req.query);
+  const buffer = await exportExpensesToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="expenses-export.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
 }
 
 export async function getExpenseController(req: Request, res: Response) {

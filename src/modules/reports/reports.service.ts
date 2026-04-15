@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { AuditLogModel } from "../audit/audit.model";
 import { ExchangeModel } from "../exchange/exchange.model";
@@ -698,7 +699,146 @@ export async function getTransactionHistory(
       .lean(),
     AuditLogModel.countDocuments(filter),
   ]);
-  return { rows, meta: { page: query.page, pageSize: query.pageSize, total } };
+  return {
+    rows: rows,
+    meta: {
+      total,
+      page: query.page,
+      pageSize: query.pageSize,
+    },
+  };
+}
+
+export async function exportTransactionHistoryToBuffer(
+  query: TransactionHistoryQuery,
+  options: { scope: AuditHistoryScope },
+): Promise<Buffer> {
+  const result = await getTransactionHistory(
+    { ...query, page: 1, pageSize: 10000 },
+    options,
+  );
+
+  const exportData = result.rows.map((r: any) => ({
+    Date: r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    Actor: r.actorId?.fullName || r.actorId?.username || r.actorId || "System",
+    Action: r.action || "",
+    Entity: r.entity || "",
+    "Entity ID": r.entityId || "",
+    "Request ID": r.requestId || "",
+    IP: r.ipAddress || "",
+    Reason: r.reason || "",
+  }));
+
+  return generateExcelBuffer(
+    exportData,
+    [
+      { header: "Date", key: "Date" },
+      { header: "Actor", key: "Actor" },
+      { header: "Action", key: "Action" },
+      { header: "Entity", key: "Entity" },
+      { header: "Entity ID", key: "Entity ID" },
+      { header: "Request ID", key: "Request ID" },
+      { header: "IP", key: "IP" },
+      { header: "Reason", key: "Reason" },
+    ],
+    options.scope === "transactions" ? "Audit History" : "Login History",
+  );
+}
+
+export async function exportDashboardSummaryToBuffer(query: DashboardSummaryQuery): Promise<Buffer> {
+  const data = await getDashboardSummary(query);
+
+  const kpiData = [
+    { KPI: "Total Deposits", Value: data.deposit.totalAmount },
+    { KPI: "Verified Deposits", Value: data.deposit.verifiedAmount },
+    { KPI: "Bonus Amount", Value: data.deposit.bonusTotal },
+    { KPI: "Total Withdrawals", Value: data.withdrawal.totalAmount },
+    { KPI: "Approved Withdrawals", Value: data.withdrawal.approvedAmount },
+    { KPI: "Reverse Bonus", Value: data.withdrawal.reverseBonusTotal },
+    { KPI: "Total Expenses", Value: data.expense.totalAmount },
+    { KPI: "Net P&L", Value: data.pnl.net },
+  ];
+
+  const exchangeData = data.exchangesBreakdown.map((ex) => ({
+    Exchange: ex.name,
+    Deposits: ex.depositTotal,
+    Withdrawals: ex.withdrawalTotal,
+    "Net P&L": ex.netPL,
+    "Bonus Given": ex.bonusGiven,
+  }));
+
+  const recentTxns = data.recentActivity.map((t) => ({
+    Type: t.type,
+    Date: t.createdAt,
+    Player: t.playerName,
+    Amount: t.amount,
+    Status: t.status,
+  }));
+
+  return generateMultiSheetExcelBuffer([
+    {
+      name: "Operational Summary",
+      data: kpiData,
+      columns: [
+        { header: "KPI", key: "KPI" },
+        { header: "Value", key: "Value" },
+      ],
+    },
+    {
+      name: "Exchange Breakdown",
+      data: exchangeData,
+      columns: [
+        { header: "Exchange", key: "Exchange" },
+        { header: "Deposits", key: "Deposits" },
+        { header: "Withdrawals", key: "Withdrawals" },
+        { header: "Net P&L", key: "Net P&L" },
+        { header: "Bonus Given", key: "Bonus Given" },
+      ],
+    },
+    {
+      name: "Recent Activity",
+      data: recentTxns,
+      columns: [
+        { header: "Type", key: "Type" },
+        { header: "Date", key: "Date" },
+        { header: "Player", key: "Player" },
+        { header: "Amount", key: "Amount" },
+        { header: "Status", key: "Status" },
+      ],
+    },
+  ]);
+}
+
+export async function exportExpenseAnalysisToBuffer(query: ExpenseAnalysisRecordsQuery): Promise<Buffer> {
+  const result = await getExpenseAnalysisRecords({
+    ...query,
+    page: 1,
+    pageSize: 10000,
+  });
+
+  const exportData = result.rows.map((r: any) => ({
+    Date: r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    Category: r.categoryName || "",
+    Merchant: r.merchantName || "",
+    "Bank Account": r.bankAccountName || "",
+    Amount: r.amount,
+    Status: r.status,
+    Description: r.description || "",
+  }));
+
+  return generateExcelBuffer(
+    exportData,
+    [
+      { header: "Date", key: "Date" },
+      { header: "Category", key: "Category" },
+      { header: "Merchant", key: "Merchant" },
+      { header: "Bank Account", key: "Bank Account" },
+      { header: "Amount", key: "Amount" },
+      { header: "Status", key: "Status" },
+      { header: "Description", key: "Description" },
+    ],
+    "Expense Analysis",
+  );
 }
 
 /** Distinct non-auth entity values for transaction history filters. */

@@ -6,6 +6,9 @@ import { PERMISSIONS } from "../../shared/constants/permissions";
 import {
   createLiabilityEntryController,
   createLiabilityPersonController,
+  exportLiabilityEntryController,
+  exportLiabilityLedgerController,
+  exportLiabilityPersonController,
   liabilityPersonLedgerController,
   liabilityPersonWiseReportController,
   liabilitySummaryReportController,
@@ -48,6 +51,13 @@ liabilityRouter.get(
   listLiabilityPersonController,
 );
 
+liabilityRouter.get(
+  "/persons/export",
+  permissionMiddleware(PERMISSIONS.LIABILITY_PERSON_LIST),
+  validate({ query: listLiabilityPersonQuerySchema }),
+  exportLiabilityPersonController,
+);
+
 liabilityRouter.post(
   "/entries",
   permissionMiddleware(PERMISSIONS.LIABILITY_ENTRY_ADD),
@@ -63,10 +73,24 @@ liabilityRouter.get(
 );
 
 liabilityRouter.get(
+  "/entries/export",
+  permissionMiddleware(PERMISSIONS.LIABILITY_ENTRY_LIST),
+  validate({ query: listLiabilityEntryQuerySchema }),
+  exportLiabilityEntryController,
+);
+
+liabilityRouter.get(
   "/persons/:id/ledger",
   permissionMiddleware(PERMISSIONS.LIABILITY_LEDGER_VIEW),
   validate({ params: liabilityPersonIdParamSchema, query: liabilityLedgerQuerySchema }),
   liabilityPersonLedgerController,
+);
+
+liabilityRouter.get(
+  "/persons/:id/ledger/export",
+  permissionMiddleware(PERMISSIONS.LIABILITY_LEDGER_VIEW),
+  validate({ params: liabilityPersonIdParamSchema, query: liabilityLedgerQuerySchema }),
+  exportLiabilityLedgerController,
 );
 
 liabilityRouter.get(
