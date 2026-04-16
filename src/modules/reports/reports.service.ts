@@ -1013,6 +1013,8 @@ export function buildExpenseReportFilter(q: ExpenseAnalysisFilterQuery): Record<
   const st = trimUndef(q.status);
   if (st === "pending_audit" || st === "approved" || st === "rejected") {
     conditions.push({ status: st as ExpenseStatus });
+  } else {
+    conditions.push({ status: { $in: ["pending_audit", "approved"] as ExpenseStatus[] } });
   }
 
   const expenseTypeId = trimUndef(q.expenseTypeId);

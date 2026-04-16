@@ -4,6 +4,7 @@ import {
   createWithdrawal,
   listSavedAccountsForPlayer,
   listWithdrawals,
+  updateWithdrawalByExchange,
   updateWithdrawalByBanker,
   updateWithdrawalStatus,
   exportWithdrawalsToBuffer,
@@ -11,6 +12,7 @@ import {
 import {
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
+  updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
@@ -23,8 +25,15 @@ export async function createWithdrawalController(req: Request, res: Response) {
 
 export async function listWithdrawalController(req: Request, res: Response) {
   const query = listWithdrawalQuerySchema.parse(req.query);
-  const result = await listWithdrawals(query);
+  const result = await listWithdrawals(query, { actorId: req.user!.userId });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
+}
+
+export async function updateWithdrawalExchangeController(req: Request, res: Response) {
+  const body = updateWithdrawalBodySchema.parse(req.body);
+  const id = String(req.params.id);
+  const data = await updateWithdrawalByExchange(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function updateWithdrawalBankerController(req: Request, res: Response) {

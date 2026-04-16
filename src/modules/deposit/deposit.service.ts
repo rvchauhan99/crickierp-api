@@ -346,7 +346,31 @@ export async function updateDepositByBanker(
   return doc;
 }
 
-export async function listDeposits(query: ListDepositQuery) {
+export type LastBankerDepositMeta = { bankId: string; bankName: string } | null;
+
+async function lastBankerDepositForActor(
+  view: ListDepositQuery["view"],
+  actorId: string | undefined,
+): Promise<LastBankerDepositMeta> {
+  if (view !== "banker" || !actorId || !Types.ObjectId.isValid(actorId)) return null;
+  const row = await DepositModel.findOne({ createdBy: new Types.ObjectId(actorId) })
+    .sort({ createdAt: -1 })
+    .select({ bankId: 1, bankName: 1 })
+    .lean();
+  if (!row) return null;
+  const raw = row.bankId as unknown;
+  const bankId =
+    raw != null && typeof raw === "object" && "_id" in (raw as object)
+      ? String((raw as { _id?: unknown })._id)
+      : raw != null
+        ? String(raw)
+        : "";
+  if (!bankId) return null;
+  const bankName = typeof row.bankName === "string" ? row.bankName.trim() : "";
+  return { bankId, bankName: bankName || "—" };
+}
+
+export async function listDeposits(query: ListDepositQuery, options?: { actorId?: string }) {
   const filter = buildDepositListFilter(query);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
@@ -354,7 +378,7 @@ export async function listDeposits(query: ListDepositQuery) {
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
   const sortField = query.sortBy;
 
-  const [rows, total] = await Promise.all([
+  const [rows, total, lastBankerDeposit] = await Promise.all([
     DepositModel.find(filter)
       .populate("bankId", "holderName bankName accountNumber ifsc openingBalance currentBalance")
       .populate("player", "playerId phone exchange")
@@ -365,15 +389,26 @@ export async function listDeposits(query: ListDepositQuery) {
       .limit(pageSize)
       .lean(),
     DepositModel.countDocuments(filter),
+    lastBankerDepositForActor(query.view, options?.actorId),
   ]);
+
+  const meta: {
+    page: number;
+    pageSize: number;
+    total: number;
+    lastBankerDeposit?: LastBankerDepositMeta;
+  } = {
+    page,
+    pageSize,
+    total,
+  };
+  if (query.view === "banker") {
+    meta.lastBankerDeposit = lastBankerDeposit;
+  }
 
   return {
     rows,
-    meta: {
-      page,
-      pageSize,
-      total,
-    },
+    meta,
   };
 }
 
@@ -463,13 +498,15 @@ export async function exchangeApproveDeposit(
   const appliedBonusPercent = isFirstDeposit
     ? playerDoc.firstDepositBonusPercentage
     : playerDoc.regularBonusPercentage;
-  const bonus = bonusAmountFromPercent(doc.amount, appliedBonusPercent);
+  const bonusFromRule = bonusAmountFromPercent(doc.amount, appliedBonusPercent);
+  const bonus = Math.round(requestedBonus * 100) / 100;
   const totalAmount = doc.amount + bonus;
+  const bankCashCredit = doc.amount;
   const bank = await BankModel.findById(doc.bankId);
   if (!bank) throw new AppError("not_found", "Bank not found", 404);
 
   const prev = bank.currentBalance ?? bank.openingBalance;
-  const bankBalanceAfter = prev + totalAmount;
+  const bankBalanceAfter = prev + bankCashCredit;
 
   bank.currentBalance = bankBalanceAfter;
   await bank.save();
@@ -499,9 +536,11 @@ export async function exchangeApproveDeposit(
       playerId: input.playerId,
       bonusAmount: bonus,
       requestedBonusAmount: requestedBonus,
+      bonusFromRule,
       appliedBonusPercent,
       appliedBonusType: isFirstDeposit ? "first_deposit" : "regular",
       totalAmount,
+      bankCashCredit,
       bankBalanceAfter,
     },
     requestId,

@@ -15,6 +15,15 @@ export const withdrawalBankerPayoutBodySchema = z.object({
   utr: z.string().min(4).max(120).trim(),
 });
 
+export const updateWithdrawalBodySchema = z.object({
+  accountNumber: z.string().min(1).max(40).trim(),
+  accountHolderName: z.string().min(1).max(120).trim(),
+  bankName: z.string().min(1).max(120).trim(),
+  ifsc: z.string().min(4).max(20).trim(),
+  amount: z.number().min(1),
+  reverseBonus: z.number().min(0).optional().default(0),
+});
+
 export const listWithdrawalQuerySchema = z.object({
   view: z.enum(["exchange", "banker", "final"]).default("exchange"),
   search: z.string().optional(),

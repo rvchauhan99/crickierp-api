@@ -8,6 +8,7 @@ import { BankModel } from "../bank/bank.model";
 import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
+import { AuditLogModel } from "../audit/audit.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
 import { listWithdrawalQuerySchema } from "./withdrawal.validation";
 
@@ -252,6 +253,74 @@ export async function createWithdrawal(
   return doc;
 }
 
+export async function updateWithdrawalByExchange(
+  id: string,
+  input: {
+    accountNumber: string;
+    accountHolderName: string;
+    bankName: string;
+    ifsc: string;
+    amount: number;
+    reverseBonus: number;
+  },
+  actorId: string,
+  requestId?: string,
+) {
+  const doc = await WithdrawalModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
+  if (doc.status !== "requested") {
+    throw new AppError("business_rule_error", "Only requested withdrawals can be updated", 400);
+  }
+
+  const nextReverseBonus = input.reverseBonus ?? 0;
+  const payableAmount = payableFromAmounts(input.amount, nextReverseBonus);
+  const prev = {
+    accountNumber: doc.accountNumber,
+    accountHolderName: doc.accountHolderName,
+    bankName: doc.bankName,
+    ifsc: doc.ifsc,
+    amount: doc.amount,
+    reverseBonus: doc.reverseBonus,
+    payableAmount: doc.payableAmount,
+  };
+
+  doc.accountNumber = input.accountNumber.trim();
+  doc.accountHolderName = input.accountHolderName.trim();
+  doc.bankName = input.bankName.trim();
+  doc.ifsc = input.ifsc.trim();
+  doc.amount = input.amount;
+  doc.reverseBonus = nextReverseBonus;
+  doc.payableAmount = payableAmount;
+  await doc.save();
+
+  await createAuditLog({
+    actorId,
+    action: "withdrawal.exchange_update",
+    entity: "withdrawal",
+    entityId: doc._id.toString(),
+    oldValue: prev as unknown as Record<string, unknown>,
+    newValue: {
+      accountNumber: doc.accountNumber,
+      accountHolderName: doc.accountHolderName,
+      bankName: doc.bankName,
+      ifsc: doc.ifsc,
+      amount: doc.amount,
+      reverseBonus: doc.reverseBonus,
+      payableAmount: doc.payableAmount,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      await recomputeExchangeCurrentBalance(String(player.exchange));
+    }
+  }
+
+  return doc;
+}
+
 export async function updateWithdrawalByBanker(
   id: string,
   input: { bankId: string; utr: string },
@@ -302,7 +371,64 @@ export async function updateWithdrawalByBanker(
   return doc;
 }
 
-export async function listWithdrawals(query: ListWithdrawalQuery) {
+export type LastBankerPayoutMeta = { bankId: string; bankName: string } | null;
+
+/** Latest company payout bank from this actor’s last banker payout (audit), not `withdrawal.createdBy`. */
+async function lastBankerPayoutBankForActor(
+  view: ListWithdrawalQuery["view"],
+  actorId: string | undefined,
+): Promise<LastBankerPayoutMeta> {
+  if (view !== "banker" || !actorId || !Types.ObjectId.isValid(actorId)) return null;
+
+  const log = await AuditLogModel.findOne({
+    actorId: new Types.ObjectId(actorId),
+    action: "withdrawal.banker_payout",
+  })
+    .sort({ createdAt: -1 })
+    .select({ entityId: 1, newValue: 1 })
+    .lean();
+
+  if (!log?.entityId) return null;
+
+  const withdrawal = await WithdrawalModel.findById(String(log.entityId).trim())
+    .select({ payoutBankId: 1, payoutBankName: 1 })
+    .lean();
+
+  if (withdrawal?.payoutBankId) {
+    const raw = withdrawal.payoutBankId as unknown;
+    const bankId =
+      raw != null && typeof raw === "object" && "_id" in (raw as object)
+        ? String((raw as { _id?: unknown })._id)
+        : String(raw);
+    const bankName = typeof withdrawal.payoutBankName === "string" ? withdrawal.payoutBankName.trim() : "";
+    if (bankId) return { bankId, bankName: bankName || "—" };
+  }
+
+  const nv = log.newValue;
+  if (nv && typeof nv === "object" && nv !== null && "bankId" in nv) {
+    const bankId = String((nv as { bankId?: unknown }).bankId ?? "").trim();
+    if (bankId && Types.ObjectId.isValid(bankId)) {
+      const bank = await BankModel.findById(bankId)
+        .select({ holderName: 1, bankName: 1, accountNumber: 1 })
+        .lean();
+      if (bank && bank.holderName != null && bank.bankName != null) {
+        const acct = String(bank.accountNumber ?? "");
+        return {
+          bankId,
+          bankName: bankDisplayName({
+            holderName: bank.holderName,
+            bankName: bank.bankName,
+            accountNumber: acct,
+          }),
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+export async function listWithdrawals(query: ListWithdrawalQuery, options?: { actorId?: string }) {
   const filter = buildWithdrawalListFilter(query);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
@@ -310,7 +436,7 @@ export async function listWithdrawals(query: ListWithdrawalQuery) {
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
   const sortField = query.sortBy;
 
-  const [rows, total] = await Promise.all([
+  const [rows, total, lastBankerPayout] = await Promise.all([
     WithdrawalModel.find(filter)
       .populate("player", "playerId phone")
       .populate("payoutBankId", "holderName bankName accountNumber")
@@ -320,15 +446,26 @@ export async function listWithdrawals(query: ListWithdrawalQuery) {
       .limit(pageSize)
       .lean(),
     WithdrawalModel.countDocuments(filter),
+    lastBankerPayoutBankForActor(query.view, options?.actorId),
   ]);
+
+  const meta: {
+    total: number;
+    page: number;
+    pageSize: number;
+    lastBankerPayout?: LastBankerPayoutMeta;
+  } = {
+    total,
+    page,
+    pageSize,
+  };
+  if (query.view === "banker") {
+    meta.lastBankerPayout = lastBankerPayout;
+  }
 
   return {
     rows,
-    meta: {
-      total,
-      page,
-      pageSize,
-    },
+    meta,
   };
 }
 

@@ -30,7 +30,7 @@ export async function updateDepositController(req: Request, res: Response) {
 
 export async function listDepositController(req: Request, res: Response) {
   const query = listDepositQuerySchema.parse(req.query);
-  const result = await listDeposits(query);
+  const result = await listDeposits(query, { actorId: req.user!.userId });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 

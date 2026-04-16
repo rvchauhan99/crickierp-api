@@ -7,6 +7,7 @@ import {
   createWithdrawalController,
   listSavedAccountsController,
   listWithdrawalController,
+  updateWithdrawalExchangeController,
   updateWithdrawalBankerController,
   updateWithdrawalStatusController,
   exportWithdrawalController,
@@ -16,6 +17,7 @@ import { withdrawalStatusPermissionMiddleware } from "./withdrawal.status.middle
 import {
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
+  updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
@@ -35,6 +37,13 @@ withdrawalRouter.get(
   "/player/:playerId/saved-accounts",
   permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE),
   listSavedAccountsController,
+);
+
+withdrawalRouter.patch(
+  "/:id",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE),
+  validate({ body: updateWithdrawalBodySchema }),
+  updateWithdrawalExchangeController,
 );
 
 withdrawalRouter.patch(
