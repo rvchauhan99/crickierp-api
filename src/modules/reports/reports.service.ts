@@ -3,6 +3,7 @@ import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared
 import type { z } from "zod";
 import { AuditLogModel } from "../audit/audit.model";
 import { ExchangeModel } from "../exchange/exchange.model";
+import { PlayerModel } from "../player/player.model";
 import { UserModel } from "../users/user.model";
 import { ExpenseModel, type ExpenseStatus } from "../expense/expense.model";
 import { AUDIT_ENTITY_AUTH } from "../../shared/constants/auditEntities";
@@ -40,6 +41,7 @@ function buildDateFilter(query: DateRangeQuery) {
 
 const DASHBOARD_DEFAULT_DAYS = 30;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 
 function ymdToUtcStart(ymd: string): Date {
   return new Date(`${ymd}T00:00:00.000Z`);
@@ -74,6 +76,21 @@ function dateRangeYmd(fromDate: string, toDate: string): string[] {
     days.push(toYMDUtc(new Date(cursor)));
   }
   return days;
+}
+
+function resolveIstTodayRange(now: Date = new Date()): { startUtc: Date; endUtc: Date; ymd: string } {
+  const istNow = new Date(now.getTime() + IST_OFFSET_MS);
+  const year = istNow.getUTCFullYear();
+  const month = istNow.getUTCMonth();
+  const day = istNow.getUTCDate();
+  const startUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0) - IST_OFFSET_MS;
+  const endUtcMs = startUtcMs + ONE_DAY_MS - 1;
+  const ymd = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return {
+    startUtc: new Date(startUtcMs),
+    endUtc: new Date(endUtcMs),
+    ymd,
+  };
 }
 
 type DashboardStatusFilter = "all" | "pending" | "approved" | "rejected";
@@ -240,6 +257,18 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
     expenseFilter,
     exchangeStatsFilter,
   } = await buildDashboardFilterContext(query);
+  const istTodayRange = resolveIstTodayRange();
+  const todayPlayerFilter = {
+    createdAt: {
+      $gte: istTodayRange.startUtc,
+      $lte: istTodayRange.endUtc,
+    },
+    ...(exchangeObjectId ? { exchange: exchangeObjectId } : {}),
+  };
+  const firstDepositBaseMatch: Record<string, unknown> = {
+    status: { $in: ["verified", "finalized"] },
+    player: scopedPlayerIds ? { $in: scopedPlayerIds } : { $exists: true, $ne: null },
+  };
 
   /* ── Raw aggregation promises ──────────────────────────────────── */
   const [
@@ -254,6 +283,10 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
     withdrawalTrend,
     exchangeDeposits,
     exchangeWithdrawals,
+    todayNewPlayersCount,
+    firstTimeDepositTodayAgg,
+    exchangeNewPlayersTodayAgg,
+    exchangeFirstTimeDepositTodayAgg,
   ] = await Promise.all([
     // Deposit: group by status → totalAmount, count, bonusTotal
     DepositModel.aggregate([
@@ -417,6 +450,94 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
         },
       },
     ]),
+
+    PlayerModel.countDocuments(todayPlayerFilter),
+
+    scopedPlayerIds && scopedPlayerIds.length === 0
+      ? Promise.resolve([{ totalAmount: 0 }])
+      : DepositModel.aggregate([
+          { $match: firstDepositBaseMatch },
+          {
+            $addFields: {
+              firstDepositEventAt: { $ifNull: ["$settledAt", "$createdAt"] },
+            },
+          },
+          { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
+          {
+            $group: {
+              _id: "$player",
+              firstDepositAt: { $first: "$firstDepositEventAt" },
+              firstDepositAmount: { $first: "$amount" },
+            },
+          },
+          {
+            $match: {
+              firstDepositAt: {
+                $gte: istTodayRange.startUtc,
+                $lte: istTodayRange.endUtc,
+              },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalAmount: { $sum: "$firstDepositAmount" },
+            },
+          },
+        ]),
+
+    PlayerModel.aggregate([
+      { $match: todayPlayerFilter },
+      {
+        $group: {
+          _id: "$exchange",
+          newPlayersToday: { $sum: 1 },
+        },
+      },
+    ]),
+
+    scopedPlayerIds && scopedPlayerIds.length === 0
+      ? Promise.resolve([])
+      : DepositModel.aggregate([
+          { $match: firstDepositBaseMatch },
+          {
+            $addFields: {
+              firstDepositEventAt: { $ifNull: ["$settledAt", "$createdAt"] },
+            },
+          },
+          { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
+          {
+            $group: {
+              _id: "$player",
+              firstDepositAt: { $first: "$firstDepositEventAt" },
+              firstDepositAmount: { $first: "$amount" },
+            },
+          },
+          {
+            $match: {
+              firstDepositAt: {
+                $gte: istTodayRange.startUtc,
+                $lte: istTodayRange.endUtc,
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: "players",
+              localField: "_id",
+              foreignField: "_id",
+              as: "playerDoc",
+            },
+          },
+          { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
+          ...(exchangeObjectId ? [{ $match: { "playerDoc.exchange": exchangeObjectId } }] : []),
+          {
+            $group: {
+              _id: "$playerDoc.exchange",
+              firstTimeDepositAmountToday: { $sum: "$firstDepositAmount" },
+            },
+          },
+        ]),
   ]);
 
   /* ── Aggregate deposit KPIs ────────────────────────────────────── */
@@ -587,10 +708,19 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
   const exchangesBreakdown = Array.from(exchangeMap.values())
     .map((e) => ({
       ...e,
+      newPlayersToday:
+        exchangeNewPlayersTodayAgg.find((row: { _id?: unknown; newPlayersToday?: number }) => String(row._id) === e.exchangeId)
+          ?.newPlayersToday ?? 0,
+      firstTimeDepositAmountToday:
+        exchangeFirstTimeDepositTodayAgg.find(
+          (row: { _id?: unknown; firstTimeDepositAmountToday?: number }) => String(row._id) === e.exchangeId,
+        )?.firstTimeDepositAmountToday ?? 0,
       netPL: e.depositVerified - e.withdrawalApproved,
       netBonus: e.bonusGiven - e.bonusRecovered,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
+  const firstTimeDepositAmountToday =
+    (firstTimeDepositTodayAgg as Array<{ totalAmount?: number }>)[0]?.totalAmount ?? 0;
 
   return {
     meta: {
@@ -600,6 +730,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
       status: query.status ?? "all",
       transactionType: query.transactionType ?? "all",
       scopedPlayerCount: scopedPlayerIds?.length ?? null,
+      todayYmdIst: istTodayRange.ymd,
     },
     deposit: {
       totalAmount: depositTotal,
@@ -637,6 +768,10 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
     },
     users: {
       total: totalUsers,
+    },
+    todayMetrics: {
+      newPlayersToday: todayNewPlayersCount ?? 0,
+      firstTimeDepositAmountToday,
     },
     trendData,
     recentActivity,
@@ -757,6 +892,8 @@ export async function exportDashboardSummaryToBuffer(query: DashboardSummaryQuer
     { KPI: "Reverse Bonus", Value: data.withdrawal.reverseBonusTotal },
     { KPI: "Total Expenses", Value: data.expense.totalAmount },
     { KPI: "Net P&L", Value: data.pnl.net },
+    { KPI: "New Players Today (IST)", Value: data.todayMetrics.newPlayersToday },
+    { KPI: "First-Time Deposit Amount Today (IST)", Value: data.todayMetrics.firstTimeDepositAmountToday },
   ];
 
   const exchangeData = data.exchangesBreakdown.map((ex) => ({
