@@ -19,6 +19,7 @@ import {
   rejectExpenseBodySchema,
   updateExpenseBodySchema,
 } from "./expense.validation";
+import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function createExpenseController(req: Request, res: Response) {
   const body = createExpenseBodySchema.parse(req.body);
@@ -40,13 +41,15 @@ export async function listExpenseTypesController(_req: Request, res: Response) {
 
 export async function listExpenseController(req: Request, res: Response) {
   const query = listExpenseQuerySchema.parse(req.query);
-  const result = await listExpenses(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await listExpenses(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
 export async function exportExpenseController(req: Request, res: Response) {
   const query = listExpenseQuerySchema.parse(req.query);
-  const buffer = await exportExpensesToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportExpensesToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="expenses-export.xlsx"');
   res.setHeader(
     "Content-Type",

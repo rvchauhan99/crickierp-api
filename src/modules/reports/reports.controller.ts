@@ -16,16 +16,19 @@ import {
   getTransactionHistory,
   listAuditEntityValuesForTransactions,
 } from "./reports.service";
+import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function dashboardSummaryController(req: Request, res: Response) {
   const query = dashboardSummaryQuerySchema.parse(req.query);
-  const data = await getDashboardSummary(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const data = await getDashboardSummary(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function exportDashboardReportController(req: Request, res: Response) {
   const query = dashboardSummaryQuerySchema.parse(req.query);
-  const buffer = await exportDashboardSummaryToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportDashboardSummaryToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="dashboard-operational-report.xlsx"');
   res.setHeader(
     "Content-Type",
@@ -36,13 +39,15 @@ export async function exportDashboardReportController(req: Request, res: Respons
 
 export async function transactionHistoryController(req: Request, res: Response) {
   const query = transactionHistoryQuerySchema.parse(req.query);
-  const data = await getTransactionHistory(query, { scope: "transactions" });
+  const timeZone = resolveRequestTimeZone(req);
+  const data = await getTransactionHistory(query, { scope: "transactions", timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: data.rows, meta: data.meta });
 }
 
 export async function exportTransactionHistoryController(req: Request, res: Response) {
   const query = transactionHistoryQuerySchema.parse(req.query);
-  const buffer = await exportTransactionHistoryToBuffer(query, { scope: "transactions" });
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportTransactionHistoryToBuffer(query, { scope: "transactions", timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="audit-history-export.xlsx"');
   res.setHeader(
     "Content-Type",
@@ -58,13 +63,15 @@ export async function auditEntitiesController(_req: Request, res: Response) {
 
 export async function expenseAnalysisSummaryController(req: Request, res: Response) {
   const query = expenseAnalysisSummaryQuerySchema.parse(req.query);
-  const summary = await getExpenseAnalysisSummary(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const summary = await getExpenseAnalysisSummary(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, summary });
 }
 
 export async function expenseAnalysisRecordsController(req: Request, res: Response) {
   const query = expenseAnalysisRecordsQuerySchema.parse(req.query);
-  const result = await getExpenseAnalysisRecords(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await getExpenseAnalysisRecords(query, { timeZone });
   res.status(StatusCodes.OK).json({
     success: true,
     data: result.rows,
@@ -74,7 +81,8 @@ export async function expenseAnalysisRecordsController(req: Request, res: Respon
 
 export async function exportExpenseAnalysisController(req: Request, res: Response) {
   const query = expenseAnalysisRecordsQuerySchema.parse(req.query);
-  const buffer = await exportExpenseAnalysisToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportExpenseAnalysisToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="expense-analysis-export.xlsx"');
   res.setHeader(
     "Content-Type",

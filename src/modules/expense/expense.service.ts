@@ -9,6 +9,14 @@ import { ExpenseTypeModel } from "../masters/expense-type.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
 import { createLiabilityEntry } from "../liability/liability.service";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateForTimeZone,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcNoon,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { ExpenseModel, ExpenseStatus } from "./expense.model";
 import { approveExpenseBodySchema, listExpenseQuerySchema } from "./expense.validation";
 import { deleteFile, getSignedUrl, uploadFile } from "../../shared/services/bucket.service";
@@ -25,9 +33,8 @@ function bankDisplayName(b: { holderName: string; bankName: string; accountNumbe
   return `${b.holderName} — ${b.bankName}${last4 ? ` (${last4})` : ""}`.trim();
 }
 
-function parseYmdToDate(ymd: string): Date {
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 12, 0, 0, 0);
+function parseYmdToDate(ymd: string, timeZone: string = DEFAULT_TIMEZONE): Date {
+  return ymdToUtcNoon(ymd, timeZone) ?? new Date(ymd);
 }
 
 function trimUndef(s: string | undefined): string | undefined {
@@ -40,23 +47,12 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 /** Date filter for `expenseDate` (aligned with deposit `createdAtCondition`; default op equals when a single bound is used). */
 function expenseDateCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const f = trimUndef(from);
   const t = trimUndef(to);
@@ -65,47 +61,47 @@ function expenseDateCondition(
     rawOp || (f && t ? "inRange" : f || t ? "equals" : "");
 
   if (effectiveOp === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { expenseDate: { $gte: start, $lte: end } };
   }
   if (effectiveOp === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { expenseDate: { $gte: start, $lte: end } };
   }
   if (effectiveOp === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { expenseDate: { $lt: start } };
   }
   if (effectiveOp === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { expenseDate: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { expenseDate: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { expenseDate: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { expenseDate: { $lte: end } };
   }
   return null;
 }
 
-function buildListFilter(q: ListExpenseQuery): Record<string, unknown> {
+function buildListFilter(q: ListExpenseQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -139,6 +135,7 @@ function buildListFilter(q: ListExpenseQuery): Record<string, unknown> {
     trimUndef(q.expenseDate_from),
     trimUndef(q.expenseDate_to),
     trimUndef(q.expenseDate_op),
+    timeZone,
   );
   if (dateCond) conditions.push(dateCond);
 
@@ -439,8 +436,9 @@ export async function rejectExpense(
   return doc;
 }
 
-export async function listExpenses(query: ListExpenseQuery) {
-  const filter = buildListFilter(query);
+export async function listExpenses(query: ListExpenseQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildListFilter(query, timeZone);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -486,8 +484,12 @@ function formatUserForExport(user: unknown): string {
   return "";
 }
 
-export async function exportExpensesToBuffer(query: ListExpenseQuery): Promise<Buffer> {
-  const filter = buildListFilter(query);
+export async function exportExpensesToBuffer(
+  query: ListExpenseQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildListFilter(query, timeZone);
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await ExpenseModel.find(filter)
@@ -513,7 +515,7 @@ export async function exportExpensesToBuffer(query: ListExpenseQuery): Promise<B
     }
 
     return {
-      "Expense Date": r.expenseDate ? new Date(r.expenseDate).toISOString().split("T")[0] : "",
+      "Expense Date": formatDateForTimeZone(r.expenseDate, timeZone),
       Type: et?.name ?? "",
       Amount: r.amount,
       Description: r.description ?? "",
@@ -522,7 +524,7 @@ export async function exportExpensesToBuffer(query: ListExpenseQuery): Promise<B
       "Reject Reason": r.rejectReason ?? "",
       "Created By": formatUserForExport(r.createdBy),
       "Approved By": formatUserForExport(r.approvedBy),
-      "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+      "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
     };
   });
 

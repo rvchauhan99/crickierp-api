@@ -8,6 +8,12 @@ import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import type { DepositAmendmentSnapshot } from "./deposit.model";
 import { DepositModel, DepositStatus } from "./deposit.model";
 import { amendDepositBodySchema, listDepositQuerySchema } from "./deposit.validation";
@@ -87,69 +93,58 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function createdAtCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const operator = op || "inRange";
   const f = trimUndef(from);
   const t = trimUndef(to);
 
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $lt: start } };
   }
   if (operator === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { createdAt: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { createdAt: { $lte: end } };
   }
   return null;
 }
 
-function buildDepositListFilter(q: ListDepositQuery): Record<string, unknown> {
+function buildDepositListFilter(q: ListDepositQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -208,6 +203,7 @@ function buildDepositListFilter(q: ListDepositQuery): Record<string, unknown> {
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) {
     conditions.push(dateCond);
@@ -383,8 +379,12 @@ async function lastBankerDepositForActor(
   return { bankId, bankName: bankName || "—" };
 }
 
-export async function listDeposits(query: ListDepositQuery, options?: { actorId?: string }) {
-  const filter = buildDepositListFilter(query);
+export async function listDeposits(
+  query: ListDepositQuery,
+  options?: { actorId?: string; timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildDepositListFilter(query, timeZone);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -441,8 +441,12 @@ function formatUserForExport(u: unknown): string {
   return "";
 }
 
-export async function exportDepositsToBuffer(query: ListDepositQuery): Promise<Buffer> {
-  const filter = buildDepositListFilter(query);
+export async function exportDepositsToBuffer(
+  query: ListDepositQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildDepositListFilter(query, timeZone);
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await DepositModel.find(filter)
@@ -462,12 +466,12 @@ export async function exportDepositsToBuffer(query: ListDepositQuery): Promise<B
     { header: "Amendment count", key: "amendmentCount" },
     {
       header: "Last amended at",
-      transform: (r) => (r.lastAmendedAt ? new Date(r.lastAmendedAt).toISOString() : ""),
+      transform: (r) => formatDateTimeForTimeZone(r.lastAmendedAt, timeZone),
     },
     { header: "Reject reason", key: "rejectReason" },
     { header: "Bank balance after", key: "bankBalanceAfter" },
-    { header: "Settled at", transform: (r) => (r.settledAt ? new Date(r.settledAt).toISOString() : "") },
-    { header: "Created at", transform: (r) => (r.createdAt ? new Date(r.createdAt).toISOString() : "") },
+    { header: "Settled at", transform: (r) => formatDateTimeForTimeZone(r.settledAt, timeZone) },
+    { header: "Created at", transform: (r) => formatDateTimeForTimeZone(r.createdAt, timeZone) },
   ], "Deposits");
 }
 

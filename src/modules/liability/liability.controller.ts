@@ -22,6 +22,7 @@ import {
   listLiabilityPersons,
   updateLiabilityPerson,
 } from "./liability.service";
+import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function createLiabilityPersonController(req: Request, res: Response) {
   const body = createLiabilityPersonBodySchema.parse(req.body);
@@ -38,13 +39,15 @@ export async function updateLiabilityPersonController(req: Request, res: Respons
 
 export async function listLiabilityPersonController(req: Request, res: Response) {
   const query = listLiabilityPersonQuerySchema.parse(req.query);
-  const result = await listLiabilityPersons(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await listLiabilityPersons(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
 export async function exportLiabilityPersonController(req: Request, res: Response) {
   const query = listLiabilityPersonQuerySchema.parse(req.query);
-  const buffer = await exportLiabilityPersonsToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportLiabilityPersonsToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="liability-persons-export.xlsx"');
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.status(StatusCodes.OK).send(buffer);
@@ -58,13 +61,15 @@ export async function createLiabilityEntryController(req: Request, res: Response
 
 export async function listLiabilityEntryController(req: Request, res: Response) {
   const query = listLiabilityEntryQuerySchema.parse(req.query);
-  const result = await listLiabilityEntries(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await listLiabilityEntries(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
 export async function exportLiabilityEntryController(req: Request, res: Response) {
   const query = listLiabilityEntryQuerySchema.parse(req.query);
-  const buffer = await exportLiabilityEntriesToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportLiabilityEntriesToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="liability-entries-export.xlsx"');
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.status(StatusCodes.OK).send(buffer);
@@ -73,14 +78,16 @@ export async function exportLiabilityEntryController(req: Request, res: Response
 export async function liabilityPersonLedgerController(req: Request, res: Response) {
   const { id } = liabilityPersonIdParamSchema.parse(req.params);
   const query = liabilityLedgerQuerySchema.parse(req.query);
-  const data = await getLiabilityPersonLedger(id, query);
+  const timeZone = resolveRequestTimeZone(req);
+  const data = await getLiabilityPersonLedger(id, query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function exportLiabilityLedgerController(req: Request, res: Response) {
   const { id } = liabilityPersonIdParamSchema.parse(req.params);
   const query = liabilityLedgerQuerySchema.parse(req.query);
-  const buffer = await exportLiabilityLedgerToBuffer(id, query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportLiabilityLedgerToBuffer(id, query, { timeZone });
   res.setHeader("Content-Disposition", `attachment; filename="liability-ledger-${id}.xlsx"`);
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.status(StatusCodes.OK).send(buffer);

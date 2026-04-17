@@ -9,6 +9,12 @@ import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { AuditLogModel } from "../audit/audit.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import type { WithdrawalAmendmentSnapshot } from "./withdrawal.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
 import { amendWithdrawalBodySchema, listWithdrawalQuerySchema } from "./withdrawal.validation";
@@ -70,39 +76,28 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function createdAtCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const f = trimUndef(from);
   const t = trimUndef(to);
   const operator = op || "inRange";
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { createdAt: { $lte: end } };
   }
@@ -130,7 +125,7 @@ function viewBaseCondition(view: ListWithdrawalQuery["view"]): Record<string, un
   }
 }
 
-function buildWithdrawalListFilter(q: ListWithdrawalQuery): Record<string, unknown> {
+function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [viewBaseCondition(q.view)];
 
   const search = trimUndef(q.search);
@@ -188,6 +183,7 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery): Record<string, unkno
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) conditions.push(dateCond);
 
@@ -449,8 +445,12 @@ async function lastBankerPayoutBankForActor(
   return null;
 }
 
-export async function listWithdrawals(query: ListWithdrawalQuery, options?: { actorId?: string }) {
-  const filter = buildWithdrawalListFilter(query);
+export async function listWithdrawals(
+  query: ListWithdrawalQuery,
+  options?: { actorId?: string; timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildWithdrawalListFilter(query, timeZone);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -589,8 +589,12 @@ export async function listSavedAccountsForPlayer(playerId: string) {
 
 const EXPORT_MAX_ROWS = 10_000;
 
-export async function exportWithdrawalsToBuffer(query: ListWithdrawalQuery): Promise<Buffer> {
-  const filter = buildWithdrawalListFilter(query);
+export async function exportWithdrawalsToBuffer(
+  query: ListWithdrawalQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildWithdrawalListFilter(query, timeZone);
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await WithdrawalModel.find(filter)
@@ -617,10 +621,10 @@ export async function exportWithdrawalsToBuffer(query: ListWithdrawalQuery): Pro
     { header: "Amendment Count", key: "amendmentCount" },
     {
       header: "Last Amended At",
-      transform: (r) => (r.lastAmendedAt ? new Date(r.lastAmendedAt).toISOString() : ""),
+      transform: (r) => formatDateTimeForTimeZone(r.lastAmendedAt, timeZone),
     },
     { header: "Created By", transform: (r) => (r.createdBy as any)?.fullName ?? "" },
-    { header: "Created At", transform: (r) => (r.createdAt ? new Date(r.createdAt).toISOString() : "") },
+    { header: "Created At", transform: (r) => formatDateTimeForTimeZone(r.createdAt, timeZone) },
   ], "Withdrawals");
 }
 

@@ -18,6 +18,7 @@ export interface UserDocument {
   resetPasswordExpires?: Date;
   createdBy?: Types.ObjectId;
   lastLoginAt?: Date;
+  timezone: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -37,6 +38,7 @@ const userSchema = new Schema<UserDocument>(
     resetPasswordExpires: { type: Date },
     createdBy: { type: Schema.Types.ObjectId, ref: "User" },
     lastLoginAt: { type: Date },
+    timezone: { type: String, trim: true, default: "Asia/Kolkata" },
   },
   { timestamps: true },
 );

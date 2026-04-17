@@ -14,6 +14,7 @@ export async function createUserController(req: Request, res: Response) {
     passwordRaw: data.password,
     role: data.role,
     permissions: data.permissions || [],
+    timezone: data.timezone,
   });
 
   res.status(StatusCodes.CREATED).json({ success: true, data: result });

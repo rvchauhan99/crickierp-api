@@ -5,6 +5,12 @@ import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { ExchangeModel } from "../exchange/exchange.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { PlayerModel } from "./player.model";
 import { listPlayerQuerySchema } from "./player.validation";
 
@@ -80,69 +86,58 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function createdAtCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const operator = op || "inRange";
   const f = trimUndef(from);
   const t = trimUndef(to);
 
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $lt: start } };
   }
   if (operator === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { createdAt: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { createdAt: { $lte: end } };
   }
   return null;
 }
 
-async function buildPlayerListFilter(q: ListPlayerQuery): Promise<Record<string, unknown>> {
+async function buildPlayerListFilter(q: ListPlayerQuery, timeZone: string): Promise<Record<string, unknown>> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -187,6 +182,7 @@ async function buildPlayerListFilter(q: ListPlayerQuery): Promise<Record<string,
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) {
     conditions.push(dateCond);
@@ -366,7 +362,8 @@ export async function updatePlayer(
   return doc;
 }
 
-export async function listPlayers(query: ListPlayerQuery) {
+export async function listPlayers(query: ListPlayerQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const page = query.page ?? 1;
   const pageSize = query.pageSize ?? query.limit ?? 20;
   const skip = (page - 1) * pageSize;
@@ -374,7 +371,7 @@ export async function listPlayers(query: ListPlayerQuery) {
   const sortBy = requestedSortBy === "bonusPercentage" ? "regularBonusPercentage" : requestedSortBy;
   const sortOrder = query.sortOrder === "asc" ? 1 : -1;
 
-  const filter = await buildPlayerListFilter(query);
+  const filter = await buildPlayerListFilter(query, timeZone);
 
   const [rows, total] = await Promise.all([
     PlayerModel.find(filter)
@@ -406,8 +403,12 @@ export async function listPlayers(query: ListPlayerQuery) {
   };
 }
 
-export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buffer> {
-  const filter = await buildPlayerListFilter(query);
+export async function exportPlayersToBuffer(
+  query: ListPlayerQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = await buildPlayerListFilter(query, timeZone);
   const requestedSortBy = query.sortBy ?? "createdAt";
   const sortBy = requestedSortBy === "bonusPercentage" ? "regularBonusPercentage" : requestedSortBy;
   const sortOrder = query.sortOrder === "asc" ? 1 : -1;
@@ -442,7 +443,7 @@ export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buf
       "Regular Bonus %": r.regularBonusPercentage ?? 0,
       "First Deposit Bonus %": r.firstDepositBonusPercentage ?? 0,
       "Created By": formatCreatedBy(r.createdBy),
-      "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+      "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
     };
   });
 

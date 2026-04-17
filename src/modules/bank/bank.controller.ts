@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import { createBank, exportBanksToBuffer, getBankLedger, listBanks } from "./bank.service";
 import { bankIdParamSchema, bankLedgerQuerySchema, listBankQuerySchema } from "./bank.validation";
+import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function createBankController(req: Request, res: Response) {
   const data = await createBank(req.body, req.user!.userId, req.requestId);
@@ -10,13 +11,15 @@ export async function createBankController(req: Request, res: Response) {
 
 export async function listBankController(req: Request, res: Response) {
   const query = listBankQuerySchema.parse(req.query);
-  const result = await listBanks(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await listBanks(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
 export async function exportBankController(req: Request, res: Response) {
   const query = listBankQuerySchema.parse(req.query);
-  const buffer = await exportBanksToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportBanksToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="banks-export.xlsx"');
   res.setHeader(
     "Content-Type",
@@ -28,6 +31,7 @@ export async function exportBankController(req: Request, res: Response) {
 export async function bankLedgerController(req: Request, res: Response) {
   const { id } = bankIdParamSchema.parse(req.params);
   const query = bankLedgerQuerySchema.parse(req.query);
-  const data = await getBankLedger(id, query);
+  const timeZone = resolveRequestTimeZone(req);
+  const data = await getBankLedger(id, query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data });
 }
