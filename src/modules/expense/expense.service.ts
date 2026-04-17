@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
@@ -6,11 +7,22 @@ import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
 import { ExpenseTypeModel } from "../masters/expense-type.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
+import { LiabilityPersonModel } from "../liability/liability-person.model";
+import { createLiabilityEntry } from "../liability/liability.service";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateForTimeZone,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcNoon,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { ExpenseModel, ExpenseStatus } from "./expense.model";
-import { listExpenseQuerySchema } from "./expense.validation";
+import { approveExpenseBodySchema, listExpenseQuerySchema } from "./expense.validation";
 import { deleteFile, getSignedUrl, uploadFile } from "../../shared/services/bucket.service";
 
 type ListExpenseQuery = z.infer<typeof listExpenseQuerySchema>;
+type ApproveExpenseInput = z.infer<typeof approveExpenseBodySchema>;
 
 function pageSizeFromQuery(q: ListExpenseQuery): number {
   return q.limit ?? q.pageSize;
@@ -21,9 +33,8 @@ function bankDisplayName(b: { holderName: string; bankName: string; accountNumbe
   return `${b.holderName} — ${b.bankName}${last4 ? ` (${last4})` : ""}`.trim();
 }
 
-function parseYmdToDate(ymd: string): Date {
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 12, 0, 0, 0);
+function parseYmdToDate(ymd: string, timeZone: string = DEFAULT_TIMEZONE): Date {
+  return ymdToUtcNoon(ymd, timeZone) ?? new Date(ymd);
 }
 
 function trimUndef(s: string | undefined): string | undefined {
@@ -36,23 +47,12 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 /** Date filter for `expenseDate` (aligned with deposit `createdAtCondition`; default op equals when a single bound is used). */
 function expenseDateCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const f = trimUndef(from);
   const t = trimUndef(to);
@@ -61,47 +61,47 @@ function expenseDateCondition(
     rawOp || (f && t ? "inRange" : f || t ? "equals" : "");
 
   if (effectiveOp === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { expenseDate: { $gte: start, $lte: end } };
   }
   if (effectiveOp === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { expenseDate: { $gte: start, $lte: end } };
   }
   if (effectiveOp === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { expenseDate: { $lt: start } };
   }
   if (effectiveOp === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { expenseDate: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { expenseDate: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { expenseDate: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { expenseDate: { $lte: end } };
   }
   return null;
 }
 
-function buildListFilter(q: ListExpenseQuery): Record<string, unknown> {
+function buildListFilter(q: ListExpenseQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -135,6 +135,7 @@ function buildListFilter(q: ListExpenseQuery): Record<string, unknown> {
     trimUndef(q.expenseDate_from),
     trimUndef(q.expenseDate_to),
     trimUndef(q.expenseDate_op),
+    timeZone,
   );
   if (dateCond) conditions.push(dateCond);
 
@@ -270,7 +271,7 @@ export async function updateExpense(
 
 export async function approveExpense(
   id: string,
-  input: { bankId: string },
+  input: ApproveExpenseInput,
   actorId: string,
   requestId?: string,
 ) {
@@ -280,32 +281,104 @@ export async function approveExpense(
     throw new AppError("business_rule_error", "Expense is not pending audit", 400);
   }
 
-  const bank = await BankModel.findById(input.bankId);
-  if (!bank) throw new AppError("not_found", "Bank not found", 404);
-  if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
-
   const amount = doc.amount;
-  const prevBal = bank.currentBalance ?? bank.openingBalance;
-  if (amount > prevBal) {
-    throw new AppError("business_rule_error", "Insufficient bank balance for this expense", 400);
+  if (input.settlementAccountType === "bank") {
+    const bank = await BankModel.findById(input.bankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+    const prevBal = bank.currentBalance ?? bank.openingBalance;
+    if (amount > prevBal) {
+      throw new AppError("business_rule_error", "Insufficient bank balance for this expense", 400);
+    }
+
+    const bankBalanceAfter = prevBal - amount;
+    bank.currentBalance = bankBalanceAfter;
+    await bank.save();
+
+    try {
+      doc.bankId = bank._id;
+      doc.bankName = bankDisplayName(bank);
+      doc.settlementAccountType = "bank";
+      doc.liabilityPersonId = undefined;
+      doc.liabilityPersonName = "";
+      doc.liabilityEntryId = undefined;
+      doc.status = "approved";
+      doc.approvedBy = new Types.ObjectId(actorId);
+      doc.approvedAt = new Date();
+      doc.bankBalanceAfter = bankBalanceAfter;
+      doc.updatedBy = new Types.ObjectId(actorId);
+      await doc.save();
+    } catch (err) {
+      bank.currentBalance = prevBal;
+      await bank.save();
+      throw err;
+    }
+
+    await createAuditLog({
+      actorId,
+      action: "expense.approve",
+      entity: "expense",
+      entityId: doc._id.toString(),
+      newValue: {
+        settlementAccountType: "bank",
+        bankId: input.bankId,
+        bankBalanceAfter,
+        amount,
+      },
+      requestId,
+    });
+    return doc;
   }
 
-  const bankBalanceAfter = prevBal - amount;
-  bank.currentBalance = bankBalanceAfter;
-  await bank.save();
+  const person = await LiabilityPersonModel.findById(input.liabilityPersonId);
+  if (!person) throw new AppError("not_found", "Liability person not found", 404);
+  if (!person.isActive) throw new AppError("business_rule_error", "Liability person is inactive", 400);
+
+  doc.settlementAccountType = "person";
+  doc.liabilityPersonId = person._id;
+  doc.liabilityPersonName = person.name;
+  doc.liabilityEntryId = undefined;
+  doc.status = "approved";
+  doc.approvedBy = new Types.ObjectId(actorId);
+  doc.approvedAt = new Date();
+  doc.bankBalanceAfter = undefined;
+  doc.updatedBy = new Types.ObjectId(actorId);
+  await doc.save();
 
   try {
-    doc.bankId = bank._id;
-    doc.bankName = bankDisplayName(bank);
-    doc.status = "approved";
-    doc.approvedBy = new Types.ObjectId(actorId);
-    doc.approvedAt = new Date();
-    doc.bankBalanceAfter = bankBalanceAfter;
+    const referenceNo = `EXP-${String(doc._id).slice(-8).toUpperCase()}`;
+    const liabilityEntry = await createLiabilityEntry(
+      {
+        entryDate: doc.expenseDate.toISOString().slice(0, 10),
+        entryType: "journal",
+        amount: doc.amount,
+        fromAccountType: "person",
+        fromAccountId: String(person._id),
+        toAccountType: "expense",
+        toAccountId: String(doc._id),
+        sourceType: "expense",
+        sourceExpenseId: String(doc._id),
+        referenceNo,
+        remark: `Expense settlement for ${String(doc._id)}`,
+      },
+      actorId,
+      requestId,
+    );
+
+    doc.liabilityEntryId = liabilityEntry._id;
     doc.updatedBy = new Types.ObjectId(actorId);
     await doc.save();
   } catch (err) {
-    bank.currentBalance = prevBal;
-    await bank.save();
+    doc.status = "pending_audit";
+    doc.approvedBy = undefined;
+    doc.approvedAt = undefined;
+    doc.settlementAccountType = undefined;
+    doc.liabilityPersonId = undefined;
+    doc.liabilityPersonName = "";
+    doc.liabilityEntryId = undefined;
+    doc.updatedBy = new Types.ObjectId(actorId);
+    await doc.save();
     throw err;
   }
 
@@ -315,8 +388,9 @@ export async function approveExpense(
     entity: "expense",
     entityId: doc._id.toString(),
     newValue: {
-      bankId: input.bankId,
-      bankBalanceAfter,
+      settlementAccountType: "person",
+      liabilityPersonId: input.liabilityPersonId,
+      liabilityEntryId: doc.liabilityEntryId?.toString(),
       amount,
     },
     requestId,
@@ -362,8 +436,9 @@ export async function rejectExpense(
   return doc;
 }
 
-export async function listExpenses(query: ListExpenseQuery) {
-  const filter = buildListFilter(query);
+export async function listExpenses(query: ListExpenseQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildListFilter(query, timeZone);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -373,6 +448,8 @@ export async function listExpenses(query: ListExpenseQuery) {
     ExpenseModel.find(filter)
       .populate("expenseTypeId", "name code isActive")
       .populate("bankId", "holderName bankName accountNumber")
+      .populate("liabilityPersonId", "name")
+      .populate("liabilityEntryId", "entryType amount entryDate sourceType sourceExpenseId")
       .populate("createdBy", "fullName username")
       .populate("approvedBy", "fullName username")
       .sort({ [query.sortBy]: sortValue })
@@ -392,6 +469,68 @@ export async function listExpenses(query: ListExpenseQuery) {
   };
 }
 
+const EXPORT_MAX_ROWS = 10_000;
+
+function formatUserForExport(user: unknown): string {
+  if (user == null) return "";
+  if (typeof user === "object" && user !== null && "fullName" in user) {
+    const u = user as { fullName?: string; username?: string };
+    const fn = u.fullName?.trim();
+    const un = u.username?.trim();
+    if (fn && un) return `${fn} (${un})`;
+    if (fn) return fn;
+    if (un) return un;
+  }
+  return "";
+}
+
+export async function exportExpensesToBuffer(
+  query: ListExpenseQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildListFilter(query, timeZone);
+  const sortValue = query.sortOrder === "asc" ? 1 : -1;
+
+  const rows = await ExpenseModel.find(filter)
+    .populate("expenseTypeId", "name code")
+    .populate("bankId", "holderName bankName accountNumber")
+    .populate("liabilityPersonId", "name")
+    .populate("createdBy", "fullName username")
+    .populate("approvedBy", "fullName username")
+    .sort({ [query.sortBy]: sortValue })
+    .limit(EXPORT_MAX_ROWS)
+    .lean();
+
+  const exportData = rows.map((r) => {
+    const et = r.expenseTypeId as { name?: string; code?: string } | null;
+    const b = r.bankId as { holderName?: string; bankName?: string; accountNumber?: string } | null;
+    const p = r.liabilityPersonId as { name?: string } | null;
+
+    let settlement = "";
+    if (r.settlementAccountType === "bank" && b) {
+      settlement = `Bank: ${b.holderName} (${b.bankName})`;
+    } else if (r.settlementAccountType === "person" && p) {
+      settlement = `Person: ${p.name}`;
+    }
+
+    return {
+      "Expense Date": formatDateForTimeZone(r.expenseDate, timeZone),
+      Type: et?.name ?? "",
+      Amount: r.amount,
+      Description: r.description ?? "",
+      Status: r.status,
+      "Settlement Via": settlement,
+      "Reject Reason": r.rejectReason ?? "",
+      "Created By": formatUserForExport(r.createdBy),
+      "Approved By": formatUserForExport(r.approvedBy),
+      "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
+    };
+  });
+
+  return generateExcelBuffer(exportData, "Expenses");
+}
+
 export async function listActiveExpenseTypes() {
   const rows = await ExpenseTypeModel.find({
     isActive: true,
@@ -407,6 +546,8 @@ export async function getExpenseById(id: string) {
   const doc = await ExpenseModel.findById(id)
     .populate("expenseTypeId", "name code isActive")
     .populate("bankId", "holderName bankName accountNumber ifsc")
+    .populate("liabilityPersonId", "name")
+    .populate("liabilityEntryId", "entryType amount entryDate sourceType sourceExpenseId")
     .populate("createdBy", "fullName username")
     .populate("approvedBy", "fullName username")
     .lean();

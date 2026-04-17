@@ -10,6 +10,7 @@ import {
   approveExpenseController,
   createExpenseController,
   expenseDocumentViewUrlController,
+  exportExpenseController,
   getExpenseController,
   listExpenseController,
   listExpenseTypesController,
@@ -65,6 +66,13 @@ expenseRouter.get(
   expenseListPermissionMiddleware,
   validate({ query: listExpenseQuerySchema }),
   listExpenseController,
+);
+
+expenseRouter.get(
+  "/export",
+  expenseListPermissionMiddleware,
+  validate({ query: listExpenseQuerySchema }),
+  exportExpenseController,
 );
 
 expenseRouter.get("/expense-types", expenseTypesReadMiddleware, listExpenseTypesController);

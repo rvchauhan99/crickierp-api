@@ -1,15 +1,29 @@
 import { Types } from "mongoose";
 import type { z } from "zod";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
+import { DepositModel } from "../deposit/deposit.model";
+import { ExpenseModel } from "../expense/expense.model";
+import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
+import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
+import { AuditLogModel } from "../audit/audit.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
+import type { WithdrawalAmendmentSnapshot } from "./withdrawal.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
-import { listWithdrawalQuerySchema } from "./withdrawal.validation";
+import { amendWithdrawalBodySchema, listWithdrawalQuerySchema } from "./withdrawal.validation";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
+type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
 
 function pageSizeFromQuery(q: ListWithdrawalQuery): number {
   return q.limit ?? q.pageSize;
@@ -23,6 +37,15 @@ function trimUndef(s: string | undefined): string | undefined {
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseBusinessDateTime(value: string | undefined, fieldName: string): Date {
+  if (!value) return new Date();
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError("validation_error", `${fieldName} must be a valid datetime`, 400);
+  }
+  return parsed;
 }
 
 function textFieldCondition(field: string, value: string, op: string | undefined): Record<string, unknown> {
@@ -65,41 +88,31 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
-function createdAtCondition(
+function transactionDateCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
+  const txExpr = { $ifNull: ["$requestedAt", "$createdAt"] };
   const f = trimUndef(from);
   const t = trimUndef(to);
   const operator = op || "inRange";
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
-    return { createdAt: { $gte: start, $lte: end } };
+    return { $expr: { $and: [{ $gte: [txExpr, start] }, { $lte: [txExpr, end] }] } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
-    return { createdAt: { $gte: start } };
+    return { $expr: { $gte: [txExpr, start] } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
-    return { createdAt: { $lte: end } };
+    return { $expr: { $lte: [txExpr, end] } };
   }
   return null;
 }
@@ -125,7 +138,7 @@ function viewBaseCondition(view: ListWithdrawalQuery["view"]): Record<string, un
   }
 }
 
-function buildWithdrawalListFilter(q: ListWithdrawalQuery): Record<string, unknown> {
+function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [viewBaseCondition(q.view)];
 
   const search = trimUndef(q.search);
@@ -171,12 +184,32 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery): Record<string, unkno
   const amountCond = numberFieldCondition("amount", trimUndef(q.amount), trimUndef(q.amount_op), trimUndef(q.amount_to));
   if (amountCond) conditions.push(amountCond);
 
-  const dateCond = createdAtCondition(
+  const payableCond = numberFieldCondition(
+    "payableAmount",
+    trimUndef(q.payableAmount),
+    trimUndef(q.payableAmount_op),
+    trimUndef(q.payableAmount_to),
+  );
+  if (payableCond) conditions.push(payableCond);
+
+  const dateCond = transactionDateCondition(
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) conditions.push(dateCond);
+
+  const hasAmendment = trimUndef(q.hasAmendment);
+  if (hasAmendment === "yes") {
+    conditions.push({
+      $or: [{ amendmentCount: { $gt: 0 } }, { "amendmentHistory.0": { $exists: true } }],
+    });
+  } else if (hasAmendment === "no") {
+    conditions.push({
+      $nor: [{ amendmentCount: { $gt: 0 } }, { "amendmentHistory.0": { $exists: true } }],
+    });
+  }
 
   if (conditions.length === 0) {
     return {};
@@ -192,6 +225,74 @@ function payableFromAmounts(amount: number, reverseBonus: number): number {
   return Math.max(0, Math.round(raw * 100) / 100);
 }
 
+async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<Map<string, number>> {
+  if (bankIds.length === 0) return new Map();
+  const [banks, deposits, withdrawals, expenses, liabilities] = await Promise.all([
+    BankModel.find({ _id: { $in: bankIds } })
+      .select({ _id: 1, openingBalance: 1 })
+      .lean(),
+    DepositModel.find({ bankId: { $in: bankIds }, status: "verified" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    WithdrawalModel.find({ payoutBankId: { $in: bankIds }, status: "approved" })
+      .select({ payoutBankId: 1, amount: 1, payableAmount: 1 })
+      .lean(),
+    ExpenseModel.find({ bankId: { $in: bankIds }, status: "approved" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    LiabilityEntryModel.find({
+      $or: [
+        { fromAccountType: "bank", fromAccountId: { $in: bankIds } },
+        { toAccountType: "bank", toAccountId: { $in: bankIds } },
+      ],
+    })
+      .select({ fromAccountType: 1, fromAccountId: 1, toAccountType: 1, toAccountId: 1, amount: 1 })
+      .lean(),
+  ]);
+
+  const totals = new Map<string, number>();
+  for (const b of banks) totals.set(String(b._id), Number(b.openingBalance ?? 0));
+  for (const d of deposits) {
+    const id = String(d.bankId);
+    totals.set(id, (totals.get(id) ?? 0) + Number(d.amount ?? 0));
+  }
+  for (const w of withdrawals) {
+    const id = String(w.payoutBankId);
+    totals.set(id, (totals.get(id) ?? 0) - Number(w.payableAmount ?? w.amount ?? 0));
+  }
+  for (const e of expenses) {
+    const id = String(e.bankId);
+    totals.set(id, (totals.get(id) ?? 0) - Number(e.amount ?? 0));
+  }
+  for (const le of liabilities) {
+    const amt = Number(le.amount ?? 0);
+    if (le.fromAccountType === "bank" && le.fromAccountId) {
+      const id = String(le.fromAccountId);
+      totals.set(id, (totals.get(id) ?? 0) - amt);
+    }
+    if (le.toAccountType === "bank" && le.toAccountId) {
+      const id = String(le.toAccountId);
+      totals.set(id, (totals.get(id) ?? 0) + amt);
+    }
+  }
+  return totals;
+}
+
+async function normalizeBankCurrentBalances(bankIds: string[]) {
+  const unique = [...new Set(bankIds.filter((id) => Types.ObjectId.isValid(id)))];
+  if (unique.length === 0) return;
+  const objectIds = unique.map((id) => new Types.ObjectId(id));
+  const totals = await computeClosingBalanceActualByBankIds(objectIds);
+  await Promise.all(
+    unique.map((id) =>
+      BankModel.updateOne(
+        { _id: new Types.ObjectId(id) },
+        { $set: { currentBalance: Number(totals.get(id) ?? 0) } },
+      ),
+    ),
+  );
+}
+
 export async function createWithdrawal(
   input: {
     playerId: string;
@@ -201,6 +302,7 @@ export async function createWithdrawal(
     ifsc: string;
     amount: number;
     reverseBonus: number;
+    requestedAt?: string;
   },
   actorId: string,
   requestId?: string,
@@ -222,6 +324,7 @@ export async function createWithdrawal(
     amount: input.amount,
     reverseBonus,
     payableAmount,
+    requestedAt: parseBusinessDateTime(input.requestedAt, "requestedAt"),
     status: "requested",
     createdBy: new Types.ObjectId(actorId),
   });
@@ -236,9 +339,85 @@ export async function createWithdrawal(
       accountNumber: input.accountNumber,
       amount: input.amount,
       payableAmount,
+      requestedAt: doc.requestedAt,
     } as unknown as Record<string, unknown>,
     requestId,
   });
+
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      await recomputeExchangeCurrentBalance(String(player.exchange));
+    }
+  }
+
+  return doc;
+}
+
+export async function updateWithdrawalByExchange(
+  id: string,
+  input: {
+    accountNumber: string;
+    accountHolderName: string;
+    bankName: string;
+    ifsc: string;
+    amount: number;
+    reverseBonus: number;
+  },
+  actorId: string,
+  requestId?: string,
+) {
+  const doc = await WithdrawalModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
+  if (doc.status !== "requested") {
+    throw new AppError("business_rule_error", "Only requested withdrawals can be updated", 400);
+  }
+
+  const nextReverseBonus = input.reverseBonus ?? 0;
+  const payableAmount = payableFromAmounts(input.amount, nextReverseBonus);
+  const prev = {
+    accountNumber: doc.accountNumber,
+    accountHolderName: doc.accountHolderName,
+    bankName: doc.bankName,
+    ifsc: doc.ifsc,
+    amount: doc.amount,
+    reverseBonus: doc.reverseBonus,
+    payableAmount: doc.payableAmount,
+  };
+
+  doc.accountNumber = input.accountNumber.trim();
+  doc.accountHolderName = input.accountHolderName.trim();
+  doc.bankName = input.bankName.trim();
+  doc.ifsc = input.ifsc.trim();
+  doc.amount = input.amount;
+  doc.reverseBonus = nextReverseBonus;
+  doc.payableAmount = payableAmount;
+  await doc.save();
+
+  await createAuditLog({
+    actorId,
+    action: "withdrawal.exchange_update",
+    entity: "withdrawal",
+    entityId: doc._id.toString(),
+    oldValue: prev as unknown as Record<string, unknown>,
+    newValue: {
+      accountNumber: doc.accountNumber,
+      accountHolderName: doc.accountHolderName,
+      bankName: doc.bankName,
+      ifsc: doc.ifsc,
+      amount: doc.amount,
+      reverseBonus: doc.reverseBonus,
+      payableAmount: doc.payableAmount,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      await recomputeExchangeCurrentBalance(String(player.exchange));
+    }
+  }
 
   return doc;
 }
@@ -293,33 +472,106 @@ export async function updateWithdrawalByBanker(
   return doc;
 }
 
-export async function listWithdrawals(query: ListWithdrawalQuery) {
-  const filter = buildWithdrawalListFilter(query);
+export type LastBankerPayoutMeta = { bankId: string; bankName: string } | null;
+
+/** Latest company payout bank from this actor’s last banker payout (audit), not `withdrawal.createdBy`. */
+async function lastBankerPayoutBankForActor(
+  view: ListWithdrawalQuery["view"],
+  actorId: string | undefined,
+): Promise<LastBankerPayoutMeta> {
+  if (view !== "banker" || !actorId || !Types.ObjectId.isValid(actorId)) return null;
+
+  const log = await AuditLogModel.findOne({
+    actorId: new Types.ObjectId(actorId),
+    action: "withdrawal.banker_payout",
+  })
+    .sort({ createdAt: -1 })
+    .select({ entityId: 1, newValue: 1 })
+    .lean();
+
+  if (!log?.entityId) return null;
+
+  const withdrawal = await WithdrawalModel.findById(String(log.entityId).trim())
+    .select({ payoutBankId: 1, payoutBankName: 1 })
+    .lean();
+
+  if (withdrawal?.payoutBankId) {
+    const raw = withdrawal.payoutBankId as unknown;
+    const bankId =
+      raw != null && typeof raw === "object" && "_id" in (raw as object)
+        ? String((raw as { _id?: unknown })._id)
+        : String(raw);
+    const bankName = typeof withdrawal.payoutBankName === "string" ? withdrawal.payoutBankName.trim() : "";
+    if (bankId) return { bankId, bankName: bankName || "—" };
+  }
+
+  const nv = log.newValue;
+  if (nv && typeof nv === "object" && nv !== null && "bankId" in nv) {
+    const bankId = String((nv as { bankId?: unknown }).bankId ?? "").trim();
+    if (bankId && Types.ObjectId.isValid(bankId)) {
+      const bank = await BankModel.findById(bankId)
+        .select({ holderName: 1, bankName: 1, accountNumber: 1 })
+        .lean();
+      if (bank && bank.holderName != null && bank.bankName != null) {
+        const acct = String(bank.accountNumber ?? "");
+        return {
+          bankId,
+          bankName: bankDisplayName({
+            holderName: bank.holderName,
+            bankName: bank.bankName,
+            accountNumber: acct,
+          }),
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+export async function listWithdrawals(
+  query: ListWithdrawalQuery,
+  options?: { actorId?: string; timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildWithdrawalListFilter(query, timeZone);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
   const sortField = query.sortBy;
 
-  const [rows, total] = await Promise.all([
+  const [rows, total, lastBankerPayout] = await Promise.all([
     WithdrawalModel.find(filter)
       .populate("player", "playerId phone")
       .populate("payoutBankId", "holderName bankName accountNumber")
       .populate("createdBy", "fullName username")
+      .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
       .skip(skip)
       .limit(pageSize)
       .lean(),
     WithdrawalModel.countDocuments(filter),
+    lastBankerPayoutBankForActor(query.view, options?.actorId),
   ]);
+
+  const meta: {
+    total: number;
+    page: number;
+    pageSize: number;
+    lastBankerPayout?: LastBankerPayoutMeta;
+  } = {
+    total,
+    page,
+    pageSize,
+  };
+  if (query.view === "banker") {
+    meta.lastBankerPayout = lastBankerPayout;
+  }
 
   return {
     rows,
-    meta: {
-      total,
-      page,
-      pageSize,
-    },
+    meta,
   };
 }
 
@@ -368,6 +620,15 @@ export async function updateWithdrawalStatus(
     newValue,
     requestId,
   });
+
+  if (status === "finalized" || status === "rejected") {
+    if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+      const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+      if (player?.exchange) {
+        await recomputeExchangeCurrentBalance(String(player.exchange));
+      }
+    }
+  }
   return doc;
 }
 
@@ -408,4 +669,260 @@ export async function listSavedAccountsForPlayer(playerId: string) {
   }
 
   return out;
+}
+
+const EXPORT_MAX_ROWS = 10_000;
+
+export async function exportWithdrawalsToBuffer(
+  query: ListWithdrawalQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildWithdrawalListFilter(query, timeZone);
+  const sortValue = query.sortOrder === "asc" ? 1 : -1;
+
+  const rows = await WithdrawalModel.find(filter)
+    .populate("player", "playerId phone")
+    .populate("payoutBankId", "holderName bankName accountNumber")
+    .populate("createdBy", "fullName username")
+    .sort({ [query.sortBy]: sortValue })
+    .limit(EXPORT_MAX_ROWS)
+    .lean();
+
+  return generateExcelBuffer(rows, [
+    { header: "Player ID", transform: (r) => (r.player as any)?.playerId ?? "" },
+    { header: "Player Phone", transform: (r) => (r.player as any)?.phone ?? "" },
+    { header: "Account Number", key: "accountNumber" },
+    { header: "Account Holder", key: "accountHolderName" },
+    { header: "Bank", key: "bankName" },
+    { header: "IFSC", key: "ifsc" },
+    { header: "Amount", key: "amount" },
+    { header: "Reverse Bonus", key: "reverseBonus" },
+    { header: "Payable Amount", key: "payableAmount" },
+    { header: "Status", key: "status" },
+    { header: "UTR", key: "utr" },
+    { header: "Payout Bank", key: "payoutBankName" },
+    { header: "Amendment Count", key: "amendmentCount" },
+    {
+      header: "Last Amended At",
+      transform: (r) => formatDateTimeForTimeZone(r.lastAmendedAt, timeZone),
+    },
+    { header: "Created By", transform: (r) => (r.createdBy as any)?.fullName ?? "" },
+    {
+      header: "Transaction At",
+      transform: (r) => formatDateTimeForTimeZone(r.requestedAt ?? r.createdAt, timeZone),
+    },
+  ], "Withdrawals");
+}
+
+export async function deleteWithdrawalWithReversal(id: string, actorId: string, requestId?: string) {
+  const doc = await WithdrawalModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
+
+  const oldValue = {
+    playerId: doc.player?.toString(),
+    playerName: doc.playerName,
+    amount: doc.amount,
+    reverseBonus: doc.reverseBonus,
+    payableAmount: doc.payableAmount,
+    payoutBankId: doc.payoutBankId?.toString(),
+    payoutBankName: doc.payoutBankName,
+    utr: doc.utr,
+    status: doc.status,
+    requestedAt: doc.requestedAt,
+    amendmentCount: doc.amendmentCount,
+    amendmentHistory: doc.amendmentHistory ?? [],
+    createdAt: doc.createdAt,
+  };
+
+  const impactedBankIds = new Set<string>();
+  if (doc.payoutBankId && Types.ObjectId.isValid(String(doc.payoutBankId))) {
+    impactedBankIds.add(String(doc.payoutBankId));
+  }
+  for (const entry of doc.amendmentHistory ?? []) {
+    const oldBankId = entry.old?.payoutBankId;
+    const newBankId = entry.new?.payoutBankId;
+    if (oldBankId && Types.ObjectId.isValid(oldBankId)) impactedBankIds.add(oldBankId);
+    if (newBankId && Types.ObjectId.isValid(newBankId)) impactedBankIds.add(newBankId);
+  }
+  const shouldNormalizeBanks =
+    doc.status === "approved" ||
+    doc.status === "finalized" ||
+    (doc.amendmentCount ?? 0) > 0 ||
+    (doc.amendmentHistory?.length ?? 0) > 0;
+
+  await WithdrawalModel.deleteOne({ _id: doc._id });
+
+  let recomputedExchangeId: string | undefined;
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      recomputedExchangeId = String(player.exchange);
+      await recomputeExchangeCurrentBalance(recomputedExchangeId);
+    }
+  }
+
+  if (shouldNormalizeBanks && impactedBankIds.size > 0) {
+    await normalizeBankCurrentBalances([...impactedBankIds]);
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "withdrawal.delete",
+    entity: "withdrawal",
+    entityId: String(doc._id),
+    oldValue: oldValue as unknown as Record<string, unknown>,
+    newValue: {
+      deleted: true,
+      reversal: {
+        status: doc.status,
+        normalizedBankIds: [...impactedBankIds],
+        recomputedExchangeId,
+      },
+    },
+    requestId,
+  });
+
+  return { id: String(doc._id), deleted: true };
+}
+
+export async function amendWithdrawal(
+  id: string,
+  input: AmendWithdrawalInput,
+  actorId: string,
+  requestId?: string,
+) {
+  const doc = await WithdrawalModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
+  if (doc.status !== "approved") {
+    throw new AppError("business_rule_error", "Only approved withdrawals can be amended", 400);
+  }
+  if (!doc.payoutBankId) {
+    throw new AppError("business_rule_error", "Withdrawal has no payout bank linked", 400);
+  }
+
+  const newBank = await BankModel.findById(input.payoutBankId);
+  if (!newBank) throw new AppError("not_found", "Bank not found", 404);
+  if (newBank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+  const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
+  const newPayable = payableFromAmounts(input.amount, input.reverseBonus);
+  const nextRequestedAt = input.requestedAt
+    ? parseBusinessDateTime(input.requestedAt, "requestedAt")
+    : doc.requestedAt;
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.WITHDRAWAL_FINAL_AMEND);
+  const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
+  const oldBankId = String(doc.payoutBankId);
+  const newBankId = input.payoutBankId;
+
+  const oldSnapshot: WithdrawalAmendmentSnapshot = {
+    amount: doc.amount,
+    reverseBonus: doc.reverseBonus,
+    payableAmount: doc.payableAmount,
+    payoutBankId: oldBankId,
+    payoutBankName: doc.payoutBankName,
+    utr: doc.utr,
+  };
+  const oldRequestedAt = doc.requestedAt;
+  const newSnapshot: WithdrawalAmendmentSnapshot = {
+    amount: input.amount,
+    reverseBonus: input.reverseBonus,
+    payableAmount: newPayable,
+    payoutBankId: newBankId,
+    payoutBankName: bankDisplayName(newBank),
+    utr: input.utr.trim(),
+  };
+
+  let rollbackBankChanges: (() => Promise<void>) | null = null;
+  if (oldBankId === newBankId) {
+    const bank = await BankModel.findById(oldBankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    const prevBal = bank.currentBalance ?? bank.openingBalance;
+    const delta = newPayable - oldPayable;
+    bank.currentBalance = prevBal - delta;
+    await bank.save();
+    rollbackBankChanges = async () => {
+      bank.currentBalance = prevBal;
+      await bank.save();
+    };
+  } else {
+    const oldBank = await BankModel.findById(oldBankId);
+    if (!oldBank) throw new AppError("not_found", "Bank not found", 404);
+    const oldPrev = oldBank.currentBalance ?? oldBank.openingBalance;
+    oldBank.currentBalance = oldPrev + oldPayable;
+    await oldBank.save();
+
+    const newBankDoc = await BankModel.findById(newBankId);
+    if (!newBankDoc) {
+      oldBank.currentBalance = oldPrev;
+      await oldBank.save();
+      throw new AppError("not_found", "Bank not found", 404);
+    }
+    const newPrev = newBankDoc.currentBalance ?? newBankDoc.openingBalance;
+    newBankDoc.currentBalance = newPrev - newPayable;
+    try {
+      await newBankDoc.save();
+    } catch (err) {
+      oldBank.currentBalance = oldPrev;
+      await oldBank.save();
+      throw err;
+    }
+    rollbackBankChanges = async () => {
+      oldBank.currentBalance = oldPrev;
+      await oldBank.save();
+      newBankDoc.currentBalance = newPrev;
+      await newBankDoc.save();
+    };
+  }
+
+  try {
+    doc.amount = input.amount;
+    doc.reverseBonus = input.reverseBonus;
+    doc.payableAmount = newPayable;
+    doc.payoutBankId = new Types.ObjectId(newBankId);
+    doc.payoutBankName = newSnapshot.payoutBankName ?? doc.payoutBankName;
+    doc.utr = input.utr.trim();
+    doc.requestedAt = nextRequestedAt;
+    doc.amendmentCount = (doc.amendmentCount ?? 0) + 1;
+    doc.lastAmendedAt = new Date();
+    doc.lastAmendedBy = new Types.ObjectId(actorId);
+    const history = doc.amendmentHistory ?? [];
+    history.push({
+      at: new Date(),
+      by: new Types.ObjectId(actorId),
+      reason: amendReasonText,
+      old: oldSnapshot,
+      new: newSnapshot,
+    });
+    doc.amendmentHistory = history;
+    await doc.save();
+  } catch (err) {
+    if (rollbackBankChanges) await rollbackBankChanges();
+    throw err;
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "withdrawal.amend",
+    entity: "withdrawal",
+    entityId: doc._id.toString(),
+    oldValue: { ...oldSnapshot, requestedAt: oldRequestedAt } as unknown as Record<string, unknown>,
+    newValue: {
+      ...newSnapshot,
+      requestedAt: nextRequestedAt,
+      reason: amendReasonText,
+      reasonId: resolved.id,
+      remark: input.remark?.trim() || undefined,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      await recomputeExchangeCurrentBalance(String(player.exchange));
+    }
+  }
+
+  return doc;
 }

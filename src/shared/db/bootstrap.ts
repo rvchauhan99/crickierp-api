@@ -122,6 +122,48 @@ export async function bootstrapData() {
       reasonType: REASON_TYPES.EXPENSE_AUDIT_REJECT,
       reason: "Other (add details in remark)",
     },
+    // deposit_final_amend
+    {
+      reasonType: REASON_TYPES.DEPOSIT_FINAL_AMEND,
+      reason: "Amount correction after reconciliation",
+    },
+    {
+      reasonType: REASON_TYPES.DEPOSIT_FINAL_AMEND,
+      reason: "Bonus correction per policy",
+    },
+    {
+      reasonType: REASON_TYPES.DEPOSIT_FINAL_AMEND,
+      reason: "Player mapping correction",
+    },
+    {
+      reasonType: REASON_TYPES.DEPOSIT_FINAL_AMEND,
+      reason: "Bank / UTR correction",
+    },
+    {
+      reasonType: REASON_TYPES.DEPOSIT_FINAL_AMEND,
+      reason: "Other (add details in remark)",
+    },
+    // withdrawal_final_amend
+    {
+      reasonType: REASON_TYPES.WITHDRAWAL_FINAL_AMEND,
+      reason: "Amount correction after reconciliation",
+    },
+    {
+      reasonType: REASON_TYPES.WITHDRAWAL_FINAL_AMEND,
+      reason: "Reverse bonus correction",
+    },
+    {
+      reasonType: REASON_TYPES.WITHDRAWAL_FINAL_AMEND,
+      reason: "Payout bank correction",
+    },
+    {
+      reasonType: REASON_TYPES.WITHDRAWAL_FINAL_AMEND,
+      reason: "UTR correction",
+    },
+    {
+      reasonType: REASON_TYPES.WITHDRAWAL_FINAL_AMEND,
+      reason: "Other (add details in remark)",
+    },
   ];
 
   for (const row of seedRows) {

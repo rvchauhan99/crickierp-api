@@ -1,9 +1,16 @@
 import mongoose, { Types } from "mongoose";
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import xlsx from "xlsx";
 import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { ExchangeModel } from "../exchange/exchange.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { PlayerModel } from "./player.model";
 import { listPlayerQuerySchema } from "./player.validation";
 
@@ -79,69 +86,58 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function createdAtCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const operator = op || "inRange";
   const f = trimUndef(from);
   const t = trimUndef(to);
 
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $lt: start } };
   }
   if (operator === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { createdAt: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { createdAt: { $lte: end } };
   }
   return null;
 }
 
-async function buildPlayerListFilter(q: ListPlayerQuery): Promise<Record<string, unknown>> {
+async function buildPlayerListFilter(q: ListPlayerQuery, timeZone: string): Promise<Record<string, unknown>> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -186,6 +182,7 @@ async function buildPlayerListFilter(q: ListPlayerQuery): Promise<Record<string,
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) {
     conditions.push(dateCond);
@@ -365,7 +362,8 @@ export async function updatePlayer(
   return doc;
 }
 
-export async function listPlayers(query: ListPlayerQuery) {
+export async function listPlayers(query: ListPlayerQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const page = query.page ?? 1;
   const pageSize = query.pageSize ?? query.limit ?? 20;
   const skip = (page - 1) * pageSize;
@@ -373,7 +371,7 @@ export async function listPlayers(query: ListPlayerQuery) {
   const sortBy = requestedSortBy === "bonusPercentage" ? "regularBonusPercentage" : requestedSortBy;
   const sortOrder = query.sortOrder === "asc" ? 1 : -1;
 
-  const filter = await buildPlayerListFilter(query);
+  const filter = await buildPlayerListFilter(query, timeZone);
 
   const [rows, total] = await Promise.all([
     PlayerModel.find(filter)
@@ -405,8 +403,12 @@ export async function listPlayers(query: ListPlayerQuery) {
   };
 }
 
-export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buffer> {
-  const filter = await buildPlayerListFilter(query);
+export async function exportPlayersToBuffer(
+  query: ListPlayerQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = await buildPlayerListFilter(query, timeZone);
   const requestedSortBy = query.sortBy ?? "createdAt";
   const sortBy = requestedSortBy === "bonusPercentage" ? "regularBonusPercentage" : requestedSortBy;
   const sortOrder = query.sortOrder === "asc" ? 1 : -1;
@@ -441,14 +443,11 @@ export async function exportPlayersToBuffer(query: ListPlayerQuery): Promise<Buf
       "Regular Bonus %": r.regularBonusPercentage ?? 0,
       "First Deposit Bonus %": r.firstDepositBonusPercentage ?? 0,
       "Created By": formatCreatedBy(r.createdBy),
-      "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+      "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
     };
   });
 
-  const worksheet = xlsx.utils.json_to_sheet(exportData);
-  const workbook = xlsx.utils.book_new();
-  xlsx.utils.book_append_sheet(workbook, worksheet, "Players");
-  return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  return generateExcelBuffer(exportData, "Players");
 }
 
 export function getSampleCsvBuffer(): Buffer {
@@ -483,12 +482,66 @@ function pickCellRaw(row: Record<string, unknown>, ...aliases: string[]): string
   return "";
 }
 
-export type ImportRowError = { row: number; message: string };
+export type ImportErrorRowData = {
+  exchange_name: string;
+  player_id: string;
+  phone: string;
+  bonus_percentage: string;
+  first_deposit_bonus_percentage: string;
+};
+
+export type ImportRowError = {
+  row: number;
+  message: string;
+  reason: string;
+  rowData: ImportErrorRowData;
+};
+
+function buildImportError(
+  rowNum: number,
+  reason: string,
+  rowData: ImportErrorRowData,
+): ImportRowError {
+  return { row: rowNum, message: reason, reason, rowData };
+}
+
+function quoteCsvValue(value: string): string {
+  const escaped = value.replace(/"/g, "\"\"");
+  return `"${escaped}"`;
+}
+
+export function buildPlayerImportErrorCsvBuffer(errors: ImportRowError[]): Buffer {
+  const header = [
+    "row",
+    "exchange_name",
+    "player_id",
+    "phone",
+    "bonus_percentage",
+    "first_deposit_bonus_percentage",
+    "error_reason",
+  ];
+  const lines = [header.join(",")];
+  for (const error of errors) {
+    lines.push(
+      [
+        String(error.row),
+        quoteCsvValue(error.rowData.exchange_name),
+        quoteCsvValue(error.rowData.player_id),
+        quoteCsvValue(error.rowData.phone),
+        quoteCsvValue(error.rowData.bonus_percentage),
+        quoteCsvValue(error.rowData.first_deposit_bonus_percentage),
+        quoteCsvValue(error.reason),
+      ].join(","),
+    );
+  }
+  return Buffer.from(lines.join("\n"), "utf-8");
+}
 
 function parsePercentageCell(
   raw: string,
   rowNum: number,
   fieldName: string,
+  rowData: ImportErrorRowData,
 ): { ok: true; value: number } | { ok: false; error: ImportRowError } {
   const t = raw.trim();
   if (t === "") {
@@ -498,13 +551,13 @@ function parsePercentageCell(
   if (!Number.isFinite(n)) {
     return {
       ok: false,
-      error: { row: rowNum, message: `${fieldName} must be a valid number` },
+      error: buildImportError(rowNum, `${fieldName} must be a valid number`, rowData),
     };
   }
   if (n < 0 || n > 100) {
     return {
       ok: false,
-      error: { row: rowNum, message: `${fieldName} must be between 0 and 100` },
+      error: buildImportError(rowNum, `${fieldName} must be between 0 and 100`, rowData),
     };
   }
   return { ok: true, value: n };
@@ -516,6 +569,7 @@ function sheetRowsToObjects(sheet: xlsx.WorkSheet): Record<string, unknown>[] {
 
 type ParsedImportRow = {
   rowNum: number;
+  exchangeName: string;
   exchangeId: Types.ObjectId;
   playerId: string;
   phone: string;
@@ -523,8 +577,333 @@ type ParsedImportRow = {
   firstDepositBonusPercentage: number;
 };
 
+export type PlayerImportProgress = {
+  totalRows: number;
+  processedRows: number;
+  successRows: number;
+  failedRows: number;
+  skippedRows: number;
+};
+
+type ParsedImportPayload = {
+  parsedRows: ParsedImportRow[];
+  skipped: number;
+  totalRows: number;
+  errorSample: ImportRowError[];
+};
+
 function throwImportValidation(message: string, errors: ImportRowError[]): never {
   throw new AppError("validation_error", message, 400, { errors });
+}
+
+function readRowsFromBuffer(buffer: Buffer, originalName: string): Record<string, unknown>[] {
+  const lower = originalName.toLowerCase();
+  const wb = xlsx.read(buffer, { type: "buffer", raw: false });
+  const sheetName = wb.SheetNames[0];
+  if (!sheetName) {
+    if (lower.endsWith(".csv")) {
+      throw new AppError("validation_error", "CSV file is empty", 400);
+    }
+    throw new AppError("validation_error", "Spreadsheet has no sheets", 400);
+  }
+  if (!lower.endsWith(".csv") && !lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
+    throw new AppError("validation_error", "Unsupported file type. Use .csv, .xlsx, or .xls", 400);
+  }
+  return sheetRowsToObjects(wb.Sheets[sheetName]);
+}
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  if (size <= 0) return [arr];
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function resolveExchangeMapByName(names: string[]): Promise<Map<string, Types.ObjectId>> {
+  if (names.length === 0) return new Map();
+  const uniqueByLower = new Map<string, string>();
+  for (const rawName of names) {
+    const normalized = rawName.trim().toLowerCase();
+    if (!normalized || uniqueByLower.has(normalized)) continue;
+    uniqueByLower.set(normalized, rawName.trim());
+  }
+  const uniqueNames = Array.from(uniqueByLower.values());
+  const conditions = uniqueNames.map((name) => ({ name: { $regex: new RegExp(`^${escapeRegex(name)}$`, "i") } }));
+  const exchanges = await ExchangeModel.find({ $or: conditions }).select("_id name").lean();
+
+  const bucket = new Map<string, Types.ObjectId[]>();
+  for (const ex of exchanges) {
+    const key = String(ex.name).trim().toLowerCase();
+    const list = bucket.get(key) ?? [];
+    list.push(ex._id as Types.ObjectId);
+    bucket.set(key, list);
+  }
+
+  const resolved = new Map<string, Types.ObjectId>();
+  for (const [k, list] of bucket.entries()) {
+    if (list.length === 1) resolved.set(k, list[0]);
+  }
+  return resolved;
+}
+
+export async function parsePlayerImportFile(
+  buffer: Buffer,
+  originalName: string,
+): Promise<ParsedImportPayload> {
+  const rows = readRowsFromBuffer(buffer, originalName);
+  const errors: ImportRowError[] = [];
+  let skipped = 0;
+  const parsedRows: ParsedImportRow[] = [];
+  const exchangeNames: string[] = [];
+  const rowInputCache: Array<{
+    rowNum: number;
+    exchangeName: string;
+    playerId: string;
+    phone: string;
+    regularBonusRaw: string;
+    firstDepositBonusRaw: string;
+    rowData: ImportErrorRowData;
+  }> = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const rowNum = i + 2;
+    const exchangeName = pickCell(row, "exchange_name", "exchange", "exchange name");
+    const playerId = pickCell(row, "player_id", "playerid", "player id");
+    const phone = pickCell(row, "phone", "phone_number", "phone number", "mobile");
+    const regularBonusRaw = pickCellRaw(
+      row,
+      "bonus_percentage",
+      "bonus_percent",
+      "bonus",
+      "bonus percentage",
+      "bonus%",
+    );
+    const firstDepositBonusRaw = pickCellRaw(
+      row,
+      "first_deposit_bonus_percentage",
+      "first_deposit_bonus_percent",
+      "first deposit bonus percentage",
+      "first deposit bonus%",
+      "firstdepositbonuspercentage",
+    );
+    const rowData: ImportErrorRowData = {
+      exchange_name: exchangeName,
+      player_id: playerId,
+      phone,
+      bonus_percentage: regularBonusRaw,
+      first_deposit_bonus_percentage: firstDepositBonusRaw,
+    };
+
+    if (!exchangeName && !playerId && !phone) {
+      skipped += 1;
+      continue;
+    }
+
+    if (!exchangeName) {
+      errors.push(buildImportError(rowNum, "exchange_name is required", rowData));
+      continue;
+    }
+    if (!playerId) {
+      errors.push(buildImportError(rowNum, "player_id is required", rowData));
+      continue;
+    }
+    if (!phone) {
+      errors.push(buildImportError(rowNum, "phone is required", rowData));
+      continue;
+    }
+
+    exchangeNames.push(exchangeName);
+    rowInputCache.push({
+      rowNum,
+      exchangeName,
+      playerId,
+      phone,
+      regularBonusRaw,
+      firstDepositBonusRaw,
+      rowData,
+    });
+  }
+
+  const exchangeMap = await resolveExchangeMapByName(exchangeNames);
+  for (const row of rowInputCache) {
+    const exchangeKey = row.exchangeName.trim().toLowerCase();
+    const exchangeId = exchangeMap.get(exchangeKey);
+    if (!exchangeId) {
+      const resolved = await resolveExchangeIdByName(row.exchangeName);
+      if (resolved.notFound) {
+        errors.push(buildImportError(row.rowNum, `No exchange found for name "${row.exchangeName}"`, row.rowData));
+      } else if (resolved.ambiguous) {
+        errors.push(
+          buildImportError(
+            row.rowNum,
+            `Multiple exchanges match "${row.exchangeName}"; names must be unique for import`,
+            row.rowData,
+          ),
+        );
+      }
+      continue;
+    }
+
+    const regularBonusParsed = parsePercentageCell(
+      row.regularBonusRaw,
+      row.rowNum,
+      "bonus_percentage",
+      row.rowData,
+    );
+    if (!regularBonusParsed.ok) {
+      errors.push(regularBonusParsed.error);
+      continue;
+    }
+    const firstDepositBonusParsed = parsePercentageCell(
+      row.firstDepositBonusRaw,
+      row.rowNum,
+      "first_deposit_bonus_percentage",
+      row.rowData,
+    );
+    if (!firstDepositBonusParsed.ok) {
+      errors.push(firstDepositBonusParsed.error);
+      continue;
+    }
+
+    parsedRows.push({
+      rowNum: row.rowNum,
+      exchangeName: row.exchangeName,
+      exchangeId,
+      playerId: row.playerId,
+      phone: row.phone,
+      regularBonusPercentage: regularBonusParsed.value,
+      firstDepositBonusPercentage: firstDepositBonusParsed.value,
+    });
+  }
+
+  const seenFirstRow = new Map<string, number>();
+  for (const p of parsedRows) {
+    const key = `${p.exchangeId.toString()}:${p.playerId}`;
+    const first = seenFirstRow.get(key);
+    if (first !== undefined) {
+      errors.push({
+        row: p.rowNum,
+        message: `Duplicate player_id "${p.playerId}" for this exchange (same as row ${first})`,
+        reason: `Duplicate player_id "${p.playerId}" for this exchange (same as row ${first})`,
+        rowData: {
+          exchange_name: p.exchangeName,
+          player_id: p.playerId,
+          phone: p.phone,
+          bonus_percentage: String(p.regularBonusPercentage),
+          first_deposit_bonus_percentage: String(p.firstDepositBonusPercentage),
+        },
+      });
+    } else {
+      seenFirstRow.set(key, p.rowNum);
+    }
+  }
+
+  if (errors.length > 0) {
+    throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", errors);
+  }
+  if (parsedRows.length === 0) {
+    throw new AppError(
+      "validation_error",
+      "No data rows to import. Add at least one row with exchange_name, player_id, and phone.",
+      400,
+    );
+  }
+
+  return { parsedRows, skipped, totalRows: rows.length, errorSample: [] };
+}
+
+export async function applyPlayerImportRows(
+  parsedRows: ParsedImportRow[],
+  actorId: string,
+  options?: {
+    chunkSize?: number;
+    skippedRows?: number;
+    onProgress?: (progress: PlayerImportProgress) => Promise<void> | void;
+  },
+): Promise<{
+  created: number;
+  updated: number;
+  skipped: number;
+}> {
+  const actorOid = new Types.ObjectId(actorId);
+  const chunkSize = options?.chunkSize ?? 750;
+  let created = 0;
+  let updated = 0;
+  let processedRows = 0;
+  const totalRows = parsedRows.length + (options?.skippedRows ?? 0);
+  const skipped = options?.skippedRows ?? 0;
+  const chunks = chunkArray(parsedRows, chunkSize);
+
+  for (const chunk of chunks) {
+    const orConditions = chunk.map((p) => ({
+      exchange: p.exchangeId,
+      playerId: p.playerId,
+    }));
+    const existing = await PlayerModel.find({ $or: orConditions }).select("_id exchange playerId").lean();
+    const existingByKey = new Map<string, Types.ObjectId>();
+    for (const doc of existing) {
+      const exId = (doc.exchange as Types.ObjectId).toString();
+      existingByKey.set(`${exId}:${doc.playerId}`, doc._id as Types.ObjectId);
+    }
+
+    const docsToCreate = chunk
+      .filter((p) => !existingByKey.has(`${p.exchangeId.toString()}:${p.playerId}`))
+      .map((p) => ({
+        exchange: p.exchangeId,
+        playerId: p.playerId,
+        phone: p.phone,
+        regularBonusPercentage: p.regularBonusPercentage,
+        firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+        createdBy: actorOid,
+        updatedBy: actorOid,
+      }));
+
+    const updateOps = chunk
+      .map((p) => {
+        const key = `${p.exchangeId.toString()}:${p.playerId}`;
+        const existingId = existingByKey.get(key);
+        if (!existingId) return null;
+        return {
+          updateOne: {
+            filter: { _id: existingId },
+            update: {
+              $set: {
+                phone: p.phone,
+                regularBonusPercentage: p.regularBonusPercentage,
+                firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+                updatedBy: actorOid,
+              },
+            },
+          },
+        };
+      })
+      .filter((op): op is NonNullable<typeof op> => op !== null);
+
+    if (docsToCreate.length > 0) {
+      await PlayerModel.insertMany(docsToCreate, { ordered: false });
+      created += docsToCreate.length;
+    }
+    if (updateOps.length > 0) {
+      await PlayerModel.bulkWrite(updateOps, { ordered: false });
+      updated += updateOps.length;
+    }
+
+    processedRows += chunk.length;
+    if (options?.onProgress) {
+      await options.onProgress({
+        totalRows,
+        processedRows: processedRows + skipped,
+        successRows: created + updated,
+        failedRows: 0,
+        skippedRows: skipped,
+      });
+    }
+  }
+
+  return { created, updated, skipped };
 }
 
 export async function importPlayersFromFile(
@@ -537,219 +916,8 @@ export async function importPlayersFromFile(
   updated: number;
   skipped: number;
 }> {
-  const lower = originalName.toLowerCase();
-  let rows: Record<string, unknown>[];
-
-  if (lower.endsWith(".csv")) {
-    const wb = xlsx.read(buffer, { type: "buffer", raw: false });
-    const sheetName = wb.SheetNames[0];
-    if (!sheetName) {
-      throw new AppError("validation_error", "CSV file is empty", 400);
-    }
-    rows = sheetRowsToObjects(wb.Sheets[sheetName]);
-  } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
-    const wb = xlsx.read(buffer, { type: "buffer", raw: false });
-    const sheetName = wb.SheetNames[0];
-    if (!sheetName) {
-      throw new AppError("validation_error", "Spreadsheet has no sheets", 400);
-    }
-    rows = sheetRowsToObjects(wb.Sheets[sheetName]);
-  } else {
-    throw new AppError("validation_error", "Unsupported file type. Use .csv, .xlsx, or .xls", 400);
-  }
-
-  const errors: ImportRowError[] = [];
-  let skipped = 0;
-  const parsedRows: ParsedImportRow[] = [];
-
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const rowNum = i + 2;
-    const exchangeName = pickCell(row, "exchange_name", "exchange", "exchange name");
-    const playerId = pickCell(row, "player_id", "playerid", "player id");
-    const phone = pickCell(row, "phone", "phone_number", "phone number", "mobile");
-
-    if (!exchangeName && !playerId && !phone) {
-      skipped += 1;
-      continue;
-    }
-
-    if (!exchangeName) {
-      errors.push({ row: rowNum, message: "exchange_name is required" });
-      continue;
-    }
-    if (!playerId) {
-      errors.push({ row: rowNum, message: "player_id is required" });
-      continue;
-    }
-    if (!phone) {
-      errors.push({ row: rowNum, message: "phone is required" });
-      continue;
-    }
-
-    const resolved = await resolveExchangeIdByName(exchangeName);
-    if (resolved.notFound) {
-      errors.push({ row: rowNum, message: `No exchange found for name "${exchangeName}"` });
-      continue;
-    }
-    if (resolved.ambiguous) {
-      errors.push({
-        row: rowNum,
-        message: `Multiple exchanges match "${exchangeName}"; names must be unique for import`,
-      });
-      continue;
-    }
-
-    const regularBonusRaw = pickCellRaw(
-      row,
-      "bonus_percentage",
-      "bonus_percent",
-      "bonus",
-      "bonus percentage",
-      "bonus%",
-    );
-    const regularBonusParsed = parsePercentageCell(regularBonusRaw, rowNum, "bonus_percentage");
-    if (!regularBonusParsed.ok) {
-      errors.push(regularBonusParsed.error);
-      continue;
-    }
-
-    const firstDepositBonusRaw = pickCellRaw(
-      row,
-      "first_deposit_bonus_percentage",
-      "first_deposit_bonus_percent",
-      "first deposit bonus percentage",
-      "first deposit bonus%",
-      "firstdepositbonuspercentage",
-    );
-    const firstDepositBonusParsed = parsePercentageCell(
-      firstDepositBonusRaw,
-      rowNum,
-      "first_deposit_bonus_percentage",
-    );
-    if (!firstDepositBonusParsed.ok) {
-      errors.push(firstDepositBonusParsed.error);
-      continue;
-    }
-
-    parsedRows.push({
-      rowNum,
-      exchangeId: resolved.id,
-      playerId,
-      phone,
-      regularBonusPercentage: regularBonusParsed.value,
-      firstDepositBonusPercentage: firstDepositBonusParsed.value,
-    });
-  }
-
-  if (errors.length > 0) {
-    throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", errors);
-  }
-
-  if (parsedRows.length === 0) {
-    throw new AppError("validation_error", "No data rows to import. Add at least one row with exchange_name, player_id, and phone.", 400);
-  }
-
-  const seenFirstRow = new Map<string, number>();
-  const dupErrors: ImportRowError[] = [];
-  for (const p of parsedRows) {
-    const key = `${p.exchangeId.toString()}:${p.playerId}`;
-    const first = seenFirstRow.get(key);
-    if (first !== undefined) {
-      dupErrors.push({
-        row: p.rowNum,
-        message: `Duplicate player_id "${p.playerId}" for this exchange (same as row ${first})`,
-      });
-    } else {
-      seenFirstRow.set(key, p.rowNum);
-    }
-  }
-  if (dupErrors.length > 0) {
-    throwImportValidation("Import failed — no rows were imported. Fix the issues below and try again.", dupErrors);
-  }
-
-  const actorOid = new Types.ObjectId(actorId);
-  const orConditions = parsedRows.map((p) => ({
-    exchange: p.exchangeId,
-    playerId: p.playerId,
-  }));
-  const existing = await PlayerModel.find({ $or: orConditions }).select("_id exchange playerId").lean();
-  const existingByKey = new Map<string, Types.ObjectId>();
-  for (const doc of existing) {
-    const exId = (doc.exchange as Types.ObjectId).toString();
-    existingByKey.set(`${exId}:${doc.playerId}`, doc._id as Types.ObjectId);
-  }
-
-  const docsToCreate = parsedRows
-    .filter((p) => !existingByKey.has(`${p.exchangeId.toString()}:${p.playerId}`))
-    .map((p) => ({
-      exchange: p.exchangeId,
-      playerId: p.playerId,
-      phone: p.phone,
-      regularBonusPercentage: p.regularBonusPercentage,
-      firstDepositBonusPercentage: p.firstDepositBonusPercentage,
-      createdBy: actorOid,
-      updatedBy: actorOid,
-    }));
-
-  const updateOps = parsedRows
-    .map((p) => {
-      const key = `${p.exchangeId.toString()}:${p.playerId}`;
-      const existingId = existingByKey.get(key);
-      if (!existingId) return null;
-      return {
-        updateOne: {
-          filter: { _id: existingId },
-          update: {
-            $set: {
-              phone: p.phone,
-              regularBonusPercentage: p.regularBonusPercentage,
-              firstDepositBonusPercentage: p.firstDepositBonusPercentage,
-              updatedBy: actorOid,
-            },
-          },
-        },
-      };
-    })
-    .filter((op): op is NonNullable<typeof op> => op !== null);
-
-  const created = docsToCreate.length;
-  const updated = updateOps.length;
-
-  const transactionalWrite = async (session?: mongoose.ClientSession) => {
-    if (docsToCreate.length > 0) {
-      if (session) {
-        await PlayerModel.insertMany(docsToCreate, { session });
-      } else {
-        await PlayerModel.insertMany(docsToCreate);
-      }
-    }
-    if (updateOps.length > 0) {
-      if (session) {
-        await PlayerModel.bulkWrite(updateOps, { session });
-      } else {
-        await PlayerModel.bulkWrite(updateOps);
-      }
-    }
-  };
-
-  try {
-    const session = await mongoose.startSession();
-    try {
-      await session.withTransaction(async () => {
-        await transactionalWrite(session);
-      });
-    } finally {
-      await session.endSession();
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/replica set|Transaction numbers|multi-document transactions/i.test(msg)) {
-      await transactionalWrite();
-    } else {
-      throw err;
-    }
-  }
+  const { parsedRows, skipped } = await parsePlayerImportFile(buffer, originalName);
+  const { created, updated } = await applyPlayerImportRows(parsedRows, actorId, { skippedRows: skipped });
 
   await createAuditLog({
     actorId,

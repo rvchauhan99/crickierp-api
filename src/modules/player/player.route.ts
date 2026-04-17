@@ -6,11 +6,15 @@ import { validate } from "../../shared/middlewares/validate.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import {
   createPlayerController,
+  createPlayerImportJobController,
+  downloadPlayerImportJobErrorsCsvController,
   exportPlayerController,
   getPlayerByIdController,
+  getPlayerImportJobStatusController,
   importPlayerController,
   listPlayerController,
   samplePlayerCsvController,
+  streamPlayerImportJobEventsController,
   updatePlayerController,
 } from "./player.controller";
 import { createPlayerBodySchema, updatePlayerBodySchema } from "./player.validation";
@@ -51,6 +55,36 @@ playerRouter.post(
     });
   },
   importPlayerController,
+);
+playerRouter.post(
+  "/import-jobs",
+  permissionMiddleware(PERMISSIONS.PLAYER_ADD),
+  (req, res, next) => {
+    upload.single("file")(req, res, (err: unknown) => {
+      if (err) {
+        const message = err instanceof Error ? err.message : "Upload failed";
+        res.status(400).json({ success: false, message });
+        return;
+      }
+      next();
+    });
+  },
+  createPlayerImportJobController,
+);
+playerRouter.get(
+  "/import-jobs/:jobId",
+  permissionMiddleware(PERMISSIONS.PLAYER_LIST),
+  getPlayerImportJobStatusController,
+);
+playerRouter.get(
+  "/import-jobs/:jobId/errors.csv",
+  permissionMiddleware(PERMISSIONS.PLAYER_LIST),
+  downloadPlayerImportJobErrorsCsvController,
+);
+playerRouter.get(
+  "/import-jobs/:jobId/events",
+  permissionMiddleware(PERMISSIONS.PLAYER_LIST),
+  streamPlayerImportJobEventsController,
 );
 playerRouter.post(
   "/",

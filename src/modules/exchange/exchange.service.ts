@@ -1,10 +1,20 @@
+import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { Types } from "mongoose";
 import type { z } from "zod";
-import xlsx from "xlsx";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
+import { DepositModel } from "../deposit/deposit.model";
+import { ExchangeTopupModel } from "../exchange-topup/exchange-topup.model";
+import { PlayerModel } from "../player/player.model";
+import { WithdrawalModel } from "../withdrawal/withdrawal.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { ExchangeModel } from "./exchange.model";
-import { listExchangeQuerySchema } from "./exchange.validation";
+import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
 
 type CreateExchangeInput = {
   name: string;
@@ -15,6 +25,7 @@ type CreateExchangeInput = {
 };
 
 type ListExchangeQuery = z.infer<typeof listExchangeQuerySchema>;
+type ExchangeStatementQuery = z.infer<typeof exchangeStatementQuerySchema>;
 
 function trimUndef(s: string | undefined): string | undefined {
   if (s == null) return undefined;
@@ -84,69 +95,58 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function createdAtCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const operator = op || "inRange";
   const f = trimUndef(from);
   const t = trimUndef(to);
 
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $lt: start } };
   }
   if (operator === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { createdAt: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { createdAt: { $lte: end } };
   }
   return null;
 }
 
-function buildExchangeListFilter(q: ListExchangeQuery): Record<string, unknown> {
+function buildExchangeListFilter(q: ListExchangeQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -183,6 +183,7 @@ function buildExchangeListFilter(q: ListExchangeQuery): Record<string, unknown> 
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) {
     conditions.push(dateCond);
@@ -196,6 +197,16 @@ function buildExchangeListFilter(q: ListExchangeQuery): Record<string, unknown> 
   );
   if (ob) {
     conditions.push(ob);
+  }
+
+  const cb = numberFieldCondition(
+    "currentBalance",
+    trimUndef(q.currentBalance),
+    trimUndef(q.currentBalance_op),
+    trimUndef(q.currentBalance_to),
+  );
+  if (cb) {
+    conditions.push(cb);
   }
 
   const bonus = numberFieldCondition("bonus", trimUndef(q.bonus), trimUndef(q.bonus_op), trimUndef(q.bonus_to));
@@ -224,6 +235,7 @@ export async function createExchange(
 
   const payload = {
     ...input,
+    currentBalance: input.openingBalance,
     createdBy: new Types.ObjectId(actorId),
     updatedBy: new Types.ObjectId(actorId),
   };
@@ -238,6 +250,7 @@ export async function createExchange(
       name: doc.name,
       provider: doc.provider,
       openingBalance: doc.openingBalance,
+      currentBalance: doc.currentBalance,
       bonus: doc.bonus,
       status: doc.status,
     },
@@ -247,8 +260,9 @@ export async function createExchange(
   return doc;
 }
 
-export async function listExchanges(query: ListExchangeQuery) {
-  const filter = buildExchangeListFilter(query);
+export async function listExchanges(query: ListExchangeQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildExchangeListFilter(query, timeZone);
 
   const skip = (query.page - 1) * query.pageSize;
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
@@ -288,8 +302,12 @@ function formatCreatedByForExport(createdBy: unknown): string {
   return String(createdBy);
 }
 
-export async function exportExchangesToBuffer(query: ListExchangeQuery): Promise<Buffer> {
-  const filter = buildExchangeListFilter(query);
+export async function exportExchangesToBuffer(
+  query: ListExchangeQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildExchangeListFilter(query, timeZone);
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await ExchangeModel.find(filter)
@@ -302,17 +320,15 @@ export async function exportExchangesToBuffer(query: ListExchangeQuery): Promise
     "Exchange Name": r.name,
     Provider: r.provider,
     "Opening Balance": r.openingBalance,
+    "Current Balance": r.currentBalance ?? r.openingBalance,
     Bonus: r.bonus,
     Version: r.version ?? "",
     Status: r.status,
     "Created By": formatCreatedByForExport(r.createdBy),
-    "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
   }));
 
-  const worksheet = xlsx.utils.json_to_sheet(exportData);
-  const workbook = xlsx.utils.book_new();
-  xlsx.utils.book_append_sheet(workbook, worksheet, "Exchanges");
-  return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  return generateExcelBuffer(exportData, "Exchanges");
 }
 
 export async function getExchangeById(id: string) {
@@ -338,6 +354,7 @@ export async function updateExchange(
     name: existing.name,
     provider: existing.provider,
     openingBalance: existing.openingBalance,
+    currentBalance: existing.currentBalance,
     bonus: existing.bonus,
     status: existing.status,
     version: existing.version,
@@ -347,6 +364,14 @@ export async function updateExchange(
   existing.updatedBy = new Types.ObjectId(actorId);
   existing.version += 1;
   await existing.save();
+
+  if (input.openingBalance !== undefined) {
+    await recomputeExchangeCurrentBalance(existing._id.toString());
+    const refreshed = await ExchangeModel.findById(existing._id);
+    if (refreshed) {
+      existing.currentBalance = refreshed.currentBalance;
+    }
+  }
 
   await createAuditLog({
     actorId,
@@ -358,6 +383,7 @@ export async function updateExchange(
       name: existing.name,
       provider: existing.provider,
       openingBalance: existing.openingBalance,
+      currentBalance: existing.currentBalance,
       bonus: existing.bonus,
       status: existing.status,
       version: existing.version,
@@ -366,4 +392,303 @@ export async function updateExchange(
   });
 
   return existing;
+}
+
+export async function recomputeExchangeCurrentBalance(exchangeId: string): Promise<number> {
+  if (!Types.ObjectId.isValid(exchangeId)) {
+    throw new AppError("validation_error", "Invalid exchange id", 400);
+  }
+  const exchangeObjectId = new Types.ObjectId(exchangeId);
+  const exchange = await ExchangeModel.findById(exchangeObjectId);
+  if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
+
+  const scopedPlayerIds = await PlayerModel.distinct("_id", { exchange: exchangeObjectId });
+
+  const [depositAgg, withdrawalAgg, topupAgg] = await Promise.all([
+    scopedPlayerIds.length
+      ? DepositModel.aggregate<{ total: number }>([
+          { $match: { player: { $in: scopedPlayerIds }, status: { $in: ["verified", "finalized"] } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $ifNull: ["$totalAmount", "$amount"] } },
+            },
+          },
+        ])
+      : Promise.resolve([] as { total: number }[]),
+    scopedPlayerIds.length
+      ? WithdrawalModel.aggregate<{ total: number }>([
+          { $match: { player: { $in: scopedPlayerIds }, status: { $in: ["approved", "finalized"] } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+            },
+          },
+        ])
+      : Promise.resolve([] as { total: number }[]),
+    ExchangeTopupModel.aggregate<{ total: number }>([
+      { $match: { exchangeId: exchangeObjectId } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]),
+  ]);
+
+  const depositTotal = Number(depositAgg[0]?.total ?? 0);
+  const withdrawalTotal = Number(withdrawalAgg[0]?.total ?? 0);
+  const topupTotal = Number(topupAgg[0]?.total ?? 0);
+  const nextCurrentBalance = exchange.openingBalance - depositTotal + withdrawalTotal + topupTotal;
+
+  exchange.currentBalance = nextCurrentBalance;
+  await exchange.save();
+  return nextCurrentBalance;
+}
+
+function depositEventTime(d: {
+  entryAt?: Date;
+  settledAt?: Date;
+  exchangeActionAt?: Date;
+  updatedAt?: Date;
+  createdAt?: Date;
+}): Date {
+  if (d.entryAt) return new Date(d.entryAt);
+  if (d.settledAt) return new Date(d.settledAt);
+  if (d.exchangeActionAt) return new Date(d.exchangeActionAt);
+  if (d.updatedAt) return new Date(d.updatedAt);
+  if (d.createdAt) return new Date(d.createdAt);
+  return new Date(0);
+}
+
+function withdrawalEventTime(w: { requestedAt?: Date; updatedAt?: Date; createdAt?: Date }): Date {
+  if (w.requestedAt) return new Date(w.requestedAt);
+  if (w.updatedAt) return new Date(w.updatedAt);
+  if (w.createdAt) return new Date(w.createdAt);
+  return new Date(0);
+}
+
+/**
+ * Exchange-perspective statement:
+ * - deposit -> debit (money withdrawn from exchange)
+ * - withdrawal -> credit (money deposited into exchange)
+ */
+export async function getExchangeStatement(
+  exchangeId: string,
+  query: ExchangeStatementQuery,
+  options?: { timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  if (!Types.ObjectId.isValid(exchangeId)) {
+    throw new AppError("validation_error", "Invalid exchange id", 400);
+  }
+  const exchangeObjectId = new Types.ObjectId(exchangeId);
+  const exchange = await ExchangeModel.findById(exchangeObjectId).lean();
+  if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
+
+  const fromDate = query.fromDate?.trim();
+  const toDate = query.toDate?.trim();
+  const from = fromDate ? ymdToUtcStart(fromDate, timeZone) : null;
+  const to = toDate ? ymdToUtcEnd(toDate, timeZone) : null;
+  if (fromDate && !from) {
+    throw new AppError("validation_error", "fromDate must be in YYYY-MM-DD format", 400);
+  }
+  if (toDate && !to) {
+    throw new AppError("validation_error", "toDate must be in YYYY-MM-DD format", 400);
+  }
+
+  const playerFilter: Record<string, unknown> = { exchange: exchangeObjectId };
+  if (query.playerId) {
+    if (!Types.ObjectId.isValid(query.playerId)) {
+      throw new AppError("validation_error", "Invalid player id", 400);
+    }
+    playerFilter._id = new Types.ObjectId(query.playerId);
+  }
+
+  const players = await PlayerModel.find(playerFilter).select("_id playerId").lean();
+  const playerIds = players.map((p) => p._id);
+  const playerMap = new Map(players.map((p) => [String(p._id), p.playerId]));
+
+  const [allDeposits, allWithdrawals, allTopups] = await Promise.all([
+    playerIds.length
+      ? DepositModel.find({
+          player: { $in: playerIds },
+          status: { $in: ["verified", "finalized"] },
+        })
+          .select("_id player amount bonusAmount totalAmount utr entryAt settledAt exchangeActionAt updatedAt createdAt")
+          .lean()
+      : Promise.resolve([]),
+    playerIds.length
+      ? WithdrawalModel.find({
+          player: { $in: playerIds },
+          status: { $in: ["approved", "finalized"] },
+        })
+          .select("_id player playerName amount payableAmount reverseBonus utr requestedAt updatedAt createdAt")
+          .lean()
+      : Promise.resolve([]),
+    ExchangeTopupModel.find({ exchangeId: exchangeObjectId })
+      .populate("createdBy", "fullName username")
+      .select("_id exchangeId amount remark createdBy createdAt updatedAt")
+      .lean(),
+  ]);
+
+  if (playerIds.length === 0 && allTopups.length === 0) {
+    return {
+      exchange: {
+        _id: exchange._id.toString(),
+        name: exchange.name,
+        provider: exchange.provider,
+        openingBalance: exchange.openingBalance,
+        currentBalance: exchange.currentBalance ?? exchange.openingBalance,
+      },
+      periodOpeningBalance: exchange.openingBalance,
+      periodClosingBalance: exchange.openingBalance,
+      totalCredits: 0,
+      totalDebits: 0,
+      totalDepositOutflow: 0,
+      totalWithdrawalInflow: 0,
+      totalTopUpCredits: 0,
+      rows: [],
+    };
+  }
+
+  let priorNet = 0;
+  if (from) {
+    for (const d of allDeposits) {
+      if (depositEventTime(d) >= from) continue;
+      priorNet -= d.totalAmount ?? d.amount;
+    }
+    for (const w of allWithdrawals) {
+      if (withdrawalEventTime(w) >= from) continue;
+      priorNet += w.payableAmount ?? w.amount;
+    }
+    for (const t of allTopups) {
+      if (new Date(t.createdAt) >= from) continue;
+      priorNet += t.amount;
+    }
+  }
+
+  type StatementEvent =
+    | { kind: "deposit"; t: number; doc: (typeof allDeposits)[0] }
+    | { kind: "withdrawal"; t: number; doc: (typeof allWithdrawals)[0] }
+    | { kind: "topup"; t: number; doc: (typeof allTopups)[0] };
+
+  const events: StatementEvent[] = [];
+  const entryType = query.entryType || "all";
+
+  for (const d of allDeposits) {
+    const at = depositEventTime(d);
+    if (from && at < from) continue;
+    if (to && at > to) continue;
+    if (entryType === "all" || entryType === "deposit") {
+      events.push({ kind: "deposit", t: at.getTime(), doc: d });
+    }
+  }
+  for (const w of allWithdrawals) {
+    const at = withdrawalEventTime(w);
+    if (from && at < from) continue;
+    if (to && at > to) continue;
+    if (entryType === "all" || entryType === "withdrawal") {
+      events.push({ kind: "withdrawal", t: at.getTime(), doc: w });
+    }
+  }
+  for (const t of allTopups) {
+    const at = new Date(t.createdAt);
+    if (from && at < from) continue;
+    if (to && at > to) continue;
+    if (entryType === "all" || entryType === "topup") {
+      events.push({ kind: "topup", t: at.getTime(), doc: t });
+    }
+  }
+  events.sort((a, b) => a.t - b.t);
+
+  const periodOpeningBalance = exchange.openingBalance + priorNet;
+  let running = periodOpeningBalance;
+  let totalCredits = 0;
+  let totalDebits = 0;
+  let totalDepositOutflow = 0;
+  let totalWithdrawalInflow = 0;
+  let totalTopUpCredits = 0;
+
+  const rows = events.map((ev) => {
+    if (ev.kind === "deposit") {
+      const d = ev.doc;
+      const amount = d.totalAmount ?? d.amount;
+      running -= amount;
+      totalDebits += amount;
+      totalDepositOutflow += amount;
+
+      return {
+        kind: "deposit" as const,
+        refId: d._id.toString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
+        label: "Deposit",
+        playerId: playerMap.get(String(d.player)) ?? "",
+        amount,
+        direction: "debit" as const,
+        balanceAfter: running,
+        bonusMemo: d.bonusAmount ?? 0,
+        utr: d.utr,
+      };
+    }
+
+    if (ev.kind === "withdrawal") {
+      const w = ev.doc;
+      const amount = w.payableAmount ?? w.amount;
+      running += amount;
+      totalCredits += amount;
+      totalWithdrawalInflow += amount;
+
+      return {
+        kind: "withdrawal" as const,
+        refId: w._id.toString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
+        label: "Withdrawal",
+        playerId: playerMap.get(String(w.player)) ?? w.playerName ?? "",
+        amount,
+        direction: "credit" as const,
+        balanceAfter: running,
+        bonusMemo: w.reverseBonus ?? 0,
+        utr: w.utr,
+      };
+    }
+
+    const topup = ev.doc;
+    running += topup.amount;
+    totalCredits += topup.amount;
+    totalTopUpCredits += topup.amount;
+    const createdByObj = topup.createdBy as { fullName?: string; username?: string } | undefined;
+    const createdByLabel =
+      createdByObj?.fullName?.trim() || createdByObj?.username?.trim() || "";
+
+    return {
+      kind: "topup" as const,
+      refId: topup._id.toString(),
+      at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
+      label: "Top Up",
+      playerId: "",
+      amount: topup.amount,
+      direction: "credit" as const,
+      balanceAfter: running,
+      bonusMemo: 0,
+      utr: undefined,
+      remark: topup.remark ?? "",
+      createdByName: createdByLabel,
+    };
+  });
+
+  return {
+    exchange: {
+      _id: exchange._id.toString(),
+      name: exchange.name,
+      provider: exchange.provider,
+      openingBalance: exchange.openingBalance,
+      currentBalance: exchange.currentBalance ?? exchange.openingBalance,
+    },
+    periodOpeningBalance,
+    periodClosingBalance: running,
+    totalCredits,
+    totalDebits,
+    totalDepositOutflow,
+    totalWithdrawalInflow,
+    totalTopUpCredits,
+    rows,
+  };
 }
