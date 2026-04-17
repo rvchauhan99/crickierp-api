@@ -221,6 +221,73 @@ function buildBankListFilter(q: ListBankQuery): Record<string, unknown> {
   return { $and: conditions };
 }
 
+type ClosingBalanceByBankId = Map<string, number>;
+
+/**
+ * Computes statement-equivalent closing balance snapshot for given banks:
+ * openingBalance + verified deposits - approved withdrawals - approved expenses +/- liabilities.
+ */
+async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<ClosingBalanceByBankId> {
+  if (bankIds.length === 0) return new Map();
+  const [banks, deposits, withdrawals, expenses, liabilities] = await Promise.all([
+    BankModel.find({ _id: { $in: bankIds } })
+      .select({ _id: 1, openingBalance: 1 })
+      .lean(),
+    DepositModel.find({ bankId: { $in: bankIds }, status: "verified" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    WithdrawalModel.find({ payoutBankId: { $in: bankIds }, status: "approved" })
+      .select({ payoutBankId: 1, amount: 1, payableAmount: 1 })
+      .lean(),
+    ExpenseModel.find({ bankId: { $in: bankIds }, status: "approved" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    LiabilityEntryModel.find({
+      $or: [
+        { fromAccountType: "bank", fromAccountId: { $in: bankIds } },
+        { toAccountType: "bank", toAccountId: { $in: bankIds } },
+      ],
+    })
+      .select({ fromAccountType: 1, fromAccountId: 1, toAccountType: 1, toAccountId: 1, amount: 1 })
+      .lean(),
+  ]);
+
+  const totals = new Map<string, number>();
+  for (const b of banks) {
+    totals.set(String(b._id), Number(b.openingBalance ?? 0));
+  }
+
+  for (const d of deposits) {
+    const id = String(d.bankId);
+    const prev = totals.get(id) ?? 0;
+    totals.set(id, prev + Number(d.amount ?? 0));
+  }
+  for (const w of withdrawals) {
+    const id = String(w.payoutBankId);
+    const prev = totals.get(id) ?? 0;
+    totals.set(id, prev - Number(w.payableAmount ?? w.amount ?? 0));
+  }
+  for (const e of expenses) {
+    const id = String(e.bankId);
+    const prev = totals.get(id) ?? 0;
+    totals.set(id, prev - Number(e.amount ?? 0));
+  }
+  for (const le of liabilities) {
+    const amt = Number(le.amount ?? 0);
+    if (le.fromAccountType === "bank" && le.fromAccountId) {
+      const id = String(le.fromAccountId);
+      const prev = totals.get(id) ?? 0;
+      totals.set(id, prev - amt);
+    }
+    if (le.toAccountType === "bank" && le.toAccountId) {
+      const id = String(le.toAccountId);
+      const prev = totals.get(id) ?? 0;
+      totals.set(id, prev + amt);
+    }
+  }
+  return totals;
+}
+
 const EXPORT_MAX_ROWS = 10_000;
 
 function formatCreatedByForExport(createdBy: unknown): string {
@@ -280,8 +347,15 @@ export async function listBanks(query: ListBankQuery) {
     BankModel.countDocuments(filter),
   ]);
 
+  const bankIds = rows.map((r) => new Types.ObjectId(String(r._id)));
+  const closingByBankId = await computeClosingBalanceActualByBankIds(bankIds);
+  const rowsWithClosing = rows.map((r) => ({
+    ...r,
+    closingBalanceActual: closingByBankId.get(String(r._id)) ?? Number(r.openingBalance ?? 0),
+  }));
+
   return {
-    rows,
+    rows: rowsWithClosing,
     meta: {
       page,
       pageSize,
