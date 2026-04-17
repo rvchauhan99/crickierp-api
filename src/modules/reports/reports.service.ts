@@ -2,7 +2,9 @@ import { Types } from "mongoose";
 import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { AuditLogModel } from "../audit/audit.model";
+import { BankModel } from "../bank/bank.model";
 import { ExchangeModel } from "../exchange/exchange.model";
+import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { UserModel } from "../users/user.model";
 import { ExpenseModel, type ExpenseStatus } from "../expense/expense.model";
@@ -109,6 +111,36 @@ function businessDateRangeExpr(field: "entryAt" | "requestedAt", startUtc: Date 
   return {
     $expr: {
       $and: [{ $gte: [txExpr, startUtc] }, { $lte: [txExpr, endUtc] }],
+    },
+  };
+}
+
+function businessDateBeforeExpr(field: "entryAt" | "requestedAt", beforeUtc: Date | null) {
+  if (!beforeUtc) return {};
+  const txExpr = { $ifNull: [`$${field}`, "$createdAt"] };
+  return {
+    $expr: {
+      $lt: [txExpr, beforeUtc],
+    },
+  };
+}
+
+function liabilityDateRangeExpr(startUtc: Date | null, endUtc: Date | null) {
+  if (!startUtc || !endUtc) return {};
+  const txExpr = { $ifNull: ["$entryDate", "$createdAt"] };
+  return {
+    $expr: {
+      $and: [{ $gte: [txExpr, startUtc] }, { $lte: [txExpr, endUtc] }],
+    },
+  };
+}
+
+function liabilityDateBeforeExpr(beforeUtc: Date | null) {
+  if (!beforeUtc) return {};
+  const txExpr = { $ifNull: ["$entryDate", "$createdAt"] };
+  return {
+    $expr: {
+      $lt: [txExpr, beforeUtc],
     },
   };
 }
@@ -276,6 +308,109 @@ export async function getDashboardSummary(
     expenseFilter,
     exchangeStatsFilter,
   } = await buildDashboardFilterContext(query, timeZone);
+  const rangeStartUtc = ymdToUtcStartInZone(appliedRange.fromDate, timeZone);
+  const rangeEndUtc = ymdToUtcEndInZone(appliedRange.toDate, timeZone);
+  const selectedBankObjectId =
+    query.bankId && Types.ObjectId.isValid(query.bankId) ? new Types.ObjectId(query.bankId) : null;
+  const txType = (query.transactionType as DashboardTxnTypeFilter | undefined) ?? "all";
+  const status = query.status as DashboardStatusFilter | undefined;
+  const includeTransferSummary = txType === "all";
+  const minAmount = query.amountFrom != null ? Number(query.amountFrom) : undefined;
+  const maxAmount = query.amountTo != null ? Number(query.amountTo) : undefined;
+  const liabilityAmountFilter =
+    minAmount != null || maxAmount != null
+      ? {
+          amount: {
+            ...(minAmount != null ? { $gte: minAmount } : {}),
+            ...(maxAmount != null ? { $lte: maxAmount } : {}),
+          },
+        }
+      : {};
+  const liabilitySearchText = query.search?.trim();
+  const liabilitySearchFilter = liabilitySearchText
+    ? {
+        $or: [
+          { referenceNo: { $regex: escapeRegexFragment(liabilitySearchText), $options: "i" } },
+          { remark: { $regex: escapeRegexFragment(liabilitySearchText), $options: "i" } },
+          { entryType: { $regex: escapeRegexFragment(liabilitySearchText), $options: "i" } },
+        ],
+      }
+    : {};
+  const bankSelectionLiabilityFilter = selectedBankObjectId
+    ? {
+        $or: [{ fromAccountId: selectedBankObjectId }, { toAccountId: selectedBankObjectId }],
+      }
+    : {};
+  const liabilityBaseFilter = includeTransferSummary
+    ? { ...liabilityAmountFilter, ...liabilitySearchFilter, ...bankSelectionLiabilityFilter }
+    : { _id: { $exists: false } };
+
+  const { $expr: _depositDateExpr, ...depositFilterNoDate } = depositFilter as Record<string, unknown>;
+  const { $expr: _withdrawalDateExpr, ...withdrawalFilterNoDate } = withdrawalFilter as Record<string, unknown>;
+  const { createdAt: _expenseDateRange, ...expenseFilterNoDate } = expenseFilter as Record<string, unknown>;
+
+  const depositBalanceStatusFilter =
+    status === "all" || !status ? { status: { $in: ["verified", "finalized"] } } : {};
+  const withdrawalBalanceStatusFilter = status === "all" || !status ? { status: "approved" } : {};
+  const expenseBalanceStatusFilter = status === "all" || !status ? { status: "approved" } : {};
+
+  const depositBankRangeFilter = {
+    ...depositFilterNoDate,
+    ...businessDateRangeExpr("entryAt", rangeStartUtc, rangeEndUtc),
+    ...depositBalanceStatusFilter,
+  };
+  const depositBankPriorFilter = {
+    ...depositFilterNoDate,
+    ...businessDateBeforeExpr("entryAt", rangeStartUtc),
+    ...depositBalanceStatusFilter,
+  };
+  const withdrawalBankRangeFilter = {
+    ...withdrawalFilterNoDate,
+    ...businessDateRangeExpr("requestedAt", rangeStartUtc, rangeEndUtc),
+    ...(selectedBankObjectId ? { payoutBankId: selectedBankObjectId } : {}),
+    ...withdrawalBalanceStatusFilter,
+  };
+  const withdrawalBankPriorFilter = {
+    ...withdrawalFilterNoDate,
+    ...businessDateBeforeExpr("requestedAt", rangeStartUtc),
+    ...(selectedBankObjectId ? { payoutBankId: selectedBankObjectId } : {}),
+    ...withdrawalBalanceStatusFilter,
+  };
+  const expenseBankRangeFilter = {
+    ...expenseFilterNoDate,
+    createdAt: {
+      ...(rangeStartUtc ? { $gte: rangeStartUtc } : {}),
+      ...(rangeEndUtc ? { $lte: rangeEndUtc } : {}),
+    },
+    ...expenseBalanceStatusFilter,
+  };
+  const expenseBankPriorFilter = {
+    ...expenseFilterNoDate,
+    createdAt: {
+      ...(rangeStartUtc ? { $lt: rangeStartUtc } : {}),
+    },
+    ...expenseBalanceStatusFilter,
+  };
+  const transferOutRangeFilter = {
+    ...liabilityBaseFilter,
+    fromAccountType: "bank",
+    ...liabilityDateRangeExpr(rangeStartUtc, rangeEndUtc),
+  };
+  const transferOutPriorFilter = {
+    ...liabilityBaseFilter,
+    fromAccountType: "bank",
+    ...liabilityDateBeforeExpr(rangeStartUtc),
+  };
+  const transferInRangeFilter = {
+    ...liabilityBaseFilter,
+    toAccountType: "bank",
+    ...liabilityDateRangeExpr(rangeStartUtc, rangeEndUtc),
+  };
+  const transferInPriorFilter = {
+    ...liabilityBaseFilter,
+    toAccountType: "bank",
+    ...liabilityDateBeforeExpr(rangeStartUtc),
+  };
   const todayRange = resolveTodayRangeForTimeZone(timeZone);
   const todayPlayerFilter = {
     createdAt: {
@@ -306,6 +441,17 @@ export async function getDashboardSummary(
     firstTimeDepositTodayAgg,
     exchangeNewPlayersTodayAgg,
     exchangeFirstTimeDepositTodayAgg,
+    activeBanks,
+    depositByBankInRange,
+    depositByBankBeforeRange,
+    withdrawalByBankInRange,
+    withdrawalByBankBeforeRange,
+    expenseByBankInRange,
+    expenseByBankBeforeRange,
+    transferOutByBankInRange,
+    transferOutByBankBeforeRange,
+    transferInByBankInRange,
+    transferInByBankBeforeRange,
   ] = await Promise.all([
     // Deposit: group by status → totalAmount, count, bonusTotal
     DepositModel.aggregate([
@@ -571,6 +717,110 @@ export async function getDashboardSummary(
             },
           },
         ]),
+
+    BankModel.find({ status: "active" })
+      .select({ _id: 1, holderName: 1, bankName: 1, openingBalance: 1 })
+      .lean(),
+
+    DepositModel.aggregate([
+      { $match: depositBankRangeFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    DepositModel.aggregate([
+      { $match: depositBankPriorFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
+
+    WithdrawalModel.aggregate([
+      { $match: withdrawalBankRangeFilter },
+      {
+        $group: {
+          _id: "$payoutBankId",
+          totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    WithdrawalModel.aggregate([
+      { $match: withdrawalBankPriorFilter },
+      {
+        $group: {
+          _id: "$payoutBankId",
+          totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+        },
+      },
+    ]),
+
+    ExpenseModel.aggregate([
+      { $match: expenseBankRangeFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    ExpenseModel.aggregate([
+      { $match: expenseBankPriorFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
+
+    LiabilityEntryModel.aggregate([
+      { $match: transferOutRangeFilter },
+      {
+        $group: {
+          _id: "$fromAccountId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    LiabilityEntryModel.aggregate([
+      { $match: transferOutPriorFilter },
+      {
+        $group: {
+          _id: "$fromAccountId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
+
+    LiabilityEntryModel.aggregate([
+      { $match: transferInRangeFilter },
+      {
+        $group: {
+          _id: "$toAccountId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    LiabilityEntryModel.aggregate([
+      { $match: transferInPriorFilter },
+      {
+        $group: {
+          _id: "$toAccountId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
   ]);
 
   /* ── Aggregate deposit KPIs ────────────────────────────────────── */
@@ -755,6 +1005,94 @@ export async function getDashboardSummary(
   const firstTimeDepositAmountToday =
     (firstTimeDepositTodayAgg as Array<{ totalAmount?: number }>)[0]?.totalAmount ?? 0;
 
+  const asNumber = (value: unknown) => Number(value ?? 0);
+  const groupToAmountMap = (rows: Array<{ _id?: unknown; totalAmount?: number }>) => {
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      const id = String(row._id ?? "");
+      if (!Types.ObjectId.isValid(id)) continue;
+      map.set(id, asNumber(row.totalAmount));
+    }
+    return map;
+  };
+  const groupToCountMap = (rows: Array<{ _id?: unknown; count?: number }>) => {
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      const id = String(row._id ?? "");
+      if (!Types.ObjectId.isValid(id)) continue;
+      map.set(id, asNumber(row.count));
+    }
+    return map;
+  };
+
+  const depositInRangeMap = groupToAmountMap(depositByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const depositBeforeMap = groupToAmountMap(depositByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const depositCountMap = groupToCountMap(depositByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const withdrawalInRangeMap = groupToAmountMap(withdrawalByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const withdrawalBeforeMap = groupToAmountMap(
+    withdrawalByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const withdrawalCountMap = groupToCountMap(withdrawalByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const expenseInRangeMap = groupToAmountMap(expenseByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const expenseBeforeMap = groupToAmountMap(expenseByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const expenseCountMap = groupToCountMap(expenseByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const transferOutInRangeMap = groupToAmountMap(
+    transferOutByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferOutBeforeMap = groupToAmountMap(
+    transferOutByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferOutCountMap = groupToCountMap(transferOutByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const transferInInRangeMap = groupToAmountMap(
+    transferInByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferInBeforeMap = groupToAmountMap(
+    transferInByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferInCountMap = groupToCountMap(transferInByBankInRange as Array<{ _id?: unknown; count?: number }>);
+
+  const banksBreakdown = (activeBanks as Array<{ _id: Types.ObjectId; holderName?: string; bankName?: string; openingBalance?: number }>)
+    .map((bank) => {
+      const bankId = String(bank._id);
+      const baseOpeningBalance = asNumber(bank.openingBalance);
+      const openingBalance =
+        baseOpeningBalance +
+        asNumber(depositBeforeMap.get(bankId)) +
+        asNumber(transferInBeforeMap.get(bankId)) -
+        asNumber(withdrawalBeforeMap.get(bankId)) -
+        asNumber(expenseBeforeMap.get(bankId)) -
+        asNumber(transferOutBeforeMap.get(bankId));
+
+      const deposit = asNumber(depositInRangeMap.get(bankId));
+      const withdrawal = asNumber(withdrawalInRangeMap.get(bankId));
+      const expenses = asNumber(expenseInRangeMap.get(bankId));
+      const transferOut = asNumber(transferOutInRangeMap.get(bankId));
+      const transferIn = asNumber(transferInInRangeMap.get(bankId));
+      const entries =
+        asNumber(depositCountMap.get(bankId)) +
+        asNumber(withdrawalCountMap.get(bankId)) +
+        asNumber(expenseCountMap.get(bankId)) +
+        asNumber(transferOutCountMap.get(bankId)) +
+        asNumber(transferInCountMap.get(bankId));
+      const closingBalance = openingBalance + deposit + transferIn - withdrawal - expenses - transferOut;
+
+      return {
+        bankId,
+        name: `${String(bank.holderName ?? "").trim()} ${String(bank.bankName ?? "").trim()}`.trim() || "Unknown",
+        holderName: String(bank.holderName ?? ""),
+        bankName: String(bank.bankName ?? ""),
+        openingBalance,
+        entries,
+        deposit,
+        withdrawal,
+        expenses,
+        transferOut,
+        transferIn,
+        closingBalance,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
   return {
     meta: {
       fromDate: appliedRange.fromDate,
@@ -809,6 +1147,7 @@ export async function getDashboardSummary(
     trendData,
     recentActivity,
     exchangesBreakdown,
+    banksBreakdown,
   };
 }
 
