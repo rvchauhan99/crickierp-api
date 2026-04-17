@@ -3,6 +3,25 @@ import { Schema, model, Types } from "mongoose";
 /** pending = awaiting exchange; verified = approved and settled on bank; rejected = exchange rejected; finalized = legacy */
 export type DepositStatus = "pending" | "verified" | "rejected" | "finalized";
 
+/** Snapshot of deposit fields stored on each amendment entry (plain ids for JSON stability). */
+export interface DepositAmendmentSnapshot {
+  bankId?: string;
+  bankName?: string;
+  utr?: string;
+  amount?: number;
+  playerId?: string;
+  bonusAmount?: number;
+  totalAmount?: number;
+}
+
+export interface DepositAmendmentEntry {
+  at: Date;
+  by: Types.ObjectId;
+  reason: string;
+  old: DepositAmendmentSnapshot;
+  new: DepositAmendmentSnapshot;
+}
+
 export interface DepositDocument {
   _id: Types.ObjectId;
   bankId?: Types.ObjectId;
@@ -22,9 +41,38 @@ export interface DepositDocument {
   exchangeActionAt?: Date;
   bankBalanceAfter?: number;
   settledAt?: Date;
+  /** Number of successful post-settlement amendments. */
+  amendmentCount?: number;
+  lastAmendedAt?: Date;
+  lastAmendedBy?: Types.ObjectId;
+  amendmentHistory?: DepositAmendmentEntry[];
   createdAt: Date;
   updatedAt: Date;
 }
+
+const amendmentSnapshotSchema = new Schema<DepositAmendmentSnapshot>(
+  {
+    bankId: { type: String, trim: true },
+    bankName: { type: String, trim: true },
+    utr: { type: String, trim: true },
+    amount: { type: Number },
+    playerId: { type: String, trim: true },
+    bonusAmount: { type: Number },
+    totalAmount: { type: Number },
+  },
+  { _id: false },
+);
+
+const amendmentEntrySchema = new Schema<DepositAmendmentEntry>(
+  {
+    at: { type: Date, required: true },
+    by: { type: Schema.Types.ObjectId, required: true, ref: "User" },
+    reason: { type: String, required: true, trim: true },
+    old: { type: amendmentSnapshotSchema, required: true },
+    new: { type: amendmentSnapshotSchema, required: true },
+  },
+  { _id: false },
+);
 
 const depositSchema = new Schema<DepositDocument>(
   {
@@ -47,6 +95,10 @@ const depositSchema = new Schema<DepositDocument>(
     exchangeActionAt: { type: Date },
     bankBalanceAfter: { type: Number, min: 0 },
     settledAt: { type: Date },
+    amendmentCount: { type: Number, min: 0, default: 0 },
+    lastAmendedAt: { type: Date },
+    lastAmendedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    amendmentHistory: { type: [amendmentEntrySchema], default: [] },
   },
   { timestamps: true },
 );

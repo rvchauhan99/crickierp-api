@@ -1,6 +1,6 @@
 import { Types } from "mongoose";
 import { ReasonModel } from "../masters/reason.model";
-import type { RejectionReasonType } from "../../shared/constants/reasonTypes";
+import type { ReasonType } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
 
 export type ResolvedRejectReason = {
@@ -13,7 +13,7 @@ export type ResolvedRejectReason = {
  */
 export async function loadActiveReasonForReject(
   reasonId: string,
-  expectedReasonType: RejectionReasonType,
+  expectedReasonType: ReasonType,
 ): Promise<ResolvedRejectReason> {
   const id = String(reasonId || "").trim();
   if (!Types.ObjectId.isValid(id)) {

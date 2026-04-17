@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
+  amendWithdrawal,
   createWithdrawal,
   listSavedAccountsForPlayer,
   listWithdrawals,
@@ -10,6 +11,7 @@ import {
   exportWithdrawalsToBuffer,
 } from "./withdrawal.service";
 import {
+  amendWithdrawalBodySchema,
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
@@ -40,6 +42,13 @@ export async function updateWithdrawalBankerController(req: Request, res: Respon
   const body = withdrawalBankerPayoutBodySchema.parse(req.body);
   const id = String(req.params.id);
   const data = await updateWithdrawalByBanker(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function amendWithdrawalController(req: Request, res: Response) {
+  const body = amendWithdrawalBodySchema.parse(req.body);
+  const id = String(req.params.id);
+  const data = await amendWithdrawal(id, body, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 

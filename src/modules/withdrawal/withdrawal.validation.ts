@@ -44,9 +44,13 @@ export const listWithdrawalQuerySchema = z.object({
   amount: z.string().optional(),
   amount_to: z.string().optional(),
   amount_op: z.string().optional(),
+  payableAmount: z.string().optional(),
+  payableAmount_to: z.string().optional(),
+  payableAmount_op: z.string().optional(),
   createdAt_from: z.string().optional(),
   createdAt_to: z.string().optional(),
   createdAt_op: z.string().optional(),
+  hasAmendment: z.enum(["yes", "no"]).optional(),
 });
 
 export const updateWithdrawalStatusBodySchema = z.discriminatedUnion("status", [
@@ -59,3 +63,12 @@ export const updateWithdrawalStatusBodySchema = z.discriminatedUnion("status", [
     status: z.literal("finalized"),
   }),
 ]);
+
+export const amendWithdrawalBodySchema = z.object({
+  amount: z.number().min(1),
+  reverseBonus: z.number().min(0),
+  payoutBankId: z.string().length(24),
+  utr: z.string().min(4).max(120).trim(),
+  reasonId: z.string().length(24),
+  remark: z.string().max(2000).trim().optional(),
+});

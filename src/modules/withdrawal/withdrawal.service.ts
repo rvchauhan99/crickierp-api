@@ -9,10 +9,12 @@ import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { AuditLogModel } from "../audit/audit.model";
+import type { WithdrawalAmendmentSnapshot } from "./withdrawal.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
-import { listWithdrawalQuerySchema } from "./withdrawal.validation";
+import { amendWithdrawalBodySchema, listWithdrawalQuerySchema } from "./withdrawal.validation";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
+type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
 
 function pageSizeFromQuery(q: ListWithdrawalQuery): number {
   return q.limit ?? q.pageSize;
@@ -174,12 +176,31 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery): Record<string, unkno
   const amountCond = numberFieldCondition("amount", trimUndef(q.amount), trimUndef(q.amount_op), trimUndef(q.amount_to));
   if (amountCond) conditions.push(amountCond);
 
+  const payableCond = numberFieldCondition(
+    "payableAmount",
+    trimUndef(q.payableAmount),
+    trimUndef(q.payableAmount_op),
+    trimUndef(q.payableAmount_to),
+  );
+  if (payableCond) conditions.push(payableCond);
+
   const dateCond = createdAtCondition(
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
   );
   if (dateCond) conditions.push(dateCond);
+
+  const hasAmendment = trimUndef(q.hasAmendment);
+  if (hasAmendment === "yes") {
+    conditions.push({
+      $or: [{ amendmentCount: { $gt: 0 } }, { "amendmentHistory.0": { $exists: true } }],
+    });
+  } else if (hasAmendment === "no") {
+    conditions.push({
+      $nor: [{ amendmentCount: { $gt: 0 } }, { "amendmentHistory.0": { $exists: true } }],
+    });
+  }
 
   if (conditions.length === 0) {
     return {};
@@ -441,6 +462,7 @@ export async function listWithdrawals(query: ListWithdrawalQuery, options?: { ac
       .populate("player", "playerId phone")
       .populate("payoutBankId", "holderName bankName accountNumber")
       .populate("createdBy", "fullName username")
+      .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
       .skip(skip)
       .limit(pageSize)
@@ -592,7 +614,147 @@ export async function exportWithdrawalsToBuffer(query: ListWithdrawalQuery): Pro
     { header: "Status", key: "status" },
     { header: "UTR", key: "utr" },
     { header: "Payout Bank", key: "payoutBankName" },
+    { header: "Amendment Count", key: "amendmentCount" },
+    {
+      header: "Last Amended At",
+      transform: (r) => (r.lastAmendedAt ? new Date(r.lastAmendedAt).toISOString() : ""),
+    },
     { header: "Created By", transform: (r) => (r.createdBy as any)?.fullName ?? "" },
     { header: "Created At", transform: (r) => (r.createdAt ? new Date(r.createdAt).toISOString() : "") },
   ], "Withdrawals");
+}
+
+export async function amendWithdrawal(
+  id: string,
+  input: AmendWithdrawalInput,
+  actorId: string,
+  requestId?: string,
+) {
+  const doc = await WithdrawalModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
+  if (doc.status !== "approved") {
+    throw new AppError("business_rule_error", "Only approved withdrawals can be amended", 400);
+  }
+  if (!doc.payoutBankId) {
+    throw new AppError("business_rule_error", "Withdrawal has no payout bank linked", 400);
+  }
+
+  const newBank = await BankModel.findById(input.payoutBankId);
+  if (!newBank) throw new AppError("not_found", "Bank not found", 404);
+  if (newBank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+  const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
+  const newPayable = payableFromAmounts(input.amount, input.reverseBonus);
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.WITHDRAWAL_FINAL_AMEND);
+  const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
+  const oldBankId = String(doc.payoutBankId);
+  const newBankId = input.payoutBankId;
+
+  const oldSnapshot: WithdrawalAmendmentSnapshot = {
+    amount: doc.amount,
+    reverseBonus: doc.reverseBonus,
+    payableAmount: doc.payableAmount,
+    payoutBankId: oldBankId,
+    payoutBankName: doc.payoutBankName,
+    utr: doc.utr,
+  };
+  const newSnapshot: WithdrawalAmendmentSnapshot = {
+    amount: input.amount,
+    reverseBonus: input.reverseBonus,
+    payableAmount: newPayable,
+    payoutBankId: newBankId,
+    payoutBankName: bankDisplayName(newBank),
+    utr: input.utr.trim(),
+  };
+
+  let rollbackBankChanges: (() => Promise<void>) | null = null;
+  if (oldBankId === newBankId) {
+    const bank = await BankModel.findById(oldBankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    const prevBal = bank.currentBalance ?? bank.openingBalance;
+    const delta = newPayable - oldPayable;
+    bank.currentBalance = prevBal - delta;
+    await bank.save();
+    rollbackBankChanges = async () => {
+      bank.currentBalance = prevBal;
+      await bank.save();
+    };
+  } else {
+    const oldBank = await BankModel.findById(oldBankId);
+    if (!oldBank) throw new AppError("not_found", "Bank not found", 404);
+    const oldPrev = oldBank.currentBalance ?? oldBank.openingBalance;
+    oldBank.currentBalance = oldPrev + oldPayable;
+    await oldBank.save();
+
+    const newBankDoc = await BankModel.findById(newBankId);
+    if (!newBankDoc) {
+      oldBank.currentBalance = oldPrev;
+      await oldBank.save();
+      throw new AppError("not_found", "Bank not found", 404);
+    }
+    const newPrev = newBankDoc.currentBalance ?? newBankDoc.openingBalance;
+    newBankDoc.currentBalance = newPrev - newPayable;
+    try {
+      await newBankDoc.save();
+    } catch (err) {
+      oldBank.currentBalance = oldPrev;
+      await oldBank.save();
+      throw err;
+    }
+    rollbackBankChanges = async () => {
+      oldBank.currentBalance = oldPrev;
+      await oldBank.save();
+      newBankDoc.currentBalance = newPrev;
+      await newBankDoc.save();
+    };
+  }
+
+  try {
+    doc.amount = input.amount;
+    doc.reverseBonus = input.reverseBonus;
+    doc.payableAmount = newPayable;
+    doc.payoutBankId = new Types.ObjectId(newBankId);
+    doc.payoutBankName = newSnapshot.payoutBankName ?? doc.payoutBankName;
+    doc.utr = input.utr.trim();
+    doc.amendmentCount = (doc.amendmentCount ?? 0) + 1;
+    doc.lastAmendedAt = new Date();
+    doc.lastAmendedBy = new Types.ObjectId(actorId);
+    const history = doc.amendmentHistory ?? [];
+    history.push({
+      at: new Date(),
+      by: new Types.ObjectId(actorId),
+      reason: amendReasonText,
+      old: oldSnapshot,
+      new: newSnapshot,
+    });
+    doc.amendmentHistory = history;
+    await doc.save();
+  } catch (err) {
+    if (rollbackBankChanges) await rollbackBankChanges();
+    throw err;
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "withdrawal.amend",
+    entity: "withdrawal",
+    entityId: doc._id.toString(),
+    oldValue: oldSnapshot as unknown as Record<string, unknown>,
+    newValue: {
+      ...newSnapshot,
+      reason: amendReasonText,
+      reasonId: resolved.id,
+      remark: input.remark?.trim() || undefined,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      await recomputeExchangeCurrentBalance(String(player.exchange));
+    }
+  }
+
+  return doc;
 }

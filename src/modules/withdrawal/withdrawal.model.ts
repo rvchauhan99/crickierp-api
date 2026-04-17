@@ -3,6 +3,23 @@ import { Schema, model, Types } from "mongoose";
 /** requested = awaiting banker payout UTR; approved = banker completed; rejected; finalized = closed */
 export type WithdrawalStatus = "requested" | "approved" | "rejected" | "finalized";
 
+export interface WithdrawalAmendmentSnapshot {
+  amount?: number;
+  reverseBonus?: number;
+  payableAmount?: number;
+  payoutBankId?: string;
+  payoutBankName?: string;
+  utr?: string;
+}
+
+export interface WithdrawalAmendmentEntry {
+  at: Date;
+  by: Types.ObjectId;
+  reason: string;
+  old: WithdrawalAmendmentSnapshot;
+  new: WithdrawalAmendmentSnapshot;
+}
+
 export interface WithdrawalDocument {
   _id: Types.ObjectId;
   /** Set on new rows; legacy rows may omit until backfill */
@@ -30,9 +47,36 @@ export interface WithdrawalDocument {
   /** @deprecated Legacy queue field; list uses `view` query instead */
   stage?: "exchange" | "banker" | "final";
   createdBy: Types.ObjectId;
+  amendmentCount?: number;
+  lastAmendedAt?: Date;
+  lastAmendedBy?: Types.ObjectId;
+  amendmentHistory?: WithdrawalAmendmentEntry[];
   createdAt: Date;
   updatedAt: Date;
 }
+
+const withdrawalAmendmentSnapshotSchema = new Schema<WithdrawalAmendmentSnapshot>(
+  {
+    amount: { type: Number },
+    reverseBonus: { type: Number },
+    payableAmount: { type: Number },
+    payoutBankId: { type: String, trim: true },
+    payoutBankName: { type: String, trim: true },
+    utr: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
+const withdrawalAmendmentEntrySchema = new Schema<WithdrawalAmendmentEntry>(
+  {
+    at: { type: Date, required: true },
+    by: { type: Schema.Types.ObjectId, required: true, ref: "User" },
+    reason: { type: String, required: true, trim: true },
+    old: { type: withdrawalAmendmentSnapshotSchema, required: true },
+    new: { type: withdrawalAmendmentSnapshotSchema, required: true },
+  },
+  { _id: false },
+);
 
 const withdrawalSchema = new Schema<WithdrawalDocument>(
   {
@@ -57,6 +101,10 @@ const withdrawalSchema = new Schema<WithdrawalDocument>(
     },
     stage: { type: String, enum: ["exchange", "banker", "final"] },
     createdBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },
+    amendmentCount: { type: Number, min: 0, default: 0 },
+    lastAmendedAt: { type: Date },
+    lastAmendedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    amendmentHistory: { type: [withdrawalAmendmentEntrySchema], default: [] },
   },
   { timestamps: true },
 );

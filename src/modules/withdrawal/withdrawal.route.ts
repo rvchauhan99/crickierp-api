@@ -4,6 +4,7 @@ import { permissionMiddleware } from "../../shared/middlewares/permission.middle
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import { validate } from "../../shared/middlewares/validate.middleware";
 import {
+  amendWithdrawalController,
   createWithdrawalController,
   listSavedAccountsController,
   listWithdrawalController,
@@ -15,6 +16,7 @@ import {
 import { withdrawalListPermissionMiddleware } from "./withdrawal.list.middleware";
 import { withdrawalStatusPermissionMiddleware } from "./withdrawal.status.middleware";
 import {
+  amendWithdrawalBodySchema,
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
@@ -51,6 +53,13 @@ withdrawalRouter.patch(
   permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
   validate({ body: withdrawalBankerPayoutBodySchema }),
   updateWithdrawalBankerController,
+);
+
+withdrawalRouter.post(
+  "/:id/amend",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_FINAL_VIEW),
+  validate({ body: amendWithdrawalBodySchema }),
+  amendWithdrawalController,
 );
 
 withdrawalRouter.patch(

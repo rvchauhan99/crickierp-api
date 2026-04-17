@@ -8,10 +8,12 @@ import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
+import type { DepositAmendmentSnapshot } from "./deposit.model";
 import { DepositModel, DepositStatus } from "./deposit.model";
-import { listDepositQuerySchema } from "./deposit.validation";
+import { amendDepositBodySchema, listDepositQuerySchema } from "./deposit.validation";
 
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
+type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
 
 function pageSizeFromQuery(q: ListDepositQuery): number {
   return q.limit ?? q.pageSize;
@@ -211,6 +213,17 @@ function buildDepositListFilter(q: ListDepositQuery): Record<string, unknown> {
     conditions.push(dateCond);
   }
 
+  const hasAmendment = trimUndef(q.hasAmendment);
+  if (hasAmendment === "yes") {
+    conditions.push({
+      $or: [{ amendmentCount: { $gt: 0 } }, { "amendmentHistory.0": { $exists: true } }],
+    });
+  } else if (hasAmendment === "no") {
+    conditions.push({
+      $nor: [{ amendmentCount: { $gt: 0 } }, { "amendmentHistory.0": { $exists: true } }],
+    });
+  }
+
   const amt = numberFieldCondition(
     "amount",
     trimUndef(q.amount),
@@ -384,6 +397,7 @@ export async function listDeposits(query: ListDepositQuery, options?: { actorId?
       .populate("player", "playerId phone exchange")
       .populate("createdBy", "fullName username")
       .populate("exchangeActionBy", "fullName username")
+      .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
       .skip(skip)
       .limit(pageSize)
@@ -445,6 +459,11 @@ export async function exportDepositsToBuffer(query: ListDepositQuery): Promise<B
     { header: "Status", key: "status" },
     { header: "Bonus amount", key: "bonusAmount" },
     { header: "Total amount", key: "totalAmount" },
+    { header: "Amendment count", key: "amendmentCount" },
+    {
+      header: "Last amended at",
+      transform: (r) => (r.lastAmendedAt ? new Date(r.lastAmendedAt).toISOString() : ""),
+    },
     { header: "Reject reason", key: "rejectReason" },
     { header: "Bank balance after", key: "bankBalanceAfter" },
     { header: "Settled at", transform: (r) => (r.settledAt ? new Date(r.settledAt).toISOString() : "") },
@@ -585,5 +604,173 @@ export async function exchangeRejectDeposit(
     },
     requestId,
   });
+  return doc;
+}
+
+/**
+ * In-place amendment for settled (`verified`) deposits. Updates bank cash balance delta,
+ * exchange recomputation for affected players, and appends `amendmentHistory`.
+ */
+export async function amendVerifiedDeposit(
+  id: string,
+  input: AmendDepositInput,
+  actorId: string,
+  requestId?: string,
+) {
+  const doc = await DepositModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+  if (doc.status !== "verified") {
+    throw new AppError("business_rule_error", "Only verified deposits can be amended", 400);
+  }
+  if (!doc.bankId || !doc.player) {
+    throw new AppError("business_rule_error", "Deposit is missing bank or player", 400);
+  }
+
+  const utrTrim = input.utr.trim();
+  if (utrTrim !== doc.utr) {
+    const exists = await utrConflictsWithNonRejected(utrTrim, doc._id);
+    if (exists) throw new AppError("business_rule_error", "UTR already exists", 409);
+  }
+
+  const newBankDoc = await BankModel.findById(input.bankId);
+  if (!newBankDoc) throw new AppError("not_found", "Bank not found", 404);
+  if (newBankDoc.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+  const newPlayerDoc = await PlayerModel.findById(input.playerId).select("exchange");
+  if (!newPlayerDoc) throw new AppError("not_found", "Player not found", 404);
+  if (!newPlayerDoc.exchange) {
+    throw new AppError("business_rule_error", "Player has no exchange assigned", 400);
+  }
+
+  const bonus = Math.round(Number(input.bonusAmount) * 100) / 100;
+  const totalAmount = Math.round((input.amount + bonus) * 100) / 100;
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.DEPOSIT_FINAL_AMEND);
+  const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
+
+  const oldBankId = doc.bankId;
+  const oldAmount = doc.amount;
+  const newBankId = new Types.ObjectId(input.bankId);
+  const newAmount = input.amount;
+
+  const oldSnapshot: DepositAmendmentSnapshot = {
+    bankId: doc.bankId?.toString(),
+    bankName: doc.bankName,
+    utr: doc.utr,
+    amount: doc.amount,
+    playerId: doc.player?.toString(),
+    bonusAmount: doc.bonusAmount,
+    totalAmount: doc.totalAmount,
+  };
+
+  const newSnapshotPlain: DepositAmendmentSnapshot = {
+    bankId: input.bankId,
+    bankName: bankDisplayName(newBankDoc),
+    utr: utrTrim,
+    amount: input.amount,
+    playerId: input.playerId,
+    bonusAmount: bonus,
+    totalAmount,
+  };
+
+  let newBankBalanceAfter: number;
+  let rollbackBanks: (() => Promise<void>) | null = null;
+
+  if (String(oldBankId) === String(newBankId)) {
+    const bank = await BankModel.findById(oldBankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    const prevBal = bank.currentBalance ?? bank.openingBalance;
+    const delta = newAmount - oldAmount;
+    const nextBal = prevBal + delta;
+    bank.currentBalance = nextBal;
+    await bank.save();
+    newBankBalanceAfter = nextBal;
+    rollbackBanks = async () => {
+      bank.currentBalance = prevBal;
+      await bank.save();
+    };
+  } else {
+    const oldBank = await BankModel.findById(oldBankId);
+    if (!oldBank) throw new AppError("not_found", "Bank not found", 404);
+    const prevOld = oldBank.currentBalance ?? oldBank.openingBalance;
+    oldBank.currentBalance = prevOld - oldAmount;
+    await oldBank.save();
+
+    const creditBank = await BankModel.findById(newBankId);
+    if (!creditBank) {
+      oldBank.currentBalance = prevOld;
+      await oldBank.save();
+      throw new AppError("not_found", "Bank not found", 404);
+    }
+    const prevNew = creditBank.currentBalance ?? creditBank.openingBalance;
+    creditBank.currentBalance = prevNew + newAmount;
+    try {
+      await creditBank.save();
+    } catch (err) {
+      oldBank.currentBalance = prevOld;
+      await oldBank.save();
+      throw err;
+    }
+    newBankBalanceAfter = creditBank.currentBalance ?? creditBank.openingBalance;
+
+    rollbackBanks = async () => {
+      oldBank.currentBalance = prevOld;
+      await oldBank.save();
+      creditBank.currentBalance = prevNew;
+      await creditBank.save();
+    };
+  }
+
+  const oldPlayerId = doc.player;
+
+  try {
+    doc.bankId = newBankId;
+    doc.bankName = newSnapshotPlain.bankName ?? doc.bankName;
+    doc.utr = utrTrim;
+    doc.amount = input.amount;
+    doc.player = new Types.ObjectId(input.playerId);
+    doc.bonusAmount = bonus;
+    doc.totalAmount = totalAmount;
+    doc.bankBalanceAfter = newBankBalanceAfter;
+    doc.amendmentCount = (doc.amendmentCount ?? 0) + 1;
+    doc.lastAmendedAt = new Date();
+    doc.lastAmendedBy = new Types.ObjectId(actorId);
+    const history = doc.amendmentHistory ?? [];
+    history.push({
+      at: new Date(),
+      by: new Types.ObjectId(actorId),
+      reason: amendReasonText,
+      old: oldSnapshot,
+      new: newSnapshotPlain,
+    });
+    doc.amendmentHistory = history;
+    await doc.save();
+  } catch (err) {
+    if (rollbackBanks) await rollbackBanks();
+    throw err;
+  }
+
+  const oldPlayer = await PlayerModel.findById(oldPlayerId).select("exchange");
+  const exchanges = new Set<string>();
+  if (oldPlayer?.exchange) exchanges.add(String(oldPlayer.exchange));
+  if (newPlayerDoc.exchange) exchanges.add(String(newPlayerDoc.exchange));
+  for (const ex of exchanges) {
+    await recomputeExchangeCurrentBalance(ex);
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "deposit.amend",
+    entity: "deposit",
+    entityId: doc._id.toString(),
+    oldValue: oldSnapshot as unknown as Record<string, unknown>,
+    newValue: {
+      ...newSnapshotPlain,
+      reason: amendReasonText,
+      reasonId: resolved.id,
+      remark: input.remark?.trim() || undefined,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
   return doc;
 }

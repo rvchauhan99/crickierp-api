@@ -1,7 +1,7 @@
 import { ReasonModel } from "../masters/reason.model";
-import type { RejectionReasonType } from "../../shared/constants/reasonTypes";
+import type { ReasonType } from "../../shared/constants/reasonTypes";
 
-export async function listActiveReasonOptions(reasonType: RejectionReasonType, limit: number) {
+export async function listActiveReasonOptions(reasonType: ReasonType, limit: number) {
   const rows = await ReasonModel.find({
     reasonType,
     isActive: true,

@@ -35,6 +35,8 @@ export const listDepositQuerySchema = z.object({
   createdAt_from: z.string().optional(),
   createdAt_to: z.string().optional(),
   createdAt_op: z.string().optional(),
+  /** Filter: deposits that have at least one amendment (`yes`) or none (`no`). */
+  hasAmendment: z.enum(["yes", "no"]).optional(),
 });
 
 export const exchangeActionBodySchema = z.discriminatedUnion("action", [
@@ -49,3 +51,14 @@ export const exchangeActionBodySchema = z.discriminatedUnion("action", [
     remark: z.string().max(2000).trim().optional(),
   }),
 ]);
+
+/** Post-settlement amendment for verified deposits (bank + UTR + amount + player + bonus). */
+export const amendDepositBodySchema = z.object({
+  bankId: z.string().length(24),
+  utr: z.string().min(4).max(120).trim(),
+  amount: z.number().min(1),
+  playerId: z.string().length(24),
+  bonusAmount: z.number().min(0),
+  reasonId: z.string().length(24),
+  remark: z.string().max(2000).trim().optional(),
+});

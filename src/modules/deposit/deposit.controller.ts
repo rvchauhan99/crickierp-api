@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
+  amendVerifiedDeposit,
   createDeposit,
   exchangeApproveDeposit,
   exchangeRejectDeposit,
@@ -9,6 +10,7 @@ import {
   updateDepositByBanker,
 } from "./deposit.service";
 import {
+  amendDepositBodySchema,
   createDepositBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
@@ -43,6 +45,13 @@ export async function exportDepositController(req: Request, res: Response) {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   );
   res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function amendDepositController(req: Request, res: Response) {
+  const body = amendDepositBodySchema.parse(req.body);
+  const id = String(req.params.id);
+  const data = await amendVerifiedDeposit(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function exchangeActionController(req: Request, res: Response) {
