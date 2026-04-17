@@ -5,6 +5,7 @@ export type AuthTokenPayload = JwtPayload & {
   userId: string;
   role: string;
   permissions: string[];
+  timezone?: string;
 };
 
 export function signAccessToken(payload: AuthTokenPayload) {

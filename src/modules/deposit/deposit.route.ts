@@ -1,10 +1,13 @@
 import { Router } from "express";
 import { authMiddleware } from "../../shared/middlewares/auth.middleware";
-import { permissionMiddleware } from "../../shared/middlewares/permission.middleware";
+import { anyPermissionMiddleware, permissionMiddleware } from "../../shared/middlewares/permission.middleware";
+import { requireSuperadminMiddleware } from "../../shared/middlewares/superadmin.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import { validate } from "../../shared/middlewares/validate.middleware";
 import {
+  amendDepositController,
   createDepositController,
+  deleteDepositController,
   exchangeActionController,
   exportDepositController,
   listDepositController,
@@ -12,6 +15,7 @@ import {
 } from "./deposit.controller";
 import { depositListPermissionMiddleware } from "./deposit.list.middleware";
 import {
+  amendDepositBodySchema,
   createDepositBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
@@ -56,5 +60,14 @@ depositRouter.post(
   validate({ body: exchangeActionBodySchema }),
   exchangeActionController,
 );
+
+depositRouter.post(
+  "/:id/amend",
+  anyPermissionMiddleware([PERMISSIONS.DEPOSIT_FINAL_VIEW]),
+  validate({ body: amendDepositBodySchema }),
+  amendDepositController,
+);
+
+depositRouter.delete("/:id", requireSuperadminMiddleware, deleteDepositController);
 
 export { depositRouter };

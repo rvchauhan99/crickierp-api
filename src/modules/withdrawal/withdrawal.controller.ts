@@ -1,7 +1,9 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
+  amendWithdrawal,
   createWithdrawal,
+  deleteWithdrawalWithReversal,
   listSavedAccountsForPlayer,
   listWithdrawals,
   updateWithdrawalByExchange,
@@ -10,12 +12,14 @@ import {
   exportWithdrawalsToBuffer,
 } from "./withdrawal.service";
 import {
+  amendWithdrawalBodySchema,
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
+import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function createWithdrawalController(req: Request, res: Response) {
   const body = createWithdrawalBodySchema.parse(req.body);
@@ -25,7 +29,8 @@ export async function createWithdrawalController(req: Request, res: Response) {
 
 export async function listWithdrawalController(req: Request, res: Response) {
   const query = listWithdrawalQuerySchema.parse(req.query);
-  const result = await listWithdrawals(query, { actorId: req.user!.userId });
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await listWithdrawals(query, { actorId: req.user!.userId, timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
@@ -43,9 +48,23 @@ export async function updateWithdrawalBankerController(req: Request, res: Respon
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
+export async function amendWithdrawalController(req: Request, res: Response) {
+  const body = amendWithdrawalBodySchema.parse(req.body);
+  const id = String(req.params.id);
+  const data = await amendWithdrawal(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function deleteWithdrawalController(req: Request, res: Response) {
+  const id = String(req.params.id);
+  const data = await deleteWithdrawalWithReversal(id, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
 export async function exportWithdrawalController(req: Request, res: Response) {
   const query = listWithdrawalQuerySchema.parse(req.query);
-  const buffer = await exportWithdrawalsToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportWithdrawalsToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="withdrawals-export.xlsx"');
   res.setHeader(
     "Content-Type",

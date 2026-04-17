@@ -4,6 +4,7 @@ import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { ExchangeModel } from "../exchange/exchange.model";
 import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
+import { DEFAULT_TIMEZONE, formatDateTimeForTimeZone } from "../../shared/utils/timezone";
 import { ExchangeTopupModel } from "./exchange-topup.model";
 
 export async function createExchangeTopup(
@@ -52,7 +53,7 @@ export async function listExchangeTopups(query: {
   page: number;
   pageSize: number;
   sortOrder: "asc" | "desc";
-}) {
+}, _options?: { timeZone?: string }) {
   const filter: Record<string, unknown> = {};
   if (query.exchangeId) {
     if (!Types.ObjectId.isValid(query.exchangeId)) {
@@ -90,12 +91,13 @@ const EXPORT_MAX_ROWS = 10_000;
 export async function exportExchangeTopupsToBuffer(query: {
   exchangeId?: string;
   sortOrder: "asc" | "desc";
-}): Promise<Buffer> {
+}, options?: { timeZone?: string }): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const result = await listExchangeTopups({
     ...query,
     page: 1,
     pageSize: EXPORT_MAX_ROWS,
-  });
+  }, options);
 
   const exportData = result.rows.map((r) => {
     const exchange = r.exchangeId as { name?: string; provider?: string } | null;
@@ -107,7 +109,7 @@ export async function exportExchangeTopupsToBuffer(query: {
     }
 
     return {
-      Date: r.createdAt ? new Date(r.createdAt).toISOString() : "",
+      Date: formatDateTimeForTimeZone(r.createdAt, timeZone),
       Exchange: exchange?.name || "",
       Provider: exchange?.provider || "",
       Amount: r.amount,

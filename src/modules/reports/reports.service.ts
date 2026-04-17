@@ -2,11 +2,20 @@ import { Types } from "mongoose";
 import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { AuditLogModel } from "../audit/audit.model";
+import { BankModel } from "../bank/bank.model";
 import { ExchangeModel } from "../exchange/exchange.model";
+import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { UserModel } from "../users/user.model";
 import { ExpenseModel, type ExpenseStatus } from "../expense/expense.model";
 import { AUDIT_ENTITY_AUTH } from "../../shared/constants/auditEntities";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateForTimeZone,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd as ymdToUtcEndInZone,
+  ymdToUtcStart as ymdToUtcStartInZone,
+} from "../../shared/utils/timezone";
 import {
   dashboardSummaryQuerySchema,
   expenseAnalysisFilterQuerySchema,
@@ -31,64 +40,51 @@ type DateRangeQuery = {
   toDate?: string;
 };
 
-function buildDateFilter(query: DateRangeQuery) {
+function buildDateFilter(query: DateRangeQuery, timeZone: string) {
   if (!query.fromDate && !query.toDate) return {};
   const createdAt: { $gte?: Date; $lte?: Date } = {};
-  if (query.fromDate) createdAt.$gte = new Date(query.fromDate);
-  if (query.toDate) createdAt.$lte = new Date(`${query.toDate}T23:59:59.999Z`);
+  if (query.fromDate) createdAt.$gte = ymdToUtcStartInZone(query.fromDate, timeZone) ?? undefined;
+  if (query.toDate) createdAt.$lte = ymdToUtcEndInZone(query.toDate, timeZone) ?? undefined;
   return { createdAt };
 }
 
 const DASHBOARD_DEFAULT_DAYS = 30;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
-
-function ymdToUtcStart(ymd: string): Date {
-  return new Date(`${ymd}T00:00:00.000Z`);
-}
-
-function ymdToUtcEnd(ymd: string): Date {
-  return new Date(`${ymd}T23:59:59.999Z`);
-}
-
-function toYMDUtc(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
-function resolveDashboardRange(query: DashboardSummaryQuery): { fromDate: string; toDate: string } {
-  const today = new Date();
-  const todayYmd = toYMDUtc(today);
+function resolveDashboardRange(query: DashboardSummaryQuery, timeZone: string): { fromDate: string; toDate: string } {
+  const todayYmd = formatDateForTimeZone(new Date(), timeZone);
 
   const toDate = query.toDate ?? todayYmd;
   const fromDate =
     query.fromDate ??
-    toYMDUtc(new Date(new Date(`${toDate}T00:00:00.000Z`).getTime() - (DASHBOARD_DEFAULT_DAYS - 1) * ONE_DAY_MS));
+    formatDateForTimeZone(
+      new Date((ymdToUtcStartInZone(toDate, timeZone) ?? new Date()).getTime() - (DASHBOARD_DEFAULT_DAYS - 1) * ONE_DAY_MS),
+      timeZone,
+    );
 
   if (fromDate <= toDate) return { fromDate, toDate };
   return { fromDate: toDate, toDate: fromDate };
 }
 
-function dateRangeYmd(fromDate: string, toDate: string): string[] {
-  const startMs = new Date(`${fromDate}T00:00:00.000Z`).getTime();
-  const endMs = new Date(`${toDate}T00:00:00.000Z`).getTime();
+function dateRangeYmd(fromDate: string, toDate: string, timeZone: string): string[] {
+  const startMs = (ymdToUtcStartInZone(fromDate, timeZone) ?? new Date()).getTime();
+  const endMs = (ymdToUtcStartInZone(toDate, timeZone) ?? new Date()).getTime();
   const days: string[] = [];
   for (let cursor = startMs; cursor <= endMs; cursor += ONE_DAY_MS) {
-    days.push(toYMDUtc(new Date(cursor)));
+    days.push(formatDateForTimeZone(new Date(cursor), timeZone));
   }
   return days;
 }
 
-function resolveIstTodayRange(now: Date = new Date()): { startUtc: Date; endUtc: Date; ymd: string } {
-  const istNow = new Date(now.getTime() + IST_OFFSET_MS);
-  const year = istNow.getUTCFullYear();
-  const month = istNow.getUTCMonth();
-  const day = istNow.getUTCDate();
-  const startUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0) - IST_OFFSET_MS;
-  const endUtcMs = startUtcMs + ONE_DAY_MS - 1;
-  const ymd = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+function resolveTodayRangeForTimeZone(
+  timeZone: string,
+  now: Date = new Date(),
+): { startUtc: Date; endUtc: Date; ymd: string } {
+  const ymd = formatDateForTimeZone(now, timeZone);
+  const startUtc = ymdToUtcStartInZone(ymd, timeZone) ?? now;
+  const endUtc = ymdToUtcEndInZone(ymd, timeZone) ?? now;
   return {
-    startUtc: new Date(startUtcMs),
-    endUtc: new Date(endUtcMs),
+    startUtc,
+    endUtc,
     ymd,
   };
 }
@@ -98,6 +94,8 @@ type DashboardTxnTypeFilter = "all" | "deposit" | "withdrawal" | "expense";
 
 type DashboardFilterContext = {
   dateFilter: Record<string, unknown>;
+  depositDateFilter: Record<string, unknown>;
+  withdrawalDateFilter: Record<string, unknown>;
   appliedRange: { fromDate: string; toDate: string };
   exchangeObjectId: Types.ObjectId | null;
   scopedPlayerIds: Types.ObjectId[] | null;
@@ -106,6 +104,46 @@ type DashboardFilterContext = {
   expenseFilter: Record<string, unknown>;
   exchangeStatsFilter: Record<string, unknown>;
 };
+
+function businessDateRangeExpr(field: "entryAt" | "requestedAt", startUtc: Date | null, endUtc: Date | null) {
+  if (!startUtc || !endUtc) return {};
+  const txExpr = { $ifNull: [`$${field}`, "$createdAt"] };
+  return {
+    $expr: {
+      $and: [{ $gte: [txExpr, startUtc] }, { $lte: [txExpr, endUtc] }],
+    },
+  };
+}
+
+function businessDateBeforeExpr(field: "entryAt" | "requestedAt", beforeUtc: Date | null) {
+  if (!beforeUtc) return {};
+  const txExpr = { $ifNull: [`$${field}`, "$createdAt"] };
+  return {
+    $expr: {
+      $lt: [txExpr, beforeUtc],
+    },
+  };
+}
+
+function liabilityDateRangeExpr(startUtc: Date | null, endUtc: Date | null) {
+  if (!startUtc || !endUtc) return {};
+  const txExpr = { $ifNull: ["$entryDate", "$createdAt"] };
+  return {
+    $expr: {
+      $and: [{ $gte: [txExpr, startUtc] }, { $lte: [txExpr, endUtc] }],
+    },
+  };
+}
+
+function liabilityDateBeforeExpr(beforeUtc: Date | null) {
+  if (!beforeUtc) return {};
+  const txExpr = { $ifNull: ["$entryDate", "$createdAt"] };
+  return {
+    $expr: {
+      $lt: [txExpr, beforeUtc],
+    },
+  };
+}
 
 function statusFilterForDeposit(status: DashboardStatusFilter | undefined): Record<string, unknown> {
   if (status === "pending") return { status: "pending" };
@@ -128,14 +166,21 @@ function statusFilterForExpense(status: DashboardStatusFilter | undefined): Reco
   return {};
 }
 
-async function buildDashboardFilterContext(query: DashboardSummaryQuery): Promise<DashboardFilterContext> {
-  const appliedRange = resolveDashboardRange(query);
+async function buildDashboardFilterContext(
+  query: DashboardSummaryQuery,
+  timeZone: string,
+): Promise<DashboardFilterContext> {
+  const appliedRange = resolveDashboardRange(query, timeZone);
+  const rangeStartUtc = ymdToUtcStartInZone(appliedRange.fromDate, timeZone);
+  const rangeEndUtc = ymdToUtcEndInZone(appliedRange.toDate, timeZone);
   const dateFilter = {
     createdAt: {
-      $gte: ymdToUtcStart(appliedRange.fromDate),
-      $lte: ymdToUtcEnd(appliedRange.toDate),
+      $gte: rangeStartUtc,
+      $lte: rangeEndUtc,
     },
   };
+  const depositDateFilter = businessDateRangeExpr("entryAt", rangeStartUtc, rangeEndUtc);
+  const withdrawalDateFilter = businessDateRangeExpr("requestedAt", rangeStartUtc, rangeEndUtc);
 
   const exchangeObjectId =
     query.exchangeId && Types.ObjectId.isValid(query.exchangeId) ? new Types.ObjectId(query.exchangeId) : null;
@@ -202,7 +247,7 @@ async function buildDashboardFilterContext(query: DashboardSummaryQuery): Promis
 
   const depositFilter = isDepositAllowed
     ? {
-        ...dateFilter,
+        ...depositDateFilter,
         ...playerFilter,
         ...(bankObjectId ? { bankId: bankObjectId } : {}),
         ...amountFilter,
@@ -213,7 +258,7 @@ async function buildDashboardFilterContext(query: DashboardSummaryQuery): Promis
 
   const withdrawalFilter = isWithdrawalAllowed
     ? {
-        ...dateFilter,
+        ...withdrawalDateFilter,
         ...playerFilter,
         ...amountFilter,
         ...statusFilterForWithdrawal(status),
@@ -235,6 +280,8 @@ async function buildDashboardFilterContext(query: DashboardSummaryQuery): Promis
 
   return {
     dateFilter,
+    depositDateFilter,
+    withdrawalDateFilter,
     appliedRange,
     exchangeObjectId,
     scopedPlayerIds,
@@ -245,7 +292,11 @@ async function buildDashboardFilterContext(query: DashboardSummaryQuery): Promis
   };
 }
 
-export async function getDashboardSummary(query: DashboardSummaryQuery) {
+export async function getDashboardSummary(
+  query: DashboardSummaryQuery,
+  options?: { timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const { DepositModel } = await import("../deposit/deposit.model");
   const { WithdrawalModel } = await import("../withdrawal/withdrawal.model");
   const {
@@ -256,12 +307,115 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
     withdrawalFilter,
     expenseFilter,
     exchangeStatsFilter,
-  } = await buildDashboardFilterContext(query);
-  const istTodayRange = resolveIstTodayRange();
+  } = await buildDashboardFilterContext(query, timeZone);
+  const rangeStartUtc = ymdToUtcStartInZone(appliedRange.fromDate, timeZone);
+  const rangeEndUtc = ymdToUtcEndInZone(appliedRange.toDate, timeZone);
+  const selectedBankObjectId =
+    query.bankId && Types.ObjectId.isValid(query.bankId) ? new Types.ObjectId(query.bankId) : null;
+  const txType = (query.transactionType as DashboardTxnTypeFilter | undefined) ?? "all";
+  const status = query.status as DashboardStatusFilter | undefined;
+  const includeTransferSummary = txType === "all";
+  const minAmount = query.amountFrom != null ? Number(query.amountFrom) : undefined;
+  const maxAmount = query.amountTo != null ? Number(query.amountTo) : undefined;
+  const liabilityAmountFilter =
+    minAmount != null || maxAmount != null
+      ? {
+          amount: {
+            ...(minAmount != null ? { $gte: minAmount } : {}),
+            ...(maxAmount != null ? { $lte: maxAmount } : {}),
+          },
+        }
+      : {};
+  const liabilitySearchText = query.search?.trim();
+  const liabilitySearchFilter = liabilitySearchText
+    ? {
+        $or: [
+          { referenceNo: { $regex: escapeRegexFragment(liabilitySearchText), $options: "i" } },
+          { remark: { $regex: escapeRegexFragment(liabilitySearchText), $options: "i" } },
+          { entryType: { $regex: escapeRegexFragment(liabilitySearchText), $options: "i" } },
+        ],
+      }
+    : {};
+  const bankSelectionLiabilityFilter = selectedBankObjectId
+    ? {
+        $or: [{ fromAccountId: selectedBankObjectId }, { toAccountId: selectedBankObjectId }],
+      }
+    : {};
+  const liabilityBaseFilter = includeTransferSummary
+    ? { ...liabilityAmountFilter, ...liabilitySearchFilter, ...bankSelectionLiabilityFilter }
+    : { _id: { $exists: false } };
+
+  const { $expr: _depositDateExpr, ...depositFilterNoDate } = depositFilter as Record<string, unknown>;
+  const { $expr: _withdrawalDateExpr, ...withdrawalFilterNoDate } = withdrawalFilter as Record<string, unknown>;
+  const { createdAt: _expenseDateRange, ...expenseFilterNoDate } = expenseFilter as Record<string, unknown>;
+
+  const depositBalanceStatusFilter =
+    status === "all" || !status ? { status: { $in: ["verified", "finalized"] } } : {};
+  const withdrawalBalanceStatusFilter = status === "all" || !status ? { status: "approved" } : {};
+  const expenseBalanceStatusFilter = status === "all" || !status ? { status: "approved" } : {};
+
+  const depositBankRangeFilter = {
+    ...depositFilterNoDate,
+    ...businessDateRangeExpr("entryAt", rangeStartUtc, rangeEndUtc),
+    ...depositBalanceStatusFilter,
+  };
+  const depositBankPriorFilter = {
+    ...depositFilterNoDate,
+    ...businessDateBeforeExpr("entryAt", rangeStartUtc),
+    ...depositBalanceStatusFilter,
+  };
+  const withdrawalBankRangeFilter = {
+    ...withdrawalFilterNoDate,
+    ...businessDateRangeExpr("requestedAt", rangeStartUtc, rangeEndUtc),
+    ...(selectedBankObjectId ? { payoutBankId: selectedBankObjectId } : {}),
+    ...withdrawalBalanceStatusFilter,
+  };
+  const withdrawalBankPriorFilter = {
+    ...withdrawalFilterNoDate,
+    ...businessDateBeforeExpr("requestedAt", rangeStartUtc),
+    ...(selectedBankObjectId ? { payoutBankId: selectedBankObjectId } : {}),
+    ...withdrawalBalanceStatusFilter,
+  };
+  const expenseBankRangeFilter = {
+    ...expenseFilterNoDate,
+    createdAt: {
+      ...(rangeStartUtc ? { $gte: rangeStartUtc } : {}),
+      ...(rangeEndUtc ? { $lte: rangeEndUtc } : {}),
+    },
+    ...expenseBalanceStatusFilter,
+  };
+  const expenseBankPriorFilter = {
+    ...expenseFilterNoDate,
+    createdAt: {
+      ...(rangeStartUtc ? { $lt: rangeStartUtc } : {}),
+    },
+    ...expenseBalanceStatusFilter,
+  };
+  const transferOutRangeFilter = {
+    ...liabilityBaseFilter,
+    fromAccountType: "bank",
+    ...liabilityDateRangeExpr(rangeStartUtc, rangeEndUtc),
+  };
+  const transferOutPriorFilter = {
+    ...liabilityBaseFilter,
+    fromAccountType: "bank",
+    ...liabilityDateBeforeExpr(rangeStartUtc),
+  };
+  const transferInRangeFilter = {
+    ...liabilityBaseFilter,
+    toAccountType: "bank",
+    ...liabilityDateRangeExpr(rangeStartUtc, rangeEndUtc),
+  };
+  const transferInPriorFilter = {
+    ...liabilityBaseFilter,
+    toAccountType: "bank",
+    ...liabilityDateBeforeExpr(rangeStartUtc),
+  };
+  const todayRange = resolveTodayRangeForTimeZone(timeZone);
   const todayPlayerFilter = {
     createdAt: {
-      $gte: istTodayRange.startUtc,
-      $lte: istTodayRange.endUtc,
+      $gte: todayRange.startUtc,
+      $lte: todayRange.endUtc,
     },
     ...(exchangeObjectId ? { exchange: exchangeObjectId } : {}),
   };
@@ -287,6 +441,17 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
     firstTimeDepositTodayAgg,
     exchangeNewPlayersTodayAgg,
     exchangeFirstTimeDepositTodayAgg,
+    activeBanks,
+    depositByBankInRange,
+    depositByBankBeforeRange,
+    withdrawalByBankInRange,
+    withdrawalByBankBeforeRange,
+    expenseByBankInRange,
+    expenseByBankBeforeRange,
+    transferOutByBankInRange,
+    transferOutByBankBeforeRange,
+    transferInByBankInRange,
+    transferInByBankBeforeRange,
   ] = await Promise.all([
     // Deposit: group by status → totalAmount, count, bonusTotal
     DepositModel.aggregate([
@@ -343,7 +508,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
 
     // Recent deposits (last 10, all statuses)
     DepositModel.find({ ...depositFilter })
-      .sort({ createdAt: -1 })
+      .sort({ entryAt: -1, createdAt: -1 })
       .limit(10)
       .populate("player", "playerId name")
       .populate("createdBy", "fullName username")
@@ -351,7 +516,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
 
     // Recent withdrawals (last 10, all statuses)
     WithdrawalModel.find({ ...withdrawalFilter })
-      .sort({ createdAt: -1 })
+      .sort({ requestedAt: -1, createdAt: -1 })
       .limit(10)
       .populate("player", "playerId name")
       .populate("createdBy", "fullName username")
@@ -359,11 +524,16 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
 
     // Deposit daily trend
     DepositModel.aggregate([
-      { $match: { ...depositFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
+      {
+        $match: {
+          ...depositFilter,
+          ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}),
+        },
+      },
       {
         $group: {
           _id: {
-            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+            $dateToString: { format: "%Y-%m-%d", date: { $ifNull: ["$entryAt", "$createdAt"] }, timezone: timeZone },
           },
           totalAmount: { $sum: "$amount" },
           count: { $sum: 1 },
@@ -374,11 +544,20 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
 
     // Withdrawal daily trend
     WithdrawalModel.aggregate([
-      { $match: { ...withdrawalFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
+      {
+        $match: {
+          ...withdrawalFilter,
+          ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}),
+        },
+      },
       {
         $group: {
           _id: {
-            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+            $dateToString: {
+              format: "%Y-%m-%d",
+              date: { $ifNull: ["$requestedAt", "$createdAt"] },
+              timezone: timeZone,
+            },
           },
           totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
           count: { $sum: 1 },
@@ -459,7 +638,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
           { $match: firstDepositBaseMatch },
           {
             $addFields: {
-              firstDepositEventAt: { $ifNull: ["$settledAt", "$createdAt"] },
+              firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
             },
           },
           { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
@@ -473,8 +652,8 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
           {
             $match: {
               firstDepositAt: {
-                $gte: istTodayRange.startUtc,
-                $lte: istTodayRange.endUtc,
+                $gte: todayRange.startUtc,
+                $lte: todayRange.endUtc,
               },
             },
           },
@@ -502,7 +681,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
           { $match: firstDepositBaseMatch },
           {
             $addFields: {
-              firstDepositEventAt: { $ifNull: ["$settledAt", "$createdAt"] },
+              firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
             },
           },
           { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
@@ -516,8 +695,8 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
           {
             $match: {
               firstDepositAt: {
-                $gte: istTodayRange.startUtc,
-                $lte: istTodayRange.endUtc,
+                $gte: todayRange.startUtc,
+                $lte: todayRange.endUtc,
               },
             },
           },
@@ -538,6 +717,110 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
             },
           },
         ]),
+
+    BankModel.find({ status: "active" })
+      .select({ _id: 1, holderName: 1, bankName: 1, openingBalance: 1 })
+      .lean(),
+
+    DepositModel.aggregate([
+      { $match: depositBankRangeFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    DepositModel.aggregate([
+      { $match: depositBankPriorFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
+
+    WithdrawalModel.aggregate([
+      { $match: withdrawalBankRangeFilter },
+      {
+        $group: {
+          _id: "$payoutBankId",
+          totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    WithdrawalModel.aggregate([
+      { $match: withdrawalBankPriorFilter },
+      {
+        $group: {
+          _id: "$payoutBankId",
+          totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+        },
+      },
+    ]),
+
+    ExpenseModel.aggregate([
+      { $match: expenseBankRangeFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    ExpenseModel.aggregate([
+      { $match: expenseBankPriorFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
+
+    LiabilityEntryModel.aggregate([
+      { $match: transferOutRangeFilter },
+      {
+        $group: {
+          _id: "$fromAccountId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    LiabilityEntryModel.aggregate([
+      { $match: transferOutPriorFilter },
+      {
+        $group: {
+          _id: "$fromAccountId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
+
+    LiabilityEntryModel.aggregate([
+      { $match: transferInRangeFilter },
+      {
+        $group: {
+          _id: "$toAccountId",
+          totalAmount: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    LiabilityEntryModel.aggregate([
+      { $match: transferInPriorFilter },
+      {
+        $group: {
+          _id: "$toAccountId",
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]),
   ]);
 
   /* ── Aggregate deposit KPIs ────────────────────────────────────── */
@@ -613,7 +896,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
   const [exchangeTotal, exchangeActive] = exchangeStats;
 
   /* ── Build daily trend (fill missing days with 0) ──────────────── */
-  const allDays = dateRangeYmd(appliedRange.fromDate, appliedRange.toDate);
+  const allDays = dateRangeYmd(appliedRange.fromDate, appliedRange.toDate, timeZone);
 
   const depositTrendMap = new Map(depositTrend.map((r: { _id: string; totalAmount: number; count: number }) => [r._id, r]));
   const withdrawalTrendMap = new Map(withdrawalTrend.map((r: { _id: string; totalAmount: number; count: number }) => [r._id, r]));
@@ -642,7 +925,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
       createdBy: (d.createdBy as AnyRow | undefined)?.fullName ?? "",
       bankName: String(d.bankName ?? ""),
       utr: String(d.utr ?? ""),
-      createdAt: d.createdAt,
+      createdAt: d.entryAt ?? d.createdAt,
     })),
     ...(recentWithdrawals as unknown as AnyRow[]).map((w) => ({
       _id: String(w._id),
@@ -653,7 +936,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
       createdBy: (w.createdBy as AnyRow | undefined)?.fullName ?? "",
       bankName: String(w.bankName ?? ""),
       utr: String(w.utr ?? ""),
-      createdAt: w.createdAt,
+      createdAt: w.requestedAt ?? w.createdAt,
     })),
   ]
     .sort((a, b) => new Date(b.createdAt as string).getTime() - new Date(a.createdAt as string).getTime())
@@ -722,6 +1005,94 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
   const firstTimeDepositAmountToday =
     (firstTimeDepositTodayAgg as Array<{ totalAmount?: number }>)[0]?.totalAmount ?? 0;
 
+  const asNumber = (value: unknown) => Number(value ?? 0);
+  const groupToAmountMap = (rows: Array<{ _id?: unknown; totalAmount?: number }>) => {
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      const id = String(row._id ?? "");
+      if (!Types.ObjectId.isValid(id)) continue;
+      map.set(id, asNumber(row.totalAmount));
+    }
+    return map;
+  };
+  const groupToCountMap = (rows: Array<{ _id?: unknown; count?: number }>) => {
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      const id = String(row._id ?? "");
+      if (!Types.ObjectId.isValid(id)) continue;
+      map.set(id, asNumber(row.count));
+    }
+    return map;
+  };
+
+  const depositInRangeMap = groupToAmountMap(depositByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const depositBeforeMap = groupToAmountMap(depositByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const depositCountMap = groupToCountMap(depositByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const withdrawalInRangeMap = groupToAmountMap(withdrawalByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const withdrawalBeforeMap = groupToAmountMap(
+    withdrawalByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const withdrawalCountMap = groupToCountMap(withdrawalByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const expenseInRangeMap = groupToAmountMap(expenseByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const expenseBeforeMap = groupToAmountMap(expenseByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>);
+  const expenseCountMap = groupToCountMap(expenseByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const transferOutInRangeMap = groupToAmountMap(
+    transferOutByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferOutBeforeMap = groupToAmountMap(
+    transferOutByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferOutCountMap = groupToCountMap(transferOutByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const transferInInRangeMap = groupToAmountMap(
+    transferInByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferInBeforeMap = groupToAmountMap(
+    transferInByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const transferInCountMap = groupToCountMap(transferInByBankInRange as Array<{ _id?: unknown; count?: number }>);
+
+  const banksBreakdown = (activeBanks as Array<{ _id: Types.ObjectId; holderName?: string; bankName?: string; openingBalance?: number }>)
+    .map((bank) => {
+      const bankId = String(bank._id);
+      const baseOpeningBalance = asNumber(bank.openingBalance);
+      const openingBalance =
+        baseOpeningBalance +
+        asNumber(depositBeforeMap.get(bankId)) +
+        asNumber(transferInBeforeMap.get(bankId)) -
+        asNumber(withdrawalBeforeMap.get(bankId)) -
+        asNumber(expenseBeforeMap.get(bankId)) -
+        asNumber(transferOutBeforeMap.get(bankId));
+
+      const deposit = asNumber(depositInRangeMap.get(bankId));
+      const withdrawal = asNumber(withdrawalInRangeMap.get(bankId));
+      const expenses = asNumber(expenseInRangeMap.get(bankId));
+      const transferOut = asNumber(transferOutInRangeMap.get(bankId));
+      const transferIn = asNumber(transferInInRangeMap.get(bankId));
+      const entries =
+        asNumber(depositCountMap.get(bankId)) +
+        asNumber(withdrawalCountMap.get(bankId)) +
+        asNumber(expenseCountMap.get(bankId)) +
+        asNumber(transferOutCountMap.get(bankId)) +
+        asNumber(transferInCountMap.get(bankId));
+      const closingBalance = openingBalance + deposit + transferIn - withdrawal - expenses - transferOut;
+
+      return {
+        bankId,
+        name: `${String(bank.holderName ?? "").trim()} ${String(bank.bankName ?? "").trim()}`.trim() || "Unknown",
+        holderName: String(bank.holderName ?? ""),
+        bankName: String(bank.bankName ?? ""),
+        openingBalance,
+        entries,
+        deposit,
+        withdrawal,
+        expenses,
+        transferOut,
+        transferIn,
+        closingBalance,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
   return {
     meta: {
       fromDate: appliedRange.fromDate,
@@ -730,7 +1101,7 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
       status: query.status ?? "all",
       transactionType: query.transactionType ?? "all",
       scopedPlayerCount: scopedPlayerIds?.length ?? null,
-      todayYmdIst: istTodayRange.ymd,
+      todayYmdIst: todayRange.ymd,
     },
     deposit: {
       totalAmount: depositTotal,
@@ -776,14 +1147,16 @@ export async function getDashboardSummary(query: DashboardSummaryQuery) {
     trendData,
     recentActivity,
     exchangesBreakdown,
+    banksBreakdown,
   };
 }
 
 export async function getTransactionHistory(
   query: TransactionHistoryQuery,
-  options: { scope: AuditHistoryScope },
+  options: { scope: AuditHistoryScope; timeZone?: string },
 ) {
-  const dateFilter = buildDateFilter(query);
+  const timeZone = options.timeZone || DEFAULT_TIMEZONE;
+  const dateFilter = buildDateFilter(query, timeZone);
   const conditions: Record<string, unknown>[] = [];
 
   if (options.scope === "transactions") {
@@ -846,7 +1219,7 @@ export async function getTransactionHistory(
 
 export async function exportTransactionHistoryToBuffer(
   query: TransactionHistoryQuery,
-  options: { scope: AuditHistoryScope },
+  options: { scope: AuditHistoryScope; timeZone?: string },
 ): Promise<Buffer> {
   const result = await getTransactionHistory(
     { ...query, page: 1, pageSize: 10000 },
@@ -854,7 +1227,7 @@ export async function exportTransactionHistoryToBuffer(
   );
 
   const exportData = result.rows.map((r: any) => ({
-    Date: r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    Date: formatDateTimeForTimeZone(r.createdAt, options.timeZone || DEFAULT_TIMEZONE),
     Actor: r.actorId?.fullName || r.actorId?.username || r.actorId || "System",
     Action: r.action || "",
     Entity: r.entity || "",
@@ -880,8 +1253,12 @@ export async function exportTransactionHistoryToBuffer(
   );
 }
 
-export async function exportDashboardSummaryToBuffer(query: DashboardSummaryQuery): Promise<Buffer> {
-  const data = await getDashboardSummary(query);
+export async function exportDashboardSummaryToBuffer(
+  query: DashboardSummaryQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const data = await getDashboardSummary(query, { timeZone });
 
   const kpiData = [
     { KPI: "Total Deposits", Value: data.deposit.totalAmount },
@@ -892,8 +1269,8 @@ export async function exportDashboardSummaryToBuffer(query: DashboardSummaryQuer
     { KPI: "Reverse Bonus", Value: data.withdrawal.reverseBonusTotal },
     { KPI: "Total Expenses", Value: data.expense.totalAmount },
     { KPI: "Net P&L", Value: data.pnl.net },
-    { KPI: "New Players Today (IST)", Value: data.todayMetrics.newPlayersToday },
-    { KPI: "First-Time Deposit Amount Today (IST)", Value: data.todayMetrics.firstTimeDepositAmountToday },
+    { KPI: "New Players Today", Value: data.todayMetrics.newPlayersToday },
+    { KPI: "First-Time Deposit Amount Today", Value: data.todayMetrics.firstTimeDepositAmountToday },
   ];
 
   const exchangeData = data.exchangesBreakdown.map((ex) => ({
@@ -946,15 +1323,19 @@ export async function exportDashboardSummaryToBuffer(query: DashboardSummaryQuer
   ]);
 }
 
-export async function exportExpenseAnalysisToBuffer(query: ExpenseAnalysisRecordsQuery): Promise<Buffer> {
+export async function exportExpenseAnalysisToBuffer(
+  query: ExpenseAnalysisRecordsQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const result = await getExpenseAnalysisRecords({
     ...query,
     page: 1,
     pageSize: 10000,
-  });
+  }, { timeZone });
 
   const exportData = result.rows.map((r: any) => ({
-    Date: r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    Date: formatDateTimeForTimeZone(r.createdAt, timeZone),
     Category: r.categoryName || "",
     Merchant: r.merchantName || "",
     "Bank Account": r.bankAccountName || "",
@@ -993,18 +1374,6 @@ export function listAuditEntityValuesForLogin(): string[] {
   return [AUDIT_ENTITY_AUTH];
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function trimUndef(s: string | undefined): string | undefined {
   if (s == null) return undefined;
   const t = String(s).trim();
@@ -1017,6 +1386,7 @@ function dateFieldCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const f = trimUndef(from);
   const t = trimUndef(to);
@@ -1024,40 +1394,40 @@ function dateFieldCondition(
   const effectiveOp = rawOp || (f && t ? "inRange" : f || t ? "equals" : "");
 
   if (effectiveOp === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStartInZone(f, timeZone);
+    const end = ymdToUtcEndInZone(t, timeZone);
     if (!start || !end) return null;
     return { [field]: { $gte: start, $lte: end } };
   }
   if (effectiveOp === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStartInZone(f, timeZone);
+    const end = ymdToUtcEndInZone(f, timeZone);
     if (!start || !end) return null;
     return { [field]: { $gte: start, $lte: end } };
   }
   if (effectiveOp === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStartInZone(f, timeZone);
     if (!start) return null;
     return { [field]: { $lt: start } };
   }
   if (effectiveOp === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEndInZone(f, timeZone);
     if (!end) return null;
     return { [field]: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStartInZone(f, timeZone);
+    const end = ymdToUtcEndInZone(t, timeZone);
     if (!start || !end) return null;
     return { [field]: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStartInZone(f, timeZone);
     if (!start) return null;
     return { [field]: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEndInZone(t, timeZone);
     if (!end) return null;
     return { [field]: { $lte: end } };
   }
@@ -1132,7 +1502,11 @@ function amountCondition(
   return null;
 }
 
-export function buildExpenseReportFilter(q: ExpenseAnalysisFilterQuery): Record<string, unknown> {
+export function buildExpenseReportFilter(
+  q: ExpenseAnalysisFilterQuery,
+  options?: { timeZone?: string },
+): Record<string, unknown> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -1169,6 +1543,7 @@ export function buildExpenseReportFilter(q: ExpenseAnalysisFilterQuery): Record<
     trimUndef(q.expenseDate_from),
     trimUndef(q.expenseDate_to),
     trimUndef(q.expenseDate_op),
+    timeZone,
   );
   if (expenseDateCond) conditions.push(expenseDateCond);
 
@@ -1177,6 +1552,7 @@ export function buildExpenseReportFilter(q: ExpenseAnalysisFilterQuery): Record<
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (createdAtCond) conditions.push(createdAtCond);
 
@@ -1198,8 +1574,11 @@ export function buildExpenseReportFilter(q: ExpenseAnalysisFilterQuery): Record<
   return { $and: conditions };
 }
 
-export async function getExpenseAnalysisSummary(query: ExpenseAnalysisFilterQuery) {
-  const filter = buildExpenseReportFilter(query);
+export async function getExpenseAnalysisSummary(
+  query: ExpenseAnalysisFilterQuery,
+  options?: { timeZone?: string },
+) {
+  const filter = buildExpenseReportFilter(query, options);
 
   const [summaryAgg, grandAgg] = await Promise.all([
     ExpenseModel.aggregate([
@@ -1255,8 +1634,11 @@ export async function getExpenseAnalysisSummary(query: ExpenseAnalysisFilterQuer
   };
 }
 
-export async function getExpenseAnalysisRecords(query: ExpenseAnalysisRecordsQuery) {
-  const filter = buildExpenseReportFilter(query);
+export async function getExpenseAnalysisRecords(
+  query: ExpenseAnalysisRecordsQuery,
+  options?: { timeZone?: string },
+) {
+  const filter = buildExpenseReportFilter(query, options);
   const page = query.page;
   const pageSize = query.pageSize;
   const skip = (page - 1) * pageSize;

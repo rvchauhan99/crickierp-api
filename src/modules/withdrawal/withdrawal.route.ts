@@ -1,10 +1,13 @@
 import { Router } from "express";
 import { authMiddleware } from "../../shared/middlewares/auth.middleware";
 import { permissionMiddleware } from "../../shared/middlewares/permission.middleware";
+import { requireSuperadminMiddleware } from "../../shared/middlewares/superadmin.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import { validate } from "../../shared/middlewares/validate.middleware";
 import {
+  amendWithdrawalController,
   createWithdrawalController,
+  deleteWithdrawalController,
   listSavedAccountsController,
   listWithdrawalController,
   updateWithdrawalExchangeController,
@@ -15,6 +18,7 @@ import {
 import { withdrawalListPermissionMiddleware } from "./withdrawal.list.middleware";
 import { withdrawalStatusPermissionMiddleware } from "./withdrawal.status.middleware";
 import {
+  amendWithdrawalBodySchema,
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
@@ -53,6 +57,13 @@ withdrawalRouter.patch(
   updateWithdrawalBankerController,
 );
 
+withdrawalRouter.post(
+  "/:id/amend",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_FINAL_VIEW),
+  validate({ body: amendWithdrawalBodySchema }),
+  amendWithdrawalController,
+);
+
 withdrawalRouter.patch(
   "/:id/status",
   withdrawalStatusPermissionMiddleware,
@@ -73,5 +84,7 @@ withdrawalRouter.get(
   validate({ query: listWithdrawalQuerySchema }),
   listWithdrawalController,
 );
+
+withdrawalRouter.delete("/:id", requireSuperadminMiddleware, deleteWithdrawalController);
 
 export { withdrawalRouter };

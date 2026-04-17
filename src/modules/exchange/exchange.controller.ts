@@ -9,6 +9,7 @@ import {
   updateExchange,
 } from "./exchange.service";
 import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
+import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function createExchangeController(req: Request, res: Response) {
   const actorId = req.user!.userId;
@@ -18,13 +19,15 @@ export async function createExchangeController(req: Request, res: Response) {
 
 export async function listExchangeController(req: Request, res: Response) {
   const query = listExchangeQuerySchema.parse(req.query);
-  const data = await listExchanges(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const data = await listExchanges(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: data.rows, meta: data.meta });
 }
 
 export async function exportExchangeController(req: Request, res: Response) {
   const query = listExchangeQuerySchema.parse(req.query);
-  const buffer = await exportExchangesToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportExchangesToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="exchanges-export.xlsx"');
   res.setHeader(
     "Content-Type",
@@ -46,6 +49,7 @@ export async function updateExchangeController(req: Request, res: Response) {
 
 export async function exchangeStatementController(req: Request, res: Response) {
   const query = exchangeStatementQuerySchema.parse(req.query);
-  const data = await getExchangeStatement(String(req.params.id), query);
+  const timeZone = resolveRequestTimeZone(req);
+  const data = await getExchangeStatement(String(req.params.id), query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data });
 }

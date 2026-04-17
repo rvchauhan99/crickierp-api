@@ -5,6 +5,14 @@ import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
 import { ExpenseModel } from "../expense/expense.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateForTimeZone,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcNoon,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { LiabilityEntryModel } from "./liability-entry.model";
 import { LiabilityPersonModel } from "./liability-person.model";
 import { liabilityLedgerQuerySchema, listLiabilityEntryQuerySchema, listLiabilityPersonQuerySchema } from "./liability.validation";
@@ -29,21 +37,8 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function parseYmdToDate(ymd: string): Date {
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 12, 0, 0, 0);
-}
-
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
+function parseYmdToDate(ymd: string, timeZone: string = DEFAULT_TIMEZONE): Date {
+  return ymdToUtcNoon(ymd, timeZone) ?? new Date(ymd);
 }
 
 export async function recomputePersonRollup(personId: string): Promise<void> {
@@ -212,7 +207,7 @@ export async function updateLiabilityPerson(
   return doc;
 }
 
-export async function listLiabilityPersons(query: ListLiabilityPersonQuery) {
+export async function listLiabilityPersons(query: ListLiabilityPersonQuery, _options?: { timeZone?: string }) {
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -319,7 +314,11 @@ export async function createLiabilityEntry(
   return doc;
 }
 
-export async function listLiabilityEntries(query: ListLiabilityEntryQuery) {
+export async function listLiabilityEntries(
+  query: ListLiabilityEntryQuery,
+  options?: { timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -353,8 +352,8 @@ export async function listLiabilityEntries(query: ListLiabilityEntryQuery) {
 
   const from = trimUndef(query.entryDate_from);
   const to = trimUndef(query.entryDate_to);
-  const fromD = from ? ymdStart(from) : null;
-  const toD = to ? ymdEnd(to) : null;
+  const fromD = from ? ymdToUtcStart(from, timeZone) : null;
+  const toD = to ? ymdToUtcEnd(to, timeZone) : null;
   if (fromD || toD) {
     conditions.push({
       entryDate: {
@@ -426,7 +425,12 @@ export async function listLiabilityEntries(query: ListLiabilityEntryQuery) {
   };
 }
 
-export async function getLiabilityPersonLedger(personId: string, query: LedgerQuery) {
+export async function getLiabilityPersonLedger(
+  personId: string,
+  query: LedgerQuery,
+  options?: { timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   if (!Types.ObjectId.isValid(personId)) throw new AppError("validation_error", "Invalid person id", 400);
   const pid = new Types.ObjectId(personId);
   const person = await LiabilityPersonModel.findById(pid).lean();
@@ -441,8 +445,8 @@ export async function getLiabilityPersonLedger(personId: string, query: LedgerQu
     .sort({ entryDate: 1, createdAt: 1 })
     .lean();
 
-  const from = query.fromDate ? ymdStart(query.fromDate) : null;
-  const to = query.toDate ? ymdEnd(query.toDate) : null;
+  const from = query.fromDate ? ymdToUtcStart(query.fromDate, timeZone) : null;
+  const to = query.toDate ? ymdToUtcEnd(query.toDate, timeZone) : null;
 
   let running = person.openingBalance ?? 0;
   const rows: Array<{
@@ -496,7 +500,7 @@ export async function getLiabilityPersonLedger(personId: string, query: LedgerQu
     if (isInRange) {
       rows.push({
         _id: String(e._id),
-        at: at.toISOString(),
+        at: formatDateTimeForTimeZone(at, timeZone),
         entryType: e.entryType,
         from:
           e.fromAccountType === "bank"
@@ -543,8 +547,12 @@ function formatUserForExport(user: unknown): string {
   return "";
 }
 
-export async function exportLiabilityPersonsToBuffer(query: ListLiabilityPersonQuery): Promise<Buffer> {
-  const result = await listLiabilityPersons({ ...query, page: 1, limit: EXPORT_MAX_ROWS });
+export async function exportLiabilityPersonsToBuffer(
+  query: ListLiabilityPersonQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const result = await listLiabilityPersons({ ...query, page: 1, limit: EXPORT_MAX_ROWS }, options);
   const exportData = result.rows.map((r) => ({
     Name: r.name,
     Phone: r.phone ?? "",
@@ -557,16 +565,20 @@ export async function exportLiabilityPersonsToBuffer(query: ListLiabilityPersonQ
     Notes: r.notes ?? "",
     "Created By": formatUserForExport(r.createdBy),
     "Updated By": formatUserForExport(r.updatedBy),
-    "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
   }));
 
   return generateExcelBuffer(exportData, "Liability Persons");
 }
 
-export async function exportLiabilityEntriesToBuffer(query: ListLiabilityEntryQuery): Promise<Buffer> {
-  const result = await listLiabilityEntries({ ...query, page: 1, limit: EXPORT_MAX_ROWS });
+export async function exportLiabilityEntriesToBuffer(
+  query: ListLiabilityEntryQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const result = await listLiabilityEntries({ ...query, page: 1, limit: EXPORT_MAX_ROWS }, options);
   const exportData = result.rows.map((r) => ({
-    Date: r.entryDate ? new Date(r.entryDate).toISOString().split("T")[0] : "",
+    Date: formatDateForTimeZone(r.entryDate, timeZone),
     Type: r.entryType,
     Amount: r.amount,
     "From Account": r.fromAccountName,
@@ -575,16 +587,21 @@ export async function exportLiabilityEntriesToBuffer(query: ListLiabilityEntryQu
     Remark: r.remark ?? "",
     "Source Type": r.sourceType ?? "",
     "Created By": formatUserForExport(r.createdBy),
-    "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
   }));
 
   return generateExcelBuffer(exportData, "Liability Entries");
 }
 
-export async function exportLiabilityLedgerToBuffer(personId: string, query: LedgerQuery): Promise<Buffer> {
-  const result = await getLiabilityPersonLedger(personId, query);
+export async function exportLiabilityLedgerToBuffer(
+  personId: string,
+  query: LedgerQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const result = await getLiabilityPersonLedger(personId, query, options);
   const exportData = result.rows.map((r) => ({
-    Date: r.at ? new Date(r.at).toISOString().split("T")[0] : "",
+    Date: formatDateForTimeZone(r.at, timeZone),
     "Entry Type": r.entryType,
     From: r.from,
     To: r.to,

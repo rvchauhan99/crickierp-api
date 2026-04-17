@@ -63,6 +63,7 @@ export async function loginUser(username: string, password: string) {
     userId: user._id.toString(),
     role: user.role,
     permissions: user.permissions,
+    timezone: user.timezone || "Asia/Kolkata",
   };
 
   const accessToken = signAccessToken(payload);
@@ -88,6 +89,7 @@ export async function loginUser(username: string, password: string) {
       fullName: user.fullName,
       role: user.role,
       permissions: user.permissions,
+      timezone: user.timezone || "Asia/Kolkata",
     },
     accessToken,
     refreshToken,
@@ -100,6 +102,7 @@ export function refreshAccessToken(refreshToken: string) {
       userId: string;
       role: string;
       permissions: string[];
+      timezone?: string;
     };
     return { accessToken: signAccessToken(payload) };
   } catch {
@@ -119,6 +122,7 @@ export async function getCurrentUser(userId: string) {
     role: user.role,
     permissions: user.permissions,
     email: user.email,
+    timezone: user.timezone || "Asia/Kolkata",
     isTwoFactorEnabled: Boolean(user.isTwoFactorEnabled),
   };
 }
@@ -146,6 +150,7 @@ export async function verifyTwoFactor(tempToken: string, code: string) {
     userId: user._id.toString(),
     role: user.role,
     permissions: user.permissions,
+    timezone: user.timezone || "Asia/Kolkata",
   };
 
   const accessToken = signAccessToken(payload);
@@ -171,6 +176,7 @@ export async function verifyTwoFactor(tempToken: string, code: string) {
       fullName: user.fullName,
       role: user.role,
       permissions: user.permissions,
+      timezone: user.timezone || "Asia/Kolkata",
     },
     accessToken,
     refreshToken,

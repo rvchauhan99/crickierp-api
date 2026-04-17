@@ -15,6 +15,7 @@ export async function createUser(
     passwordRaw: string;
     role: UserRole;
     permissions: string[];
+    timezone?: string;
   }
 ) {
   // Role checks (route layer enforces sub_admin.add etc.)
@@ -56,6 +57,7 @@ export async function createUser(
     status: "active",
     permissions,
     createdBy: creatorId,
+    timezone: data.timezone?.trim() || "Asia/Kolkata",
   });
 
   return {
@@ -166,6 +168,7 @@ export async function exportUsers(
     "Username": u.username,
     "Role": u.role,
     "Status": u.status,
+    "Timezone": u.timezone || "Asia/Kolkata",
     "Created At": u.createdAt,
     "Last Login": u.lastLoginAt || "Never",
   }));
@@ -187,6 +190,7 @@ export async function updateUser(
     role: UserRole;
     status: string;
     permissions: string[];
+    timezone: string;
   }>
 ) {
   const user = await UserModel.findById(id);
@@ -226,6 +230,9 @@ export async function updateUser(
     user.role = data.role;
   }
   if (data.permissions) user.permissions = data.permissions;
+  if (typeof data.timezone === "string" && data.timezone.trim()) {
+    user.timezone = data.timezone.trim();
+  }
 
   await user.save();
 

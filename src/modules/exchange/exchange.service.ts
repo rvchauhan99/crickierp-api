@@ -7,6 +7,12 @@ import { DepositModel } from "../deposit/deposit.model";
 import { ExchangeTopupModel } from "../exchange-topup/exchange-topup.model";
 import { PlayerModel } from "../player/player.model";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { ExchangeModel } from "./exchange.model";
 import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
 
@@ -89,69 +95,58 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function createdAtCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const operator = op || "inRange";
   const f = trimUndef(from);
   const t = trimUndef(to);
 
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $lt: start } };
   }
   if (operator === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { createdAt: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { createdAt: { $lte: end } };
   }
   return null;
 }
 
-function buildExchangeListFilter(q: ListExchangeQuery): Record<string, unknown> {
+function buildExchangeListFilter(q: ListExchangeQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -188,6 +183,7 @@ function buildExchangeListFilter(q: ListExchangeQuery): Record<string, unknown> 
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) {
     conditions.push(dateCond);
@@ -264,8 +260,9 @@ export async function createExchange(
   return doc;
 }
 
-export async function listExchanges(query: ListExchangeQuery) {
-  const filter = buildExchangeListFilter(query);
+export async function listExchanges(query: ListExchangeQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildExchangeListFilter(query, timeZone);
 
   const skip = (query.page - 1) * query.pageSize;
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
@@ -305,8 +302,12 @@ function formatCreatedByForExport(createdBy: unknown): string {
   return String(createdBy);
 }
 
-export async function exportExchangesToBuffer(query: ListExchangeQuery): Promise<Buffer> {
-  const filter = buildExchangeListFilter(query);
+export async function exportExchangesToBuffer(
+  query: ListExchangeQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildExchangeListFilter(query, timeZone);
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await ExchangeModel.find(filter)
@@ -324,7 +325,7 @@ export async function exportExchangesToBuffer(query: ListExchangeQuery): Promise
     Version: r.version ?? "",
     Status: r.status,
     "Created By": formatCreatedByForExport(r.createdBy),
-    "Created At": r.createdAt ? new Date(r.createdAt).toISOString() : "",
+    "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
   }));
 
   return generateExcelBuffer(exportData, "Exchanges");
@@ -442,19 +443,14 @@ export async function recomputeExchangeCurrentBalance(exchangeId: string): Promi
   return nextCurrentBalance;
 }
 
-function ledgerYmdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ledgerYmdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
-function depositEventTime(d: { settledAt?: Date; exchangeActionAt?: Date; updatedAt?: Date; createdAt?: Date }): Date {
+function depositEventTime(d: {
+  entryAt?: Date;
+  settledAt?: Date;
+  exchangeActionAt?: Date;
+  updatedAt?: Date;
+  createdAt?: Date;
+}): Date {
+  if (d.entryAt) return new Date(d.entryAt);
   if (d.settledAt) return new Date(d.settledAt);
   if (d.exchangeActionAt) return new Date(d.exchangeActionAt);
   if (d.updatedAt) return new Date(d.updatedAt);
@@ -462,7 +458,8 @@ function depositEventTime(d: { settledAt?: Date; exchangeActionAt?: Date; update
   return new Date(0);
 }
 
-function withdrawalEventTime(w: { updatedAt?: Date; createdAt?: Date }): Date {
+function withdrawalEventTime(w: { requestedAt?: Date; updatedAt?: Date; createdAt?: Date }): Date {
+  if (w.requestedAt) return new Date(w.requestedAt);
   if (w.updatedAt) return new Date(w.updatedAt);
   if (w.createdAt) return new Date(w.createdAt);
   return new Date(0);
@@ -473,7 +470,12 @@ function withdrawalEventTime(w: { updatedAt?: Date; createdAt?: Date }): Date {
  * - deposit -> debit (money withdrawn from exchange)
  * - withdrawal -> credit (money deposited into exchange)
  */
-export async function getExchangeStatement(exchangeId: string, query: ExchangeStatementQuery) {
+export async function getExchangeStatement(
+  exchangeId: string,
+  query: ExchangeStatementQuery,
+  options?: { timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   if (!Types.ObjectId.isValid(exchangeId)) {
     throw new AppError("validation_error", "Invalid exchange id", 400);
   }
@@ -483,8 +485,8 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
 
   const fromDate = query.fromDate?.trim();
   const toDate = query.toDate?.trim();
-  const from = fromDate ? ledgerYmdStart(fromDate) : null;
-  const to = toDate ? ledgerYmdEnd(toDate) : null;
+  const from = fromDate ? ymdToUtcStart(fromDate, timeZone) : null;
+  const to = toDate ? ymdToUtcEnd(toDate, timeZone) : null;
   if (fromDate && !from) {
     throw new AppError("validation_error", "fromDate must be in YYYY-MM-DD format", 400);
   }
@@ -510,7 +512,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
           player: { $in: playerIds },
           status: { $in: ["verified", "finalized"] },
         })
-          .select("_id player amount bonusAmount totalAmount utr settledAt exchangeActionAt updatedAt createdAt")
+          .select("_id player amount bonusAmount totalAmount utr entryAt settledAt exchangeActionAt updatedAt createdAt")
           .lean()
       : Promise.resolve([]),
     playerIds.length
@@ -518,7 +520,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
           player: { $in: playerIds },
           status: { $in: ["approved", "finalized"] },
         })
-          .select("_id player playerName amount payableAmount reverseBonus utr updatedAt createdAt")
+          .select("_id player playerName amount payableAmount reverseBonus utr requestedAt updatedAt createdAt")
           .lean()
       : Promise.resolve([]),
     ExchangeTopupModel.find({ exchangeId: exchangeObjectId })
@@ -616,7 +618,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
       return {
         kind: "deposit" as const,
         refId: d._id.toString(),
-        at: new Date(ev.t).toISOString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
         label: "Deposit",
         playerId: playerMap.get(String(d.player)) ?? "",
         amount,
@@ -637,7 +639,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
       return {
         kind: "withdrawal" as const,
         refId: w._id.toString(),
-        at: new Date(ev.t).toISOString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
         label: "Withdrawal",
         playerId: playerMap.get(String(w.player)) ?? w.playerName ?? "",
         amount,
@@ -659,7 +661,7 @@ export async function getExchangeStatement(exchangeId: string, query: ExchangeSt
     return {
       kind: "topup" as const,
       refId: topup._id.toString(),
-      at: new Date(ev.t).toISOString(),
+      at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
       label: "Top Up",
       playerId: "",
       amount: topup.amount,

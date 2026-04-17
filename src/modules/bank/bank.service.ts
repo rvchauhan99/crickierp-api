@@ -8,6 +8,12 @@ import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExpenseModel } from "../expense/expense.model";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
+import {
+  DEFAULT_TIMEZONE,
+  formatDateTimeForTimeZone,
+  ymdToUtcEnd,
+  ymdToUtcStart,
+} from "../../shared/utils/timezone";
 import { BankModel } from "./bank.model";
 import { listBankQuerySchema } from "./bank.validation";
 
@@ -85,69 +91,58 @@ function numberFieldCondition(
   }
 }
 
-function ymdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ymdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
-
 function createdAtCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
+  timeZone: string,
 ): Record<string, unknown> | null {
   const operator = op || "inRange";
   const f = trimUndef(from);
   const t = trimUndef(to);
 
   if (operator === "inRange" && f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "equals" && f) {
-    const start = ymdStart(f);
-    const end = ymdEnd(f);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (operator === "before" && f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $lt: start } };
   }
   if (operator === "after" && f) {
-    const end = ymdEnd(f);
+    const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
     return { createdAt: { $gt: end } };
   }
   if (f && t) {
-    const start = ymdStart(f);
-    const end = ymdEnd(t);
+    const start = ymdToUtcStart(f, timeZone);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
     return { createdAt: { $gte: start, $lte: end } };
   }
   if (f) {
-    const start = ymdStart(f);
+    const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
     return { createdAt: { $gte: start } };
   }
   if (t) {
-    const end = ymdEnd(t);
+    const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
     return { createdAt: { $lte: end } };
   }
   return null;
 }
 
-function buildBankListFilter(q: ListBankQuery): Record<string, unknown> {
+function buildBankListFilter(q: ListBankQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [];
 
   const search = trimUndef(q.search);
@@ -197,6 +192,7 @@ function buildBankListFilter(q: ListBankQuery): Record<string, unknown> {
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
+    timeZone,
   );
   if (dateCond) {
     conditions.push(dateCond);
@@ -219,6 +215,73 @@ function buildBankListFilter(q: ListBankQuery): Record<string, unknown> {
     return conditions[0];
   }
   return { $and: conditions };
+}
+
+type ClosingBalanceByBankId = Map<string, number>;
+
+/**
+ * Computes statement-equivalent closing balance snapshot for given banks:
+ * openingBalance + verified deposits - approved withdrawals - approved expenses +/- liabilities.
+ */
+async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<ClosingBalanceByBankId> {
+  if (bankIds.length === 0) return new Map();
+  const [banks, deposits, withdrawals, expenses, liabilities] = await Promise.all([
+    BankModel.find({ _id: { $in: bankIds } })
+      .select({ _id: 1, openingBalance: 1 })
+      .lean(),
+    DepositModel.find({ bankId: { $in: bankIds }, status: "verified" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    WithdrawalModel.find({ payoutBankId: { $in: bankIds }, status: "approved" })
+      .select({ payoutBankId: 1, amount: 1, payableAmount: 1 })
+      .lean(),
+    ExpenseModel.find({ bankId: { $in: bankIds }, status: "approved" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    LiabilityEntryModel.find({
+      $or: [
+        { fromAccountType: "bank", fromAccountId: { $in: bankIds } },
+        { toAccountType: "bank", toAccountId: { $in: bankIds } },
+      ],
+    })
+      .select({ fromAccountType: 1, fromAccountId: 1, toAccountType: 1, toAccountId: 1, amount: 1 })
+      .lean(),
+  ]);
+
+  const totals = new Map<string, number>();
+  for (const b of banks) {
+    totals.set(String(b._id), Number(b.openingBalance ?? 0));
+  }
+
+  for (const d of deposits) {
+    const id = String(d.bankId);
+    const prev = totals.get(id) ?? 0;
+    totals.set(id, prev + Number(d.amount ?? 0));
+  }
+  for (const w of withdrawals) {
+    const id = String(w.payoutBankId);
+    const prev = totals.get(id) ?? 0;
+    totals.set(id, prev - Number(w.payableAmount ?? w.amount ?? 0));
+  }
+  for (const e of expenses) {
+    const id = String(e.bankId);
+    const prev = totals.get(id) ?? 0;
+    totals.set(id, prev - Number(e.amount ?? 0));
+  }
+  for (const le of liabilities) {
+    const amt = Number(le.amount ?? 0);
+    if (le.fromAccountType === "bank" && le.fromAccountId) {
+      const id = String(le.fromAccountId);
+      const prev = totals.get(id) ?? 0;
+      totals.set(id, prev - amt);
+    }
+    if (le.toAccountType === "bank" && le.toAccountId) {
+      const id = String(le.toAccountId);
+      const prev = totals.get(id) ?? 0;
+      totals.set(id, prev + amt);
+    }
+  }
+  return totals;
 }
 
 const EXPORT_MAX_ROWS = 10_000;
@@ -263,8 +326,9 @@ export async function createBank(input: {
   return doc;
 }
 
-export async function listBanks(query: ListBankQuery) {
-  const filter = buildBankListFilter(query);
+export async function listBanks(query: ListBankQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildBankListFilter(query, timeZone);
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -280,8 +344,15 @@ export async function listBanks(query: ListBankQuery) {
     BankModel.countDocuments(filter),
   ]);
 
+  const bankIds = rows.map((r) => new Types.ObjectId(String(r._id)));
+  const closingByBankId = await computeClosingBalanceActualByBankIds(bankIds);
+  const rowsWithClosing = rows.map((r) => ({
+    ...r,
+    closingBalanceActual: closingByBankId.get(String(r._id)) ?? Number(r.openingBalance ?? 0),
+  }));
+
   return {
-    rows,
+    rows: rowsWithClosing,
     meta: {
       page,
       pageSize,
@@ -290,8 +361,12 @@ export async function listBanks(query: ListBankQuery) {
   };
 }
 
-export async function exportBanksToBuffer(query: ListBankQuery): Promise<Buffer> {
-  const filter = buildBankListFilter(query);
+export async function exportBanksToBuffer(
+  query: ListBankQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const filter = buildBankListFilter(query, timeZone);
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await BankModel.find(filter)
@@ -308,7 +383,7 @@ export async function exportBanksToBuffer(query: ListBankQuery): Promise<Buffer>
     { header: "Opening Balance", key: "openingBalance" },
     { header: "Status", key: "status" },
     { header: "Created By", transform: (r) => formatCreatedByForExport(r.createdBy) },
-    { header: "Created At", transform: (r) => (r.createdAt ? new Date(r.createdAt).toISOString() : "") },
+    { header: "Created At", transform: (r) => formatDateTimeForTimeZone(r.createdAt, timeZone) },
   ], "Banks");
 }
 
@@ -317,18 +392,6 @@ type LedgerQuery = {
   toDate?: string;
   entryType?: "all" | "deposit" | "withdrawal" | "expense" | "liability";
 };
-
-function ledgerYmdStart(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
-}
-
-function ledgerYmdEnd(ymd: string): Date | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, m - 1, d, 23, 59, 59, 999);
-}
 
 function depositEventTime(d: { settledAt?: Date; createdAt?: Date }): Date {
   if (d.settledAt) return new Date(d.settledAt);
@@ -359,7 +422,8 @@ function liabilityEventTime(e: { entryDate?: Date; createdAt?: Date }): Date {
  * Withdrawal rows are sourced from banker-paid entries (status: approved) for the selected payout bank.
  * Reverse bonus is memo-only and never posted as a separate cash ledger row.
  */
-export async function getBankLedger(bankId: string, query: LedgerQuery) {
+export async function getBankLedger(bankId: string, query: LedgerQuery, options?: { timeZone?: string }) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   if (!Types.ObjectId.isValid(bankId)) {
     throw new AppError("validation_error", "Invalid bank id", 400);
   }
@@ -369,8 +433,8 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
 
   const from = query.fromDate?.trim();
   const to = query.toDate?.trim();
-  const fromD = from ? ledgerYmdStart(from) : null;
-  const toD = to ? ledgerYmdEnd(to) : null;
+  const fromD = from ? ymdToUtcStart(from, timeZone) : null;
+  const toD = to ? ymdToUtcEnd(to, timeZone) : null;
   const entryType = query.entryType || "all";
 
   const [allDeposits, allWithdrawals, allExpenses, allLiabilityEntries] = await Promise.all([
@@ -497,7 +561,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       return {
         kind: "deposit" as const,
         refId: d._id.toString(),
-        at: new Date(ev.t).toISOString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
         label: `Deposit`,
         utr: d.utr,
         playerName: playerObj?.name ?? "",
@@ -523,7 +587,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       return {
         kind: "withdrawal" as const,
         refId: w._id.toString(),
-        at: new Date(ev.t).toISOString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
         label: `Withdrawal`,
         utr: w.utr,
         playerName: playerObj?.name ?? w.playerName ?? "",
@@ -556,7 +620,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
       return {
         kind: "liability" as const,
         refId: le._id.toString(),
-        at: new Date(ev.t).toISOString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
         label: `Liability ${le.entryType}`,
         utr: le.referenceNo?.trim() || undefined,
         playerName: counterpartyName,
@@ -575,7 +639,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery) {
     return {
       kind: "expense" as const,
       refId: e._id.toString(),
-      at: new Date(ev.t).toISOString(),
+      at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
       label: e.description?.trim() ? e.description.trim() : "Expense",
       utr: undefined,
       playerName: "",

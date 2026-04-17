@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import type { Db } from "mongodb";
 import { logger } from "../shared/logger";
 import { migration001DropNotificationCollections } from "./001-drop-notification-collections";
+import { migration002BackfillBusinessDatetimes } from "./002-backfill-business-datetimes";
 
 export const MIGRATIONS_COLLECTION = "__migrations";
 
@@ -10,7 +11,7 @@ export type Migration = {
   up: (db: Db) => Promise<void>;
 };
 
-const registry: Migration[] = [migration001DropNotificationCollections];
+const registry: Migration[] = [migration001DropNotificationCollections, migration002BackfillBusinessDatetimes];
 
 export async function runMigrations(): Promise<void> {
   const db = mongoose.connection.db;

@@ -19,6 +19,7 @@ import {
 } from "./player-import-job.service";
 import { AppError } from "../../shared/errors/AppError";
 import type { ImportRowError } from "./player.service";
+import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 function parseImportRowErrors(error: unknown): ImportRowError[] {
   if (!(error instanceof AppError) || !error.details || typeof error.details !== "object") {
@@ -57,13 +58,15 @@ export async function getPlayerByIdController(req: Request, res: Response) {
 
 export async function listPlayerController(req: Request, res: Response) {
   const query = listPlayerQuerySchema.parse(req.query);
-  const result = await listPlayers(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await listPlayers(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
 export async function exportPlayerController(req: Request, res: Response) {
   const query = listPlayerQuerySchema.parse(req.query);
-  const buffer = await exportPlayersToBuffer(query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportPlayersToBuffer(query, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="players-export.xlsx"');
   res.setHeader(
     "Content-Type",
