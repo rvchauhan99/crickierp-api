@@ -443,7 +443,14 @@ export async function recomputeExchangeCurrentBalance(exchangeId: string): Promi
   return nextCurrentBalance;
 }
 
-function depositEventTime(d: { settledAt?: Date; exchangeActionAt?: Date; updatedAt?: Date; createdAt?: Date }): Date {
+function depositEventTime(d: {
+  entryAt?: Date;
+  settledAt?: Date;
+  exchangeActionAt?: Date;
+  updatedAt?: Date;
+  createdAt?: Date;
+}): Date {
+  if (d.entryAt) return new Date(d.entryAt);
   if (d.settledAt) return new Date(d.settledAt);
   if (d.exchangeActionAt) return new Date(d.exchangeActionAt);
   if (d.updatedAt) return new Date(d.updatedAt);
@@ -451,7 +458,8 @@ function depositEventTime(d: { settledAt?: Date; exchangeActionAt?: Date; update
   return new Date(0);
 }
 
-function withdrawalEventTime(w: { updatedAt?: Date; createdAt?: Date }): Date {
+function withdrawalEventTime(w: { requestedAt?: Date; updatedAt?: Date; createdAt?: Date }): Date {
+  if (w.requestedAt) return new Date(w.requestedAt);
   if (w.updatedAt) return new Date(w.updatedAt);
   if (w.createdAt) return new Date(w.createdAt);
   return new Date(0);
@@ -504,7 +512,7 @@ export async function getExchangeStatement(
           player: { $in: playerIds },
           status: { $in: ["verified", "finalized"] },
         })
-          .select("_id player amount bonusAmount totalAmount utr settledAt exchangeActionAt updatedAt createdAt")
+          .select("_id player amount bonusAmount totalAmount utr entryAt settledAt exchangeActionAt updatedAt createdAt")
           .lean()
       : Promise.resolve([]),
     playerIds.length
@@ -512,7 +520,7 @@ export async function getExchangeStatement(
           player: { $in: playerIds },
           status: { $in: ["approved", "finalized"] },
         })
-          .select("_id player playerName amount payableAmount reverseBonus utr updatedAt createdAt")
+          .select("_id player playerName amount payableAmount reverseBonus utr requestedAt updatedAt createdAt")
           .lean()
       : Promise.resolve([]),
     ExchangeTopupModel.find({ exchangeId: exchangeObjectId })

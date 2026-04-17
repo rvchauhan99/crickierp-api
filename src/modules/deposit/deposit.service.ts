@@ -102,12 +102,13 @@ function numberFieldCondition(
   }
 }
 
-function createdAtCondition(
+function transactionDateCondition(
   from: string | undefined,
   to: string | undefined,
   op: string | undefined,
   timeZone: string,
 ): Record<string, unknown> | null {
+  const txExpr = { $ifNull: ["$entryAt", "$createdAt"] };
   const operator = op || "inRange";
   const f = trimUndef(from);
   const t = trimUndef(to);
@@ -116,39 +117,39 @@ function createdAtCondition(
     const start = ymdToUtcStart(f, timeZone);
     const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
-    return { createdAt: { $gte: start, $lte: end } };
+    return { $expr: { $and: [{ $gte: [txExpr, start] }, { $lte: [txExpr, end] }] } };
   }
   if (operator === "equals" && f) {
     const start = ymdToUtcStart(f, timeZone);
     const end = ymdToUtcEnd(f, timeZone);
     if (!start || !end) return null;
-    return { createdAt: { $gte: start, $lte: end } };
+    return { $expr: { $and: [{ $gte: [txExpr, start] }, { $lte: [txExpr, end] }] } };
   }
   if (operator === "before" && f) {
     const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
-    return { createdAt: { $lt: start } };
+    return { $expr: { $lt: [txExpr, start] } };
   }
   if (operator === "after" && f) {
     const end = ymdToUtcEnd(f, timeZone);
     if (!end) return null;
-    return { createdAt: { $gt: end } };
+    return { $expr: { $gt: [txExpr, end] } };
   }
   if (f && t) {
     const start = ymdToUtcStart(f, timeZone);
     const end = ymdToUtcEnd(t, timeZone);
     if (!start || !end) return null;
-    return { createdAt: { $gte: start, $lte: end } };
+    return { $expr: { $and: [{ $gte: [txExpr, start] }, { $lte: [txExpr, end] }] } };
   }
   if (f) {
     const start = ymdToUtcStart(f, timeZone);
     if (!start) return null;
-    return { createdAt: { $gte: start } };
+    return { $expr: { $gte: [txExpr, start] } };
   }
   if (t) {
     const end = ymdToUtcEnd(t, timeZone);
     if (!end) return null;
-    return { createdAt: { $lte: end } };
+    return { $expr: { $lte: [txExpr, end] } };
   }
   return null;
 }
@@ -208,7 +209,7 @@ function buildDepositListFilter(q: ListDepositQuery, timeZone: string): Record<s
     conditions.push({ createdBy: new Types.ObjectId(createdBy) });
   }
 
-  const dateCond = createdAtCondition(
+  const dateCond = transactionDateCondition(
     trimUndef(q.createdAt_from),
     trimUndef(q.createdAt_to),
     trimUndef(q.createdAt_op),
@@ -482,7 +483,10 @@ export async function exportDepositsToBuffer(
     { header: "Reject reason", key: "rejectReason" },
     { header: "Bank balance after", key: "bankBalanceAfter" },
     { header: "Settled at", transform: (r) => formatDateTimeForTimeZone(r.settledAt, timeZone) },
-    { header: "Created at", transform: (r) => formatDateTimeForTimeZone(r.createdAt, timeZone) },
+    {
+      header: "Transaction at",
+      transform: (r) => formatDateTimeForTimeZone(r.entryAt ?? r.createdAt, timeZone),
+    },
   ], "Deposits");
 }
 

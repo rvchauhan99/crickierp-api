@@ -92,6 +92,8 @@ type DashboardTxnTypeFilter = "all" | "deposit" | "withdrawal" | "expense";
 
 type DashboardFilterContext = {
   dateFilter: Record<string, unknown>;
+  depositDateFilter: Record<string, unknown>;
+  withdrawalDateFilter: Record<string, unknown>;
   appliedRange: { fromDate: string; toDate: string };
   exchangeObjectId: Types.ObjectId | null;
   scopedPlayerIds: Types.ObjectId[] | null;
@@ -100,6 +102,16 @@ type DashboardFilterContext = {
   expenseFilter: Record<string, unknown>;
   exchangeStatsFilter: Record<string, unknown>;
 };
+
+function businessDateRangeExpr(field: "entryAt" | "requestedAt", startUtc: Date | null, endUtc: Date | null) {
+  if (!startUtc || !endUtc) return {};
+  const txExpr = { $ifNull: [`$${field}`, "$createdAt"] };
+  return {
+    $expr: {
+      $and: [{ $gte: [txExpr, startUtc] }, { $lte: [txExpr, endUtc] }],
+    },
+  };
+}
 
 function statusFilterForDeposit(status: DashboardStatusFilter | undefined): Record<string, unknown> {
   if (status === "pending") return { status: "pending" };
@@ -127,12 +139,16 @@ async function buildDashboardFilterContext(
   timeZone: string,
 ): Promise<DashboardFilterContext> {
   const appliedRange = resolveDashboardRange(query, timeZone);
+  const rangeStartUtc = ymdToUtcStartInZone(appliedRange.fromDate, timeZone);
+  const rangeEndUtc = ymdToUtcEndInZone(appliedRange.toDate, timeZone);
   const dateFilter = {
     createdAt: {
-      $gte: ymdToUtcStartInZone(appliedRange.fromDate, timeZone),
-      $lte: ymdToUtcEndInZone(appliedRange.toDate, timeZone),
+      $gte: rangeStartUtc,
+      $lte: rangeEndUtc,
     },
   };
+  const depositDateFilter = businessDateRangeExpr("entryAt", rangeStartUtc, rangeEndUtc);
+  const withdrawalDateFilter = businessDateRangeExpr("requestedAt", rangeStartUtc, rangeEndUtc);
 
   const exchangeObjectId =
     query.exchangeId && Types.ObjectId.isValid(query.exchangeId) ? new Types.ObjectId(query.exchangeId) : null;
@@ -199,7 +215,7 @@ async function buildDashboardFilterContext(
 
   const depositFilter = isDepositAllowed
     ? {
-        ...dateFilter,
+        ...depositDateFilter,
         ...playerFilter,
         ...(bankObjectId ? { bankId: bankObjectId } : {}),
         ...amountFilter,
@@ -210,7 +226,7 @@ async function buildDashboardFilterContext(
 
   const withdrawalFilter = isWithdrawalAllowed
     ? {
-        ...dateFilter,
+        ...withdrawalDateFilter,
         ...playerFilter,
         ...amountFilter,
         ...statusFilterForWithdrawal(status),
@@ -232,6 +248,8 @@ async function buildDashboardFilterContext(
 
   return {
     dateFilter,
+    depositDateFilter,
+    withdrawalDateFilter,
     appliedRange,
     exchangeObjectId,
     scopedPlayerIds,
@@ -344,7 +362,7 @@ export async function getDashboardSummary(
 
     // Recent deposits (last 10, all statuses)
     DepositModel.find({ ...depositFilter })
-      .sort({ createdAt: -1 })
+      .sort({ entryAt: -1, createdAt: -1 })
       .limit(10)
       .populate("player", "playerId name")
       .populate("createdBy", "fullName username")
@@ -352,7 +370,7 @@ export async function getDashboardSummary(
 
     // Recent withdrawals (last 10, all statuses)
     WithdrawalModel.find({ ...withdrawalFilter })
-      .sort({ createdAt: -1 })
+      .sort({ requestedAt: -1, createdAt: -1 })
       .limit(10)
       .populate("player", "playerId name")
       .populate("createdBy", "fullName username")
@@ -360,11 +378,16 @@ export async function getDashboardSummary(
 
     // Deposit daily trend
     DepositModel.aggregate([
-      { $match: { ...depositFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
+      {
+        $match: {
+          ...depositFilter,
+          ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}),
+        },
+      },
       {
         $group: {
           _id: {
-            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+            $dateToString: { format: "%Y-%m-%d", date: { $ifNull: ["$entryAt", "$createdAt"] }, timezone: timeZone },
           },
           totalAmount: { $sum: "$amount" },
           count: { $sum: 1 },
@@ -375,11 +398,20 @@ export async function getDashboardSummary(
 
     // Withdrawal daily trend
     WithdrawalModel.aggregate([
-      { $match: { ...withdrawalFilter, ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}) } },
+      {
+        $match: {
+          ...withdrawalFilter,
+          ...(query.status === "all" || !query.status ? { status: { $ne: "rejected" } } : {}),
+        },
+      },
       {
         $group: {
           _id: {
-            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+            $dateToString: {
+              format: "%Y-%m-%d",
+              date: { $ifNull: ["$requestedAt", "$createdAt"] },
+              timezone: timeZone,
+            },
           },
           totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
           count: { $sum: 1 },
@@ -460,7 +492,7 @@ export async function getDashboardSummary(
           { $match: firstDepositBaseMatch },
           {
             $addFields: {
-              firstDepositEventAt: { $ifNull: ["$settledAt", "$createdAt"] },
+              firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
             },
           },
           { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
@@ -503,7 +535,7 @@ export async function getDashboardSummary(
           { $match: firstDepositBaseMatch },
           {
             $addFields: {
-              firstDepositEventAt: { $ifNull: ["$settledAt", "$createdAt"] },
+              firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
             },
           },
           { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
@@ -643,7 +675,7 @@ export async function getDashboardSummary(
       createdBy: (d.createdBy as AnyRow | undefined)?.fullName ?? "",
       bankName: String(d.bankName ?? ""),
       utr: String(d.utr ?? ""),
-      createdAt: d.createdAt,
+      createdAt: d.entryAt ?? d.createdAt,
     })),
     ...(recentWithdrawals as unknown as AnyRow[]).map((w) => ({
       _id: String(w._id),
@@ -654,7 +686,7 @@ export async function getDashboardSummary(
       createdBy: (w.createdBy as AnyRow | undefined)?.fullName ?? "",
       bankName: String(w.bankName ?? ""),
       utr: String(w.utr ?? ""),
-      createdAt: w.createdAt,
+      createdAt: w.requestedAt ?? w.createdAt,
     })),
   ]
     .sort((a, b) => new Date(b.createdAt as string).getTime() - new Date(a.createdAt as string).getTime())

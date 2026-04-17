@@ -384,4 +384,151 @@ describe("Backdated entry datetime integration", () => {
     expect(withdrawalAmendRes.status).toBe(400);
     expect(withdrawalAmendRes.body.error?.code).toBe("validation_error");
   });
+
+  it("filters deposit final list by entryAt (fallback from createdAt params)", async () => {
+    const keepEntryAt = "2025-01-10T10:00:00.000Z";
+    const skipEntryAt = "2025-01-11T10:00:00.000Z";
+    const outsideCreatedAt = new Date("2026-01-01T00:00:00.000Z");
+
+    const keepRes = await request(app)
+      .post("/api/v1/deposit")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ bankId, utr: "BD-DEP-FILTER-KEEP", amount: 300, entryAt: keepEntryAt });
+    const skipRes = await request(app)
+      .post("/api/v1/deposit")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ bankId, utr: "BD-DEP-FILTER-SKIP", amount: 350, entryAt: skipEntryAt });
+
+    expect(keepRes.status).toBe(201);
+    expect(skipRes.status).toBe(201);
+
+    await DepositModel.updateOne({ _id: keepRes.body.data._id }, { $set: { createdAt: outsideCreatedAt } });
+    await DepositModel.updateOne({ _id: skipRes.body.data._id }, { $set: { createdAt: outsideCreatedAt } });
+
+    const listRes = await request(app)
+      .get("/api/v1/deposit")
+      .query({
+        view: "final",
+        createdAt_from: "2025-01-10",
+        createdAt_to: "2025-01-10",
+        createdAt_op: "inRange",
+        page: 1,
+        pageSize: 200,
+      })
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(listRes.status).toBe(200);
+    const utrs = (listRes.body.data as Array<{ utr?: string }>).map((r) => r.utr);
+    expect(utrs).toContain("BD-DEP-FILTER-KEEP");
+    expect(utrs).not.toContain("BD-DEP-FILTER-SKIP");
+  });
+
+  it("filters withdrawal final list by requestedAt (fallback from createdAt params)", async () => {
+    const keepRequestedAt = "2025-02-10T12:00:00.000Z";
+    const skipRequestedAt = "2025-02-11T12:00:00.000Z";
+    const outsideCreatedAt = new Date("2026-02-01T00:00:00.000Z");
+
+    const keepRes = await request(app)
+      .post("/api/v1/withdrawal")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        playerId,
+        accountNumber: "121212121212",
+        accountHolderName: "Filter Keep",
+        bankName: "Filter Bank",
+        ifsc: "BKID0012121",
+        amount: 500,
+        reverseBonus: 0,
+        requestedAt: keepRequestedAt,
+      });
+    const skipRes = await request(app)
+      .post("/api/v1/withdrawal")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        playerId,
+        accountNumber: "343434343434",
+        accountHolderName: "Filter Skip",
+        bankName: "Filter Bank",
+        ifsc: "BKID0034343",
+        amount: 550,
+        reverseBonus: 0,
+        requestedAt: skipRequestedAt,
+      });
+
+    expect(keepRes.status).toBe(201);
+    expect(skipRes.status).toBe(201);
+
+    await WithdrawalModel.updateOne({ _id: keepRes.body.data._id }, { $set: { createdAt: outsideCreatedAt } });
+    await WithdrawalModel.updateOne({ _id: skipRes.body.data._id }, { $set: { createdAt: outsideCreatedAt } });
+
+    const listRes = await request(app)
+      .get("/api/v1/withdrawal")
+      .query({
+        view: "final",
+        createdAt_from: "2025-02-10",
+        createdAt_to: "2025-02-10",
+        createdAt_op: "inRange",
+        page: 1,
+        pageSize: 200,
+      })
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(listRes.status).toBe(200);
+    const accountNumbers = (listRes.body.data as Array<{ accountNumber?: string }>).map((r) => r.accountNumber);
+    expect(accountNumbers).toContain("121212121212");
+    expect(accountNumbers).not.toContain("343434343434");
+  });
+
+  it("uses business datetime for dashboard trend and recent activity", async () => {
+    const trendDate = "2025-03-15";
+    const depositEntryAt = "2025-03-15T09:00:00.000Z";
+    const withdrawalRequestedAt = "2025-03-15T10:00:00.000Z";
+    const outsideCreatedAt = new Date("2026-03-01T00:00:00.000Z");
+
+    const depositRes = await request(app)
+      .post("/api/v1/deposit")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({ bankId, utr: "BD-DEP-DASH-001", amount: 410, entryAt: depositEntryAt });
+    const withdrawalRes = await request(app)
+      .post("/api/v1/withdrawal")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        playerId,
+        accountNumber: "565656565656",
+        accountHolderName: "Dash Holder",
+        bankName: "Dash Bank",
+        ifsc: "BKID0056565",
+        amount: 420,
+        reverseBonus: 20,
+        requestedAt: withdrawalRequestedAt,
+      });
+
+    expect(depositRes.status).toBe(201);
+    expect(withdrawalRes.status).toBe(201);
+
+    await DepositModel.updateOne({ _id: depositRes.body.data._id }, { $set: { createdAt: outsideCreatedAt } });
+    await WithdrawalModel.updateOne({ _id: withdrawalRes.body.data._id }, { $set: { createdAt: outsideCreatedAt } });
+
+    const dashboardRes = await request(app)
+      .get("/api/v1/reports/dashboard-summary")
+      .query({ fromDate: trendDate, toDate: trendDate })
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(dashboardRes.status).toBe(200);
+    const trendRow = (dashboardRes.body.data.trendData as Array<{ date: string; depositCount: number; withdrawalCount: number }>)
+      .find((row) => row.date === trendDate);
+    expect(trendRow).toBeDefined();
+    expect((trendRow?.depositCount ?? 0) >= 1).toBe(true);
+    expect((trendRow?.withdrawalCount ?? 0) >= 1).toBe(true);
+
+    const recentActivity = dashboardRes.body.data.recentActivity as Array<{ type: string; createdAt: string }>;
+    const hasDepositByBusinessTime = recentActivity.some(
+      (row) => row.type === "deposit" && new Date(row.createdAt).getTime() === new Date(depositEntryAt).getTime(),
+    );
+    const hasWithdrawalByBusinessTime = recentActivity.some(
+      (row) => row.type === "withdrawal" && new Date(row.createdAt).getTime() === new Date(withdrawalRequestedAt).getTime(),
+    );
+    expect(hasDepositByBusinessTime).toBe(true);
+    expect(hasWithdrawalByBusinessTime).toBe(true);
+  });
 });

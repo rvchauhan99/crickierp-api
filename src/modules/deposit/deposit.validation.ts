@@ -25,8 +25,8 @@ export const listDepositQuerySchema = z.object({
   pageSize: z.coerce.number().int().positive().max(500).default(20),
   limit: z.coerce.number().int().positive().max(500).optional(),
   sortBy: z
-    .enum(["createdAt", "amount", "utr", "status", "totalAmount", "settledAt", "bankName"])
-    .default("createdAt"),
+    .enum(["entryAt", "createdAt", "amount", "utr", "status", "totalAmount", "settledAt", "bankName"])
+    .default("entryAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
   utr: z.string().optional(),
   utr_op: z.string().optional(),

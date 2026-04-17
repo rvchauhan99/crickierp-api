@@ -293,6 +293,69 @@ describe("Exchange API integration", () => {
     expect(topupRow.amount).toBe(40);
   });
 
+  it("uses entryAt/requestedAt precedence for exchange statement event time", async () => {
+    const actor = await UserModel.findOne({ username: "superadmin" }).select("_id").lean();
+    expect(actor?._id).toBeDefined();
+    const actorId = actor!._id;
+
+    const exchange = await ExchangeModel.create({
+      name: "E2E Event Time",
+      provider: "Provider ET",
+      openingBalance: 1000,
+      currentBalance: 1000,
+      bonus: 0,
+      status: "active",
+      createdBy: actorId,
+      updatedBy: actorId,
+    });
+
+    const player = await PlayerModel.create({
+      exchange: exchange._id,
+      playerId: "PL-ET",
+      phone: "9000000019",
+      regularBonusPercentage: 0,
+      firstDepositBonusPercentage: 0,
+      createdBy: actorId,
+      updatedBy: actorId,
+    });
+
+    await DepositModel.create({
+      bankName: "Bank ET",
+      utr: "UTR-ET-DEP-1",
+      amount: 100,
+      totalAmount: 100,
+      bonusAmount: 0,
+      status: "verified",
+      createdBy: actorId,
+      player: player._id,
+      entryAt: new Date("2026-04-10T08:00:00.000Z"),
+      settledAt: new Date("2026-04-12T08:00:00.000Z"),
+    });
+
+    await WithdrawalModel.create({
+      player: player._id,
+      playerName: "PL-ET",
+      bankName: "Payout ET",
+      amount: 50,
+      payableAmount: 50,
+      reverseBonus: 0,
+      status: "approved",
+      createdBy: actorId,
+      requestedAt: new Date("2026-04-10T09:00:00.000Z"),
+      updatedAt: new Date("2026-04-12T09:00:00.000Z"),
+      createdAt: new Date("2026-04-12T09:00:00.000Z"),
+    });
+
+    const res = await request(app)
+      .get(`/api/v1/exchange/${exchange._id.toString()}/statement?fromDate=2026-04-10&toDate=2026-04-10`)
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    const kinds = (res.body.data.rows as Array<{ kind: string }>).map((row) => row.kind);
+    expect(kinds).toEqual(["deposit", "withdrawal"]);
+  });
+
   it("returns downloadable CSV when sync player import has invalid rows", async () => {
     const invalidCsv = [
       "exchange_name,player_id,phone,bonus_percentage,first_deposit_bonus_percentage",

@@ -41,8 +41,8 @@ export const listWithdrawalQuerySchema = z.object({
   pageSize: z.coerce.number().int().positive().max(500).default(20),
   limit: z.coerce.number().int().positive().max(500).optional(),
   sortBy: z
-    .enum(["createdAt", "amount", "payableAmount", "status", "playerName", "bankName", "utr"])
-    .default("createdAt"),
+    .enum(["requestedAt", "createdAt", "amount", "payableAmount", "status", "playerName", "bankName", "utr"])
+    .default("requestedAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
   status: z.string().optional(),
   playerName: z.string().optional(),
