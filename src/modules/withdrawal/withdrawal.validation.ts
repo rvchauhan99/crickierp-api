@@ -1,5 +1,14 @@
 import { z } from "zod";
 
+const optionalDateTime = z.preprocess(
+  (value) => {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    return trimmed === "" ? undefined : trimmed;
+  },
+  z.string().datetime({ offset: true }).optional(),
+);
+
 export const createWithdrawalBodySchema = z.object({
   playerId: z.string().length(24),
   accountNumber: z.string().min(1).max(40).trim(),
@@ -8,6 +17,7 @@ export const createWithdrawalBodySchema = z.object({
   ifsc: z.string().min(4).max(20).trim(),
   amount: z.number().min(1),
   reverseBonus: z.number().min(0).optional().default(0),
+  requestedAt: optionalDateTime,
 });
 
 export const withdrawalBankerPayoutBodySchema = z.object({
@@ -69,6 +79,7 @@ export const amendWithdrawalBodySchema = z.object({
   reverseBonus: z.number().min(0),
   payoutBankId: z.string().length(24),
   utr: z.string().min(4).max(120).trim(),
+  requestedAt: optionalDateTime,
   reasonId: z.string().length(24),
   remark: z.string().max(2000).trim().optional(),
 });

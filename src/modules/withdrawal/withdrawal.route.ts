@@ -1,11 +1,13 @@
 import { Router } from "express";
 import { authMiddleware } from "../../shared/middlewares/auth.middleware";
 import { permissionMiddleware } from "../../shared/middlewares/permission.middleware";
+import { requireSuperadminMiddleware } from "../../shared/middlewares/superadmin.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import { validate } from "../../shared/middlewares/validate.middleware";
 import {
   amendWithdrawalController,
   createWithdrawalController,
+  deleteWithdrawalController,
   listSavedAccountsController,
   listWithdrawalController,
   updateWithdrawalExchangeController,
@@ -82,5 +84,7 @@ withdrawalRouter.get(
   validate({ query: listWithdrawalQuerySchema }),
   listWithdrawalController,
 );
+
+withdrawalRouter.delete("/:id", requireSuperadminMiddleware, deleteWithdrawalController);
 
 export { withdrawalRouter };

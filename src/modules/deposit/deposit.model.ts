@@ -40,6 +40,8 @@ export interface DepositDocument {
   exchangeActionBy?: Types.ObjectId;
   exchangeActionAt?: Date;
   bankBalanceAfter?: number;
+  /** Business entry datetime selected by banker (can be backdated). */
+  entryAt?: Date;
   settledAt?: Date;
   /** Number of successful post-settlement amendments. */
   amendmentCount?: number;
@@ -94,6 +96,7 @@ const depositSchema = new Schema<DepositDocument>(
     exchangeActionBy: { type: Schema.Types.ObjectId, ref: "User" },
     exchangeActionAt: { type: Date },
     bankBalanceAfter: { type: Number, min: 0 },
+    entryAt: { type: Date },
     settledAt: { type: Date },
     amendmentCount: { type: Number, min: 0, default: 0 },
     lastAmendedAt: { type: Date },

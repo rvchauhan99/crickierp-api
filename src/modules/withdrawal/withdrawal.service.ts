@@ -5,7 +5,10 @@ import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
+import { DepositModel } from "../deposit/deposit.model";
+import { ExpenseModel } from "../expense/expense.model";
 import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
+import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { AuditLogModel } from "../audit/audit.model";
@@ -34,6 +37,15 @@ function trimUndef(s: string | undefined): string | undefined {
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseBusinessDateTime(value: string | undefined, fieldName: string): Date {
+  if (!value) return new Date();
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError("validation_error", `${fieldName} must be a valid datetime`, 400);
+  }
+  return parsed;
 }
 
 function textFieldCondition(field: string, value: string, op: string | undefined): Record<string, unknown> {
@@ -212,6 +224,74 @@ function payableFromAmounts(amount: number, reverseBonus: number): number {
   return Math.max(0, Math.round(raw * 100) / 100);
 }
 
+async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<Map<string, number>> {
+  if (bankIds.length === 0) return new Map();
+  const [banks, deposits, withdrawals, expenses, liabilities] = await Promise.all([
+    BankModel.find({ _id: { $in: bankIds } })
+      .select({ _id: 1, openingBalance: 1 })
+      .lean(),
+    DepositModel.find({ bankId: { $in: bankIds }, status: "verified" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    WithdrawalModel.find({ payoutBankId: { $in: bankIds }, status: "approved" })
+      .select({ payoutBankId: 1, amount: 1, payableAmount: 1 })
+      .lean(),
+    ExpenseModel.find({ bankId: { $in: bankIds }, status: "approved" })
+      .select({ bankId: 1, amount: 1 })
+      .lean(),
+    LiabilityEntryModel.find({
+      $or: [
+        { fromAccountType: "bank", fromAccountId: { $in: bankIds } },
+        { toAccountType: "bank", toAccountId: { $in: bankIds } },
+      ],
+    })
+      .select({ fromAccountType: 1, fromAccountId: 1, toAccountType: 1, toAccountId: 1, amount: 1 })
+      .lean(),
+  ]);
+
+  const totals = new Map<string, number>();
+  for (const b of banks) totals.set(String(b._id), Number(b.openingBalance ?? 0));
+  for (const d of deposits) {
+    const id = String(d.bankId);
+    totals.set(id, (totals.get(id) ?? 0) + Number(d.amount ?? 0));
+  }
+  for (const w of withdrawals) {
+    const id = String(w.payoutBankId);
+    totals.set(id, (totals.get(id) ?? 0) - Number(w.payableAmount ?? w.amount ?? 0));
+  }
+  for (const e of expenses) {
+    const id = String(e.bankId);
+    totals.set(id, (totals.get(id) ?? 0) - Number(e.amount ?? 0));
+  }
+  for (const le of liabilities) {
+    const amt = Number(le.amount ?? 0);
+    if (le.fromAccountType === "bank" && le.fromAccountId) {
+      const id = String(le.fromAccountId);
+      totals.set(id, (totals.get(id) ?? 0) - amt);
+    }
+    if (le.toAccountType === "bank" && le.toAccountId) {
+      const id = String(le.toAccountId);
+      totals.set(id, (totals.get(id) ?? 0) + amt);
+    }
+  }
+  return totals;
+}
+
+async function normalizeBankCurrentBalances(bankIds: string[]) {
+  const unique = [...new Set(bankIds.filter((id) => Types.ObjectId.isValid(id)))];
+  if (unique.length === 0) return;
+  const objectIds = unique.map((id) => new Types.ObjectId(id));
+  const totals = await computeClosingBalanceActualByBankIds(objectIds);
+  await Promise.all(
+    unique.map((id) =>
+      BankModel.updateOne(
+        { _id: new Types.ObjectId(id) },
+        { $set: { currentBalance: Number(totals.get(id) ?? 0) } },
+      ),
+    ),
+  );
+}
+
 export async function createWithdrawal(
   input: {
     playerId: string;
@@ -221,6 +301,7 @@ export async function createWithdrawal(
     ifsc: string;
     amount: number;
     reverseBonus: number;
+    requestedAt?: string;
   },
   actorId: string,
   requestId?: string,
@@ -242,6 +323,7 @@ export async function createWithdrawal(
     amount: input.amount,
     reverseBonus,
     payableAmount,
+    requestedAt: parseBusinessDateTime(input.requestedAt, "requestedAt"),
     status: "requested",
     createdBy: new Types.ObjectId(actorId),
   });
@@ -256,6 +338,7 @@ export async function createWithdrawal(
       accountNumber: input.accountNumber,
       amount: input.amount,
       payableAmount,
+      requestedAt: doc.requestedAt,
     } as unknown as Record<string, unknown>,
     requestId,
   });
@@ -628,6 +711,77 @@ export async function exportWithdrawalsToBuffer(
   ], "Withdrawals");
 }
 
+export async function deleteWithdrawalWithReversal(id: string, actorId: string, requestId?: string) {
+  const doc = await WithdrawalModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
+
+  const oldValue = {
+    playerId: doc.player?.toString(),
+    playerName: doc.playerName,
+    amount: doc.amount,
+    reverseBonus: doc.reverseBonus,
+    payableAmount: doc.payableAmount,
+    payoutBankId: doc.payoutBankId?.toString(),
+    payoutBankName: doc.payoutBankName,
+    utr: doc.utr,
+    status: doc.status,
+    requestedAt: doc.requestedAt,
+    amendmentCount: doc.amendmentCount,
+    amendmentHistory: doc.amendmentHistory ?? [],
+    createdAt: doc.createdAt,
+  };
+
+  const impactedBankIds = new Set<string>();
+  if (doc.payoutBankId && Types.ObjectId.isValid(String(doc.payoutBankId))) {
+    impactedBankIds.add(String(doc.payoutBankId));
+  }
+  for (const entry of doc.amendmentHistory ?? []) {
+    const oldBankId = entry.old?.payoutBankId;
+    const newBankId = entry.new?.payoutBankId;
+    if (oldBankId && Types.ObjectId.isValid(oldBankId)) impactedBankIds.add(oldBankId);
+    if (newBankId && Types.ObjectId.isValid(newBankId)) impactedBankIds.add(newBankId);
+  }
+  const shouldNormalizeBanks =
+    doc.status === "approved" ||
+    doc.status === "finalized" ||
+    (doc.amendmentCount ?? 0) > 0 ||
+    (doc.amendmentHistory?.length ?? 0) > 0;
+
+  await WithdrawalModel.deleteOne({ _id: doc._id });
+
+  let recomputedExchangeId: string | undefined;
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      recomputedExchangeId = String(player.exchange);
+      await recomputeExchangeCurrentBalance(recomputedExchangeId);
+    }
+  }
+
+  if (shouldNormalizeBanks && impactedBankIds.size > 0) {
+    await normalizeBankCurrentBalances([...impactedBankIds]);
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "withdrawal.delete",
+    entity: "withdrawal",
+    entityId: String(doc._id),
+    oldValue: oldValue as unknown as Record<string, unknown>,
+    newValue: {
+      deleted: true,
+      reversal: {
+        status: doc.status,
+        normalizedBankIds: [...impactedBankIds],
+        recomputedExchangeId,
+      },
+    },
+    requestId,
+  });
+
+  return { id: String(doc._id), deleted: true };
+}
+
 export async function amendWithdrawal(
   id: string,
   input: AmendWithdrawalInput,
@@ -649,6 +803,9 @@ export async function amendWithdrawal(
 
   const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
   const newPayable = payableFromAmounts(input.amount, input.reverseBonus);
+  const nextRequestedAt = input.requestedAt
+    ? parseBusinessDateTime(input.requestedAt, "requestedAt")
+    : doc.requestedAt;
   const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.WITHDRAWAL_FINAL_AMEND);
   const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
   const oldBankId = String(doc.payoutBankId);
@@ -662,6 +819,7 @@ export async function amendWithdrawal(
     payoutBankName: doc.payoutBankName,
     utr: doc.utr,
   };
+  const oldRequestedAt = doc.requestedAt;
   const newSnapshot: WithdrawalAmendmentSnapshot = {
     amount: input.amount,
     reverseBonus: input.reverseBonus,
@@ -720,6 +878,7 @@ export async function amendWithdrawal(
     doc.payoutBankId = new Types.ObjectId(newBankId);
     doc.payoutBankName = newSnapshot.payoutBankName ?? doc.payoutBankName;
     doc.utr = input.utr.trim();
+    doc.requestedAt = nextRequestedAt;
     doc.amendmentCount = (doc.amendmentCount ?? 0) + 1;
     doc.lastAmendedAt = new Date();
     doc.lastAmendedBy = new Types.ObjectId(actorId);
@@ -743,9 +902,10 @@ export async function amendWithdrawal(
     action: "withdrawal.amend",
     entity: "withdrawal",
     entityId: doc._id.toString(),
-    oldValue: oldSnapshot as unknown as Record<string, unknown>,
+    oldValue: { ...oldSnapshot, requestedAt: oldRequestedAt } as unknown as Record<string, unknown>,
     newValue: {
       ...newSnapshot,
+      requestedAt: nextRequestedAt,
       reason: amendReasonText,
       reasonId: resolved.id,
       remark: input.remark?.trim() || undefined,

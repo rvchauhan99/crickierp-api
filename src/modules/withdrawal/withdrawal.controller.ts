@@ -3,6 +3,7 @@ import { StatusCodes } from "http-status-codes";
 import {
   amendWithdrawal,
   createWithdrawal,
+  deleteWithdrawalWithReversal,
   listSavedAccountsForPlayer,
   listWithdrawals,
   updateWithdrawalByExchange,
@@ -51,6 +52,12 @@ export async function amendWithdrawalController(req: Request, res: Response) {
   const body = amendWithdrawalBodySchema.parse(req.body);
   const id = String(req.params.id);
   const data = await amendWithdrawal(id, body, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function deleteWithdrawalController(req: Request, res: Response) {
+  const id = String(req.params.id);
+  const data = await deleteWithdrawalWithReversal(id, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 

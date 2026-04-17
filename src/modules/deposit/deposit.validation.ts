@@ -1,9 +1,19 @@
 import { z } from "zod";
 
+const optionalDateTime = z.preprocess(
+  (value) => {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    return trimmed === "" ? undefined : trimmed;
+  },
+  z.string().datetime({ offset: true }).optional(),
+);
+
 export const createDepositBodySchema = z.object({
   bankId: z.string().length(24),
   utr: z.string().min(4).max(120).trim(),
   amount: z.number().min(1),
+  entryAt: optionalDateTime,
 });
 
 export const updateDepositBodySchema = createDepositBodySchema;
@@ -59,6 +69,7 @@ export const amendDepositBodySchema = z.object({
   amount: z.number().min(1),
   playerId: z.string().length(24),
   bonusAmount: z.number().min(0),
+  entryAt: optionalDateTime,
   reasonId: z.string().length(24),
   remark: z.string().max(2000).trim().optional(),
 });

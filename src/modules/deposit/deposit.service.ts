@@ -35,6 +35,15 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function parseBusinessDateTime(value: string | undefined, fieldName: string): Date {
+  if (!value) return new Date();
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError("validation_error", `${fieldName} must be a valid datetime`, 400);
+  }
+  return parsed;
+}
+
 function textFieldCondition(field: string, value: string, op: string | undefined): Record<string, unknown> {
   const operator = op || "contains";
   const esc = escapeRegex(value);
@@ -268,7 +277,7 @@ async function utrConflictsWithNonRejected(utr: string, excludeId?: Types.Object
 }
 
 export async function createDeposit(
-  input: { bankId: string; utr: string; amount: number },
+  input: { bankId: string; utr: string; amount: number; entryAt?: string },
   actorId: string,
   requestId?: string,
 ) {
@@ -285,6 +294,7 @@ export async function createDeposit(
     utr: input.utr.trim(),
     amount: input.amount,
     status: "pending",
+    entryAt: parseBusinessDateTime(input.entryAt, "entryAt"),
     createdBy: new Types.ObjectId(actorId),
   });
 
@@ -297,6 +307,7 @@ export async function createDeposit(
       bankId: input.bankId,
       utr: input.utr,
       amount: input.amount,
+      entryAt: doc.entryAt,
     } as unknown as Record<string, unknown>,
     requestId,
   });
@@ -475,6 +486,118 @@ export async function exportDepositsToBuffer(
   ], "Deposits");
 }
 
+async function recomputeExchangesForDepositPlayers(doc: {
+  player?: Types.ObjectId;
+  amendmentHistory?: Array<{
+    old?: { playerId?: string };
+    new?: { playerId?: string };
+  }>;
+}) {
+  const playerIds = new Set<string>();
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    playerIds.add(String(doc.player));
+  }
+  for (const entry of doc.amendmentHistory ?? []) {
+    const oldPlayerId = entry.old?.playerId;
+    const newPlayerId = entry.new?.playerId;
+    if (oldPlayerId && Types.ObjectId.isValid(oldPlayerId)) playerIds.add(oldPlayerId);
+    if (newPlayerId && Types.ObjectId.isValid(newPlayerId)) playerIds.add(newPlayerId);
+  }
+  if (playerIds.size === 0) return;
+
+  const rows = await PlayerModel.find({ _id: { $in: [...playerIds].map((id) => new Types.ObjectId(id)) } })
+    .select("exchange")
+    .lean();
+  const exchangeIds = new Set<string>();
+  for (const row of rows) {
+    if (row.exchange) {
+      exchangeIds.add(String(row.exchange));
+    }
+  }
+  for (const exchangeId of exchangeIds) {
+    await recomputeExchangeCurrentBalance(exchangeId);
+  }
+}
+
+export async function deleteDepositWithReversal(id: string, actorId: string, requestId?: string) {
+  const doc = await DepositModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+
+  const oldValue = {
+    bankId: doc.bankId?.toString(),
+    bankName: doc.bankName,
+    utr: doc.utr,
+    amount: doc.amount,
+    status: doc.status,
+    playerId: doc.player?.toString(),
+    bonusAmount: doc.bonusAmount,
+    totalAmount: doc.totalAmount,
+    entryAt: doc.entryAt,
+    settledAt: doc.settledAt,
+    amendmentCount: doc.amendmentCount,
+    amendmentHistory: doc.amendmentHistory ?? [],
+    createdAt: doc.createdAt,
+  };
+
+  const shouldReverseBank =
+    (doc.status === "verified" || doc.status === "finalized") &&
+    !!doc.bankId &&
+    Number.isFinite(Number(doc.amount));
+
+  let bankReversalMeta: { bankId?: string; previousBalance?: number; nextBalance?: number; delta?: number } = {};
+  let rollbackBank: (() => Promise<void>) | null = null;
+
+  if (shouldReverseBank) {
+    const bank = await BankModel.findById(doc.bankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    const prev = bank.currentBalance ?? bank.openingBalance;
+    const delta = Number(doc.amount ?? 0);
+    const next = prev - delta;
+    bank.currentBalance = next;
+    await bank.save();
+    bankReversalMeta = {
+      bankId: String(bank._id),
+      previousBalance: prev,
+      nextBalance: next,
+      delta: -delta,
+    };
+    rollbackBank = async () => {
+      bank.currentBalance = prev;
+      await bank.save();
+    };
+  }
+
+  try {
+    await DepositModel.deleteOne({ _id: doc._id });
+  } catch (error) {
+    if (rollbackBank) await rollbackBank();
+    throw error;
+  }
+
+  await recomputeExchangesForDepositPlayers({
+    player: doc.player,
+    amendmentHistory: doc.amendmentHistory as Array<{ old?: { playerId?: string }; new?: { playerId?: string } }>,
+  });
+
+  await createAuditLog({
+    actorId,
+    action: "deposit.delete",
+    entity: "deposit",
+    entityId: String(doc._id),
+    oldValue: oldValue as unknown as Record<string, unknown>,
+    newValue: {
+      deleted: true,
+      reversal: {
+        status: doc.status,
+        bank: bankReversalMeta,
+      },
+    },
+    requestId,
+  });
+
+  return { id: String(doc._id), deleted: true };
+}
+
 function bonusAmountFromPercent(amount: number, percent: number): number {
   return Math.round(((amount * percent) / 100) * 100) / 100;
 }
@@ -648,6 +771,7 @@ export async function amendVerifiedDeposit(
 
   const bonus = Math.round(Number(input.bonusAmount) * 100) / 100;
   const totalAmount = Math.round((input.amount + bonus) * 100) / 100;
+  const nextEntryAt = input.entryAt ? parseBusinessDateTime(input.entryAt, "entryAt") : doc.entryAt;
   const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.DEPOSIT_FINAL_AMEND);
   const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
 
@@ -665,6 +789,7 @@ export async function amendVerifiedDeposit(
     bonusAmount: doc.bonusAmount,
     totalAmount: doc.totalAmount,
   };
+  const oldEntryAt = doc.entryAt;
 
   const newSnapshotPlain: DepositAmendmentSnapshot = {
     bankId: input.bankId,
@@ -734,6 +859,7 @@ export async function amendVerifiedDeposit(
     doc.player = new Types.ObjectId(input.playerId);
     doc.bonusAmount = bonus;
     doc.totalAmount = totalAmount;
+    doc.entryAt = nextEntryAt;
     doc.bankBalanceAfter = newBankBalanceAfter;
     doc.amendmentCount = (doc.amendmentCount ?? 0) + 1;
     doc.lastAmendedAt = new Date();
@@ -766,9 +892,10 @@ export async function amendVerifiedDeposit(
     action: "deposit.amend",
     entity: "deposit",
     entityId: doc._id.toString(),
-    oldValue: oldSnapshot as unknown as Record<string, unknown>,
+    oldValue: { ...oldSnapshot, entryAt: oldEntryAt } as unknown as Record<string, unknown>,
     newValue: {
       ...newSnapshotPlain,
+      entryAt: nextEntryAt,
       reason: amendReasonText,
       reasonId: resolved.id,
       remark: input.remark?.trim() || undefined,
