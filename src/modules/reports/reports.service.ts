@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { Aggregate, PipelineStage, Types } from "mongoose";
 import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { AuditLogModel } from "../audit/audit.model";
@@ -303,10 +303,10 @@ async function getExchangePeriodBalancesForDashboard(args: {
   fromUtc: Date | null;
   toUtc: Date | null;
   DepositModel: {
-    aggregate: <T = unknown>(pipeline: Record<string, unknown>[]) => Promise<T[]>;
+    aggregate: <T = unknown>(pipeline?: PipelineStage[]) => Aggregate<T[]>;
   };
   WithdrawalModel: {
-    aggregate: <T = unknown>(pipeline: Record<string, unknown>[]) => Promise<T[]>;
+    aggregate: <T = unknown>(pipeline?: PipelineStage[]) => Aggregate<T[]>;
   };
 }): Promise<Map<string, ExchangeBalanceSummary>> {
   const { exchangeIds, fromUtc, toUtc, DepositModel, WithdrawalModel } = args;
