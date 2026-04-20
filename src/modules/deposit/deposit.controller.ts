@@ -5,6 +5,7 @@ import {
   createDeposit,
   deleteDepositWithReversal,
   exchangeApproveDeposit,
+  exchangeMarkNotSettled,
   exchangeRejectDeposit,
   exportDepositsToBuffer,
   listDeposits,
@@ -75,6 +76,12 @@ export async function exchangeActionController(req: Request, res: Response) {
       req.user!.userId,
       req.requestId,
     );
+    res.status(StatusCodes.OK).json({ success: true, data });
+    return;
+  }
+
+  if (body.action === "mark_not_settled") {
+    const data = await exchangeMarkNotSettled(id, req.user!.userId, req.requestId);
     res.status(StatusCodes.OK).json({ success: true, data });
     return;
   }

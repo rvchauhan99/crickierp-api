@@ -177,6 +177,7 @@ function buildDepositListFilter(q: ListDepositQuery, timeZone: string): Record<s
   if (
     !statusShowAll &&
     (statusFilter === "pending" ||
+      statusFilter === "not_settled" ||
       statusFilter === "verified" ||
       statusFilter === "rejected" ||
       statusFilter === "finalized")
@@ -471,17 +472,17 @@ export async function exportDepositsToBuffer(
   return generateExcelBuffer(rows, [
     { header: "UTR", key: "utr" },
     { header: "Bank label", key: "bankName" },
-    { header: "Amount", key: "amount" },
+    { header: "Amount", transform: (r) => Math.round(Number(r.amount ?? 0)) },
     { header: "Status", key: "status" },
-    { header: "Bonus amount", key: "bonusAmount" },
-    { header: "Total amount", key: "totalAmount" },
+    { header: "Bonus amount", transform: (r) => Math.round(Number(r.bonusAmount ?? 0)) },
+    { header: "Total amount", transform: (r) => Math.round(Number(r.totalAmount ?? 0)) },
     { header: "Amendment count", key: "amendmentCount" },
     {
       header: "Last amended at",
       transform: (r) => formatDateTimeForTimeZone(r.lastAmendedAt, timeZone),
     },
     { header: "Reject reason", key: "rejectReason" },
-    { header: "Bank balance after", key: "bankBalanceAfter" },
+    { header: "Bank balance after", transform: (r) => Math.round(Number(r.bankBalanceAfter ?? 0)) },
     { header: "Settled at", transform: (r) => formatDateTimeForTimeZone(r.settledAt, timeZone) },
     {
       header: "Transaction at",
@@ -603,7 +604,7 @@ export async function deleteDepositWithReversal(id: string, actorId: string, req
 }
 
 function bonusAmountFromPercent(amount: number, percent: number): number {
-  return Math.round(((amount * percent) / 100) * 100) / 100;
+  return Math.round((amount * percent) / 100);
 }
 
 async function isFirstDepositForPlayer(playerId: Types.ObjectId, currentDepositId: Types.ObjectId): Promise<boolean> {
@@ -628,8 +629,8 @@ export async function exchangeApproveDeposit(
 
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
-  if (doc.status !== "pending") {
-    throw new AppError("business_rule_error", "Deposit is not pending exchange action", 400);
+  if (doc.status !== "pending" && doc.status !== "not_settled") {
+    throw new AppError("business_rule_error", "Deposit is not pending/not-settled exchange action", 400);
   }
   if (!doc.bankId) {
     throw new AppError("business_rule_error", "Deposit has no bank linked", 400);
@@ -649,8 +650,8 @@ export async function exchangeApproveDeposit(
     ? playerDoc.firstDepositBonusPercentage
     : playerDoc.regularBonusPercentage;
   const bonusFromRule = bonusAmountFromPercent(doc.amount, appliedBonusPercent);
-  const bonus = Math.round(requestedBonus * 100) / 100;
-  const totalAmount = doc.amount + bonus;
+  const bonus = Math.round(requestedBonus);
+  const totalAmount = Math.round(Number(doc.amount) + bonus);
   const bankCashCredit = doc.amount;
   const bank = await BankModel.findById(doc.bankId);
   if (!bank) throw new AppError("not_found", "Bank not found", 404);
@@ -701,6 +702,39 @@ export async function exchangeApproveDeposit(
   return doc;
 }
 
+export async function exchangeMarkNotSettled(id: string, actorId: string, requestId?: string) {
+  const doc = await DepositModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+  if (doc.status !== "pending") {
+    throw new AppError("business_rule_error", "Only pending deposits can be marked not settled", 400);
+  }
+
+  doc.status = "not_settled";
+  doc.exchangeActionBy = new Types.ObjectId(actorId);
+  doc.exchangeActionAt = new Date();
+  doc.player = undefined;
+  doc.bonusAmount = undefined;
+  doc.totalAmount = undefined;
+  doc.bankBalanceAfter = undefined;
+  doc.settledAt = undefined;
+  doc.rejectReason = undefined;
+  doc.rejectReasonId = undefined;
+  await doc.save();
+
+  await createAuditLog({
+    actorId,
+    action: "deposit.exchange_mark_not_settled",
+    entity: "deposit",
+    entityId: doc._id.toString(),
+    newValue: {
+      status: "not_settled",
+    },
+    requestId,
+  });
+
+  return doc;
+}
+
 export async function exchangeRejectDeposit(
   id: string,
   input: { reasonId: string; remark?: string },
@@ -712,8 +746,8 @@ export async function exchangeRejectDeposit(
 
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
-  if (doc.status !== "pending") {
-    throw new AppError("business_rule_error", "Deposit is not pending exchange action", 400);
+  if (doc.status !== "pending" && doc.status !== "not_settled") {
+    throw new AppError("business_rule_error", "Deposit is not pending/not-settled exchange action", 400);
   }
 
   doc.status = "rejected";
@@ -773,8 +807,8 @@ export async function amendVerifiedDeposit(
     throw new AppError("business_rule_error", "Player has no exchange assigned", 400);
   }
 
-  const bonus = Math.round(Number(input.bonusAmount) * 100) / 100;
-  const totalAmount = Math.round((input.amount + bonus) * 100) / 100;
+  const bonus = Math.round(Number(input.bonusAmount));
+  const totalAmount = Math.round(Number(input.amount) + bonus);
   const nextEntryAt = input.entryAt ? parseBusinessDateTime(input.entryAt, "entryAt") : doc.entryAt;
   const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.DEPOSIT_FINAL_AMEND);
   const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
