@@ -4,6 +4,7 @@ import type { z } from "zod";
 import { AuditLogModel } from "../audit/audit.model";
 import { BankModel } from "../bank/bank.model";
 import { ExchangeModel } from "../exchange/exchange.model";
+import { ExchangeTopupModel } from "../exchange-topup/exchange-topup.model";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { UserModel } from "../users/user.model";
@@ -105,6 +106,11 @@ type DashboardFilterContext = {
   exchangeStatsFilter: Record<string, unknown>;
 };
 
+type ExchangeBalanceSummary = {
+  periodOpeningBalance: number;
+  periodClosingBalance: number;
+};
+
 function businessDateRangeExpr(field: "entryAt" | "requestedAt", startUtc: Date | null, endUtc: Date | null) {
   if (!startUtc || !endUtc) return {};
   const txExpr = { $ifNull: [`$${field}`, "$createdAt"] };
@@ -146,7 +152,7 @@ function liabilityDateBeforeExpr(beforeUtc: Date | null) {
 }
 
 function statusFilterForDeposit(status: DashboardStatusFilter | undefined): Record<string, unknown> {
-  if (status === "pending") return { status: "pending" };
+  if (status === "pending") return { status: { $in: ["pending", "not_settled"] } };
   if (status === "approved") return { status: { $in: ["verified", "finalized"] } };
   if (status === "rejected") return { status: "rejected" };
   return {};
@@ -290,6 +296,143 @@ async function buildDashboardFilterContext(
     expenseFilter,
     exchangeStatsFilter,
   };
+}
+
+async function getExchangePeriodBalancesForDashboard(args: {
+  exchangeIds: Types.ObjectId[];
+  fromUtc: Date | null;
+  toUtc: Date | null;
+  DepositModel: {
+    aggregate: <T = unknown>(pipeline: Record<string, unknown>[]) => Promise<T[]>;
+  };
+  WithdrawalModel: {
+    aggregate: <T = unknown>(pipeline: Record<string, unknown>[]) => Promise<T[]>;
+  };
+}): Promise<Map<string, ExchangeBalanceSummary>> {
+  const { exchangeIds, fromUtc, toUtc, DepositModel, WithdrawalModel } = args;
+  const balanceMap = new Map<string, ExchangeBalanceSummary>();
+  if (exchangeIds.length === 0) return balanceMap;
+
+  const exchanges = await ExchangeModel.find({ _id: { $in: exchangeIds } })
+    .select({ _id: 1, openingBalance: 1 })
+    .lean();
+  if (exchanges.length === 0) return balanceMap;
+
+  if (!fromUtc || !toUtc) {
+    for (const row of exchanges) {
+      const opening = Number(row.openingBalance ?? 0);
+      balanceMap.set(String(row._id), {
+        periodOpeningBalance: opening,
+        periodClosingBalance: opening,
+      });
+    }
+    return balanceMap;
+  }
+
+  const depositEventExpr = {
+    $ifNull: ["$entryAt", { $ifNull: ["$settledAt", { $ifNull: ["$exchangeActionAt", { $ifNull: ["$updatedAt", "$createdAt"] }] }] }],
+  };
+  const withdrawalEventExpr = {
+    $ifNull: ["$requestedAt", { $ifNull: ["$updatedAt", "$createdAt"] }],
+  };
+
+  const [depositPrior, depositInRange, withdrawalPrior, withdrawalInRange, topupPrior, topupInRange] = await Promise.all([
+    DepositModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
+      {
+        $match: {
+          status: { $in: ["verified", "finalized"] },
+          player: { $exists: true, $ne: null },
+        },
+      },
+      { $lookup: { from: "players", localField: "player", foreignField: "_id", as: "playerDoc" } },
+      { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
+      { $match: { "playerDoc.exchange": { $in: exchangeIds } } },
+      { $addFields: { eventAt: depositEventExpr } },
+      { $match: { eventAt: { $lt: fromUtc } } },
+      { $group: { _id: "$playerDoc.exchange", totalAmount: { $sum: { $ifNull: ["$totalAmount", "$amount"] } } } },
+    ]),
+    DepositModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
+      {
+        $match: {
+          status: { $in: ["verified", "finalized"] },
+          player: { $exists: true, $ne: null },
+        },
+      },
+      { $lookup: { from: "players", localField: "player", foreignField: "_id", as: "playerDoc" } },
+      { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
+      { $match: { "playerDoc.exchange": { $in: exchangeIds } } },
+      { $addFields: { eventAt: depositEventExpr } },
+      { $match: { eventAt: { $gte: fromUtc, $lte: toUtc } } },
+      { $group: { _id: "$playerDoc.exchange", totalAmount: { $sum: { $ifNull: ["$totalAmount", "$amount"] } } } },
+    ]),
+    WithdrawalModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
+      {
+        $match: {
+          status: { $in: ["approved", "finalized"] },
+          player: { $exists: true, $ne: null },
+        },
+      },
+      { $lookup: { from: "players", localField: "player", foreignField: "_id", as: "playerDoc" } },
+      { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
+      { $match: { "playerDoc.exchange": { $in: exchangeIds } } },
+      { $addFields: { eventAt: withdrawalEventExpr } },
+      { $match: { eventAt: { $lt: fromUtc } } },
+      { $group: { _id: "$playerDoc.exchange", totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } } } },
+    ]),
+    WithdrawalModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
+      {
+        $match: {
+          status: { $in: ["approved", "finalized"] },
+          player: { $exists: true, $ne: null },
+        },
+      },
+      { $lookup: { from: "players", localField: "player", foreignField: "_id", as: "playerDoc" } },
+      { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
+      { $match: { "playerDoc.exchange": { $in: exchangeIds } } },
+      { $addFields: { eventAt: withdrawalEventExpr } },
+      { $match: { eventAt: { $gte: fromUtc, $lte: toUtc } } },
+      { $group: { _id: "$playerDoc.exchange", totalAmount: { $sum: { $ifNull: ["$payableAmount", "$amount"] } } } },
+    ]),
+    ExchangeTopupModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
+      { $match: { exchangeId: { $in: exchangeIds }, createdAt: { $lt: fromUtc } } },
+      { $group: { _id: "$exchangeId", totalAmount: { $sum: "$amount" } } },
+    ]),
+    ExchangeTopupModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
+      { $match: { exchangeId: { $in: exchangeIds }, createdAt: { $gte: fromUtc, $lte: toUtc } } },
+      { $group: { _id: "$exchangeId", totalAmount: { $sum: "$amount" } } },
+    ]),
+  ]);
+
+  const toAmountMap = (rows: Array<{ _id: Types.ObjectId; totalAmount?: number }>) => {
+    const out = new Map<string, number>();
+    for (const row of rows) out.set(String(row._id), Number(row.totalAmount ?? 0));
+    return out;
+  };
+
+  const depositPriorMap = toAmountMap(depositPrior);
+  const depositRangeMap = toAmountMap(depositInRange);
+  const withdrawalPriorMap = toAmountMap(withdrawalPrior);
+  const withdrawalRangeMap = toAmountMap(withdrawalInRange);
+  const topupPriorMap = toAmountMap(topupPrior);
+  const topupRangeMap = toAmountMap(topupInRange);
+
+  for (const row of exchanges) {
+    const exchangeId = String(row._id);
+    const openingBase = Number(row.openingBalance ?? 0);
+    const periodOpeningBalance =
+      openingBase -
+      Number(depositPriorMap.get(exchangeId) ?? 0) +
+      Number(withdrawalPriorMap.get(exchangeId) ?? 0) +
+      Number(topupPriorMap.get(exchangeId) ?? 0);
+    const periodClosingBalance =
+      periodOpeningBalance -
+      Number(depositRangeMap.get(exchangeId) ?? 0) +
+      Number(withdrawalRangeMap.get(exchangeId) ?? 0) +
+      Number(topupRangeMap.get(exchangeId) ?? 0);
+
+    balanceMap.set(exchangeId, { periodOpeningBalance, periodClosingBalance });
+  }
+  return balanceMap;
 }
 
 export async function getDashboardSummary(
@@ -838,9 +981,9 @@ export async function getDashboardSummary(
     depositCount += row.count ?? 0;
     bonusTotal += row.bonusTotal ?? 0;
     
-    if (row._id === "pending") {
-      depositPendingCount = row.count ?? 0;
-      depositPendingAmount = row.totalAmount ?? 0;
+    if (row._id === "pending" || row._id === "not_settled") {
+      depositPendingCount += row.count ?? 0;
+      depositPendingAmount += row.totalAmount ?? 0;
     }
     if (row._id === "verified" || row._id === "finalized") {
       depositVerifiedAmount += row.totalAmount ?? 0;
@@ -989,8 +1132,25 @@ export async function getDashboardSummary(
   }
 
   const exchangesBreakdown = Array.from(exchangeMap.values())
+    .map((e) => ({ ...e, exchangeIdString: String(e.exchangeId) }))
     .map((e) => ({
       ...e,
+      exchangeObjectId: Types.ObjectId.isValid(e.exchangeIdString) ? new Types.ObjectId(e.exchangeIdString) : null,
+    }));
+  const exchangeBalanceMap = await getExchangePeriodBalancesForDashboard({
+    exchangeIds: exchangesBreakdown
+      .map((row) => row.exchangeObjectId)
+      .filter((value): value is Types.ObjectId => value instanceof Types.ObjectId),
+    fromUtc: rangeStartUtc,
+    toUtc: rangeEndUtc,
+    DepositModel,
+    WithdrawalModel,
+  });
+
+  const exchangesBreakdownWithBalances = exchangesBreakdown
+    .map((e) => ({
+      ...e,
+      exchangeId: e.exchangeIdString,
       newPlayersToday:
         exchangeNewPlayersTodayAgg.find((row: { _id?: unknown; newPlayersToday?: number }) => String(row._id) === e.exchangeId)
           ?.newPlayersToday ?? 0,
@@ -1000,6 +1160,8 @@ export async function getDashboardSummary(
         )?.firstTimeDepositAmountToday ?? 0,
       netPL: e.depositVerified - e.withdrawalApproved,
       netBonus: e.bonusGiven - e.bonusRecovered,
+      periodOpeningBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodOpeningBalance ?? 0 : 0,
+      periodClosingBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodClosingBalance ?? 0 : 0,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
   const firstTimeDepositAmountToday =
@@ -1146,7 +1308,7 @@ export async function getDashboardSummary(
     },
     trendData,
     recentActivity,
-    exchangesBreakdown,
+    exchangesBreakdown: exchangesBreakdownWithBalances,
     banksBreakdown,
   };
 }
@@ -1279,6 +1441,8 @@ export async function exportDashboardSummaryToBuffer(
     Withdrawals: ex.withdrawalTotal,
     "Net P&L": ex.netPL,
     "Bonus Given": ex.bonusGiven,
+    "Period Opening": ex.periodOpeningBalance ?? 0,
+    "Period Closing": ex.periodClosingBalance ?? 0,
   }));
 
   const recentTxns = data.recentActivity.map((t) => ({
@@ -1307,6 +1471,8 @@ export async function exportDashboardSummaryToBuffer(
         { header: "Withdrawals", key: "Withdrawals" },
         { header: "Net P&L", key: "Net P&L" },
         { header: "Bonus Given", key: "Bonus Given" },
+        { header: "Period Opening", key: "Period Opening" },
+        { header: "Period Closing", key: "Period Closing" },
       ],
     },
     {

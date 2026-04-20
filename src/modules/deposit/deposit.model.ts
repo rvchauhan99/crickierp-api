@@ -1,7 +1,7 @@
 import { Schema, model, Types } from "mongoose";
 
-/** pending = awaiting exchange; verified = approved and settled on bank; rejected = exchange rejected; finalized = legacy */
-export type DepositStatus = "pending" | "verified" | "rejected" | "finalized";
+/** pending = awaiting exchange; not_settled = approved but unclaimed; verified = approved and settled on bank; rejected = exchange rejected; finalized = legacy */
+export type DepositStatus = "pending" | "not_settled" | "verified" | "rejected" | "finalized";
 
 /** Snapshot of deposit fields stored on each amendment entry (plain ids for JSON stability). */
 export interface DepositAmendmentSnapshot {
@@ -84,7 +84,7 @@ const depositSchema = new Schema<DepositDocument>(
     amount: { type: Number, required: true, min: 1 },
     status: {
       type: String,
-      enum: ["pending", "verified", "rejected", "finalized"],
+      enum: ["pending", "not_settled", "verified", "rejected", "finalized"],
       default: "pending",
     },
     createdBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },

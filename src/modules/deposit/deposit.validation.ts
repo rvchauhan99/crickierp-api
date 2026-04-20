@@ -12,7 +12,7 @@ const optionalDateTime = z.preprocess(
 export const createDepositBodySchema = z.object({
   bankId: z.string().length(24),
   utr: z.string().min(4).max(120).trim(),
-  amount: z.number().min(1),
+  amount: z.number().int().min(1),
   entryAt: optionalDateTime,
 });
 
@@ -51,9 +51,12 @@ export const listDepositQuerySchema = z.object({
 
 export const exchangeActionBodySchema = z.discriminatedUnion("action", [
   z.object({
+    action: z.literal("mark_not_settled"),
+  }),
+  z.object({
     action: z.literal("approve"),
     playerId: z.string().length(24),
-    bonusAmount: z.number().min(0),
+    bonusAmount: z.number().int().min(0),
   }),
   z.object({
     action: z.literal("reject"),
@@ -66,9 +69,9 @@ export const exchangeActionBodySchema = z.discriminatedUnion("action", [
 export const amendDepositBodySchema = z.object({
   bankId: z.string().length(24),
   utr: z.string().min(4).max(120).trim(),
-  amount: z.number().min(1),
+  amount: z.number().int().min(1),
   playerId: z.string().length(24),
-  bonusAmount: z.number().min(0),
+  bonusAmount: z.number().int().min(0),
   entryAt: optionalDateTime,
   reasonId: z.string().length(24),
   remark: z.string().max(2000).trim().optional(),

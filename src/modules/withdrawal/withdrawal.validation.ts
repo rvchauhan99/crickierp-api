@@ -15,8 +15,8 @@ export const createWithdrawalBodySchema = z.object({
   accountHolderName: z.string().min(1).max(120).trim(),
   bankName: z.string().min(1).max(120).trim(),
   ifsc: z.string().min(4).max(20).trim(),
-  amount: z.number().min(1),
-  reverseBonus: z.number().min(0).optional().default(0),
+  amount: z.number().int().min(1),
+  reverseBonus: z.number().int().min(0).optional().default(0),
   requestedAt: optionalDateTime,
 });
 
@@ -30,8 +30,8 @@ export const updateWithdrawalBodySchema = z.object({
   accountHolderName: z.string().min(1).max(120).trim(),
   bankName: z.string().min(1).max(120).trim(),
   ifsc: z.string().min(4).max(20).trim(),
-  amount: z.number().min(1),
-  reverseBonus: z.number().min(0).optional().default(0),
+  amount: z.number().int().min(1),
+  reverseBonus: z.number().int().min(0).optional().default(0),
 });
 
 export const listWithdrawalQuerySchema = z.object({
@@ -75,8 +75,8 @@ export const updateWithdrawalStatusBodySchema = z.discriminatedUnion("status", [
 ]);
 
 export const amendWithdrawalBodySchema = z.object({
-  amount: z.number().min(1),
-  reverseBonus: z.number().min(0),
+  amount: z.number().int().min(1),
+  reverseBonus: z.number().int().min(0),
   payoutBankId: z.string().length(24),
   utr: z.string().min(4).max(120).trim(),
   requestedAt: optionalDateTime,
