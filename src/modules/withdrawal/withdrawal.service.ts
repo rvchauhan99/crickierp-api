@@ -222,7 +222,7 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Re
 
 function payableFromAmounts(amount: number, reverseBonus: number): number {
   const raw = amount - reverseBonus;
-  return Math.max(0, Math.round(raw * 100) / 100);
+  return Math.max(0, Math.round(raw));
 }
 
 async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<Map<string, number>> {
@@ -696,9 +696,9 @@ export async function exportWithdrawalsToBuffer(
     { header: "Account Holder", key: "accountHolderName" },
     { header: "Bank", key: "bankName" },
     { header: "IFSC", key: "ifsc" },
-    { header: "Amount", key: "amount" },
-    { header: "Reverse Bonus", key: "reverseBonus" },
-    { header: "Payable Amount", key: "payableAmount" },
+    { header: "Amount", transform: (r) => Math.round(Number(r.amount ?? 0)) },
+    { header: "Reverse Bonus", transform: (r) => Math.round(Number(r.reverseBonus ?? 0)) },
+    { header: "Payable Amount", transform: (r) => Math.round(Number(r.payableAmount ?? 0)) },
     { header: "Status", key: "status" },
     { header: "UTR", key: "utr" },
     { header: "Payout Bank", key: "payoutBankName" },
