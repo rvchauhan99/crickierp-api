@@ -12,6 +12,7 @@ import {
   updateDepositByBanker,
 } from "./deposit.service";
 import {
+  approvalQueueEventsQuerySchema,
   amendDepositBodySchema,
   createDepositBodySchema,
   exchangeActionBodySchema,
@@ -19,6 +20,7 @@ import {
   updateDepositBodySchema,
 } from "./deposit.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
+import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
 
 export async function createDepositController(req: Request, res: Response) {
   const body = createDepositBodySchema.parse(req.body);
@@ -93,4 +95,9 @@ export async function exchangeActionController(req: Request, res: Response) {
     req.requestId,
   );
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function streamDepositApprovalQueueEventsController(req: Request, res: Response) {
+  const query = approvalQueueEventsQuerySchema.parse(req.query);
+  subscribeApprovalQueueEvents("deposit", query.view, res);
 }

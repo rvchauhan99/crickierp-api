@@ -21,6 +21,7 @@ import {
 import type { WithdrawalAmendmentSnapshot } from "./withdrawal.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
 import { amendWithdrawalBodySchema, listWithdrawalQuerySchema } from "./withdrawal.validation";
+import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -351,6 +352,7 @@ export async function createWithdrawal(
     }
   }
 
+  emitApprovalQueueEvent("withdrawal", "banker");
   return doc;
 }
 
@@ -419,6 +421,7 @@ export async function updateWithdrawalByExchange(
     }
   }
 
+  emitApprovalQueueEvent("withdrawal", "banker");
   return doc;
 }
 
@@ -469,6 +472,7 @@ export async function updateWithdrawalByBanker(
     requestId,
   });
 
+  emitApprovalQueueEvent("withdrawal", "exchange");
   return doc;
 }
 
@@ -629,6 +633,7 @@ export async function updateWithdrawalStatus(
       }
     }
   }
+  emitApprovalQueueEvent("withdrawal", "exchange");
   return doc;
 }
 
@@ -833,7 +838,7 @@ export async function amendWithdrawal(
     utr: input.utr.trim(),
   };
 
-  let rollbackBankChanges: (() => Promise<void>) | null = null;
+  let rollbackBankChanges: (() => Promise<void>) | undefined;
   if (oldBankId === newBankId) {
     const bank = await BankModel.findById(oldBankId);
     if (!bank) throw new AppError("not_found", "Bank not found", 404);
