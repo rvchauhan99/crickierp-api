@@ -10,6 +10,7 @@ import {
   deleteWithdrawalController,
   listSavedAccountsController,
   listWithdrawalController,
+  streamWithdrawalApprovalQueueEventsController,
   updateWithdrawalExchangeController,
   updateWithdrawalBankerController,
   updateWithdrawalStatusController,
@@ -18,6 +19,7 @@ import {
 import { withdrawalListPermissionMiddleware } from "./withdrawal.list.middleware";
 import { withdrawalStatusPermissionMiddleware } from "./withdrawal.status.middleware";
 import {
+  approvalQueueEventsQuerySchema,
   amendWithdrawalBodySchema,
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
@@ -69,6 +71,13 @@ withdrawalRouter.patch(
   withdrawalStatusPermissionMiddleware,
   validate({ body: updateWithdrawalStatusBodySchema }),
   updateWithdrawalStatusController,
+);
+
+withdrawalRouter.get(
+  "/approval-queue/events",
+  withdrawalListPermissionMiddleware,
+  validate({ query: approvalQueueEventsQuerySchema }),
+  streamWithdrawalApprovalQueueEventsController,
 );
 
 withdrawalRouter.get(

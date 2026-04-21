@@ -49,6 +49,10 @@ export const listDepositQuerySchema = z.object({
   hasAmendment: z.enum(["yes", "no"]).optional(),
 });
 
+export const approvalQueueEventsQuerySchema = z.object({
+  view: z.enum(["banker", "exchange"]),
+});
+
 export const exchangeActionBodySchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("mark_not_settled"),

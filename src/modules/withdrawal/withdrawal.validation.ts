@@ -63,6 +63,10 @@ export const listWithdrawalQuerySchema = z.object({
   hasAmendment: z.enum(["yes", "no"]).optional(),
 });
 
+export const approvalQueueEventsQuerySchema = z.object({
+  view: z.enum(["banker", "exchange"]),
+});
+
 export const updateWithdrawalStatusBodySchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("rejected"),

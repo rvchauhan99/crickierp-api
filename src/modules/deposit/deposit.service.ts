@@ -17,6 +17,7 @@ import {
 import type { DepositAmendmentSnapshot } from "./deposit.model";
 import { DepositModel, DepositStatus } from "./deposit.model";
 import { amendDepositBodySchema, listDepositQuerySchema } from "./deposit.validation";
+import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
 
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
 type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
@@ -313,6 +314,7 @@ export async function createDeposit(
     } as unknown as Record<string, unknown>,
     requestId,
   });
+  emitApprovalQueueEvent("deposit", "exchange");
   return doc;
 }
 
@@ -365,6 +367,7 @@ export async function updateDepositByBanker(
     requestId,
   });
 
+  emitApprovalQueueEvent("deposit", "exchange");
   return doc;
 }
 
@@ -732,6 +735,7 @@ export async function exchangeMarkNotSettled(id: string, actorId: string, reques
     requestId,
   });
 
+  emitApprovalQueueEvent("deposit", "exchange");
   return doc;
 }
 
@@ -840,7 +844,7 @@ export async function amendVerifiedDeposit(
   };
 
   let newBankBalanceAfter: number;
-  let rollbackBanks: (() => Promise<void>) | null = null;
+  let rollbackBanks: (() => Promise<void>) | undefined;
 
   if (String(oldBankId) === String(newBankId)) {
     const bank = await BankModel.findById(oldBankId);

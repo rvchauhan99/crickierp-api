@@ -12,6 +12,7 @@ import {
   exportWithdrawalsToBuffer,
 } from "./withdrawal.service";
 import {
+  approvalQueueEventsQuerySchema,
   amendWithdrawalBodySchema,
   createWithdrawalBodySchema,
   listWithdrawalQuerySchema,
@@ -20,6 +21,7 @@ import {
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
+import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
 
 export async function createWithdrawalController(req: Request, res: Response) {
   const body = createWithdrawalBodySchema.parse(req.body);
@@ -84,4 +86,9 @@ export async function listSavedAccountsController(req: Request, res: Response) {
   const playerId = String(req.params.playerId);
   const data = await listSavedAccountsForPlayer(playerId);
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function streamWithdrawalApprovalQueueEventsController(req: Request, res: Response) {
+  const query = approvalQueueEventsQuerySchema.parse(req.query);
+  subscribeApprovalQueueEvents("withdrawal", query.view, res);
 }

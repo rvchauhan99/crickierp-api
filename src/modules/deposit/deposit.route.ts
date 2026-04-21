@@ -11,10 +11,12 @@ import {
   exchangeActionController,
   exportDepositController,
   listDepositController,
+  streamDepositApprovalQueueEventsController,
   updateDepositController,
 } from "./deposit.controller";
 import { depositListPermissionMiddleware } from "./deposit.list.middleware";
 import {
+  approvalQueueEventsQuerySchema,
   amendDepositBodySchema,
   createDepositBodySchema,
   exchangeActionBodySchema,
@@ -38,6 +40,13 @@ depositRouter.put(
   permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
   validate({ body: updateDepositBodySchema }),
   updateDepositController,
+);
+
+depositRouter.get(
+  "/approval-queue/events",
+  depositListPermissionMiddleware,
+  validate({ query: approvalQueueEventsQuerySchema }),
+  streamDepositApprovalQueueEventsController,
 );
 
 depositRouter.get(
