@@ -4,6 +4,7 @@ import {
   createLiabilityEntryBodySchema,
   createLiabilityPersonBodySchema,
   liabilityLedgerQuerySchema,
+  liabilityReportQuerySchema,
   liabilityPersonIdParamSchema,
   listLiabilityEntryQuerySchema,
   listLiabilityPersonQuerySchema,
@@ -94,11 +95,13 @@ export async function exportLiabilityLedgerController(req: Request, res: Respons
 }
 
 export async function liabilitySummaryReportController(_req: Request, res: Response) {
-  const data = await getLiabilityReportSummary();
+  const query = liabilityReportQuerySchema.parse(_req.query);
+  const data = await getLiabilityReportSummary(query);
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function liabilityPersonWiseReportController(_req: Request, res: Response) {
-  const data = await getLiabilityReportPersonWise();
+  const query = liabilityReportQuerySchema.parse(_req.query);
+  const data = await getLiabilityReportPersonWise(query);
   res.status(StatusCodes.OK).json({ success: true, data });
 }
