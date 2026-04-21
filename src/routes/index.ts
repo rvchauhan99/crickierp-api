@@ -13,6 +13,7 @@ import { mastersRouter } from "../modules/masters/masters.route";
 import { expenseRouter } from "../modules/expense/expense.route";
 import { reasonRouter } from "../modules/reason/reason.route";
 import { liabilityRouter } from "../modules/liability/liability.route";
+import { lookupRouter } from "../modules/lookup/lookup.route";
 
 const apiRouter = Router();
 
@@ -33,5 +34,6 @@ apiRouter.use("/masters", mastersRouter);
 apiRouter.use("/expense", expenseRouter);
 apiRouter.use("/reasons", reasonRouter);
 apiRouter.use("/liability", liabilityRouter);
+apiRouter.use("/lookup", lookupRouter);
 
 export { apiRouter };
