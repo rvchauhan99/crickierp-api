@@ -9,6 +9,8 @@ const ymd = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "entryDate must be YYYY-MM-DD");
 
+export const liabilityViewModeSchema = z.enum(["platform", "person"]).optional();
+
 export const liabilityPersonIdParamSchema = z.object({
   id: z.string().length(24),
 });
@@ -73,4 +75,9 @@ export const listLiabilityEntryQuerySchema = z.object({
 export const liabilityLedgerQuerySchema = z.object({
   fromDate: optionalTrimmed,
   toDate: optionalTrimmed,
+  viewMode: liabilityViewModeSchema,
+});
+
+export const liabilityReportQuerySchema = z.object({
+  viewMode: liabilityViewModeSchema,
 });

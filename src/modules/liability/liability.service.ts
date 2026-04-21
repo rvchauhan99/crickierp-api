@@ -20,6 +20,7 @@ import { liabilityLedgerQuerySchema, listLiabilityEntryQuerySchema, listLiabilit
 type ListLiabilityPersonQuery = z.infer<typeof listLiabilityPersonQuerySchema>;
 type ListLiabilityEntryQuery = z.infer<typeof listLiabilityEntryQuerySchema>;
 type LedgerQuery = z.infer<typeof liabilityLedgerQuerySchema>;
+type LiabilityViewMode = "platform" | "person";
 
 const EXPORT_MAX_ROWS = 10_000;
 
@@ -39,6 +40,31 @@ function escapeRegex(s: string): string {
 
 function parseYmdToDate(ymd: string, timeZone: string = DEFAULT_TIMEZONE): Date {
   return ymdToUtcNoon(ymd, timeZone) ?? new Date(ymd);
+}
+
+function resolveSideFromBalance(
+  balance: number,
+  viewMode: LiabilityViewMode,
+): "receivable" | "payable" | "settled" {
+  if (balance === 0) return "settled";
+  if (viewMode === "person") {
+    return balance < 0 ? "receivable" : "payable";
+  }
+  return balance > 0 ? "receivable" : "payable";
+}
+
+function normalizeViewMode(viewMode?: string): LiabilityViewMode {
+  return viewMode === "person" ? "person" : "platform";
+}
+
+function resolveBalanceByViewMode(input: { openingBalance?: number; totalDebits?: number; totalCredits?: number }, viewMode: LiabilityViewMode): number {
+  const opening = Number(input.openingBalance ?? 0);
+  const debits = Number(input.totalDebits ?? 0);
+  const credits = Number(input.totalCredits ?? 0);
+  if (viewMode === "person") {
+    return opening - debits + credits;
+  }
+  return opening + debits - credits;
 }
 
 export async function recomputePersonRollup(personId: string): Promise<void> {
@@ -430,6 +456,7 @@ export async function getLiabilityPersonLedger(
   query: LedgerQuery,
   options?: { timeZone?: string },
 ) {
+  const viewMode = normalizeViewMode(query.viewMode);
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   if (!Types.ObjectId.isValid(personId)) throw new AppError("validation_error", "Invalid person id", 400);
   const pid = new Types.ObjectId(personId);
@@ -495,7 +522,7 @@ export async function getLiabilityPersonLedger(
     const isPersonTo = e.toAccountType === "person" && toId === personId;
     const debit = isPersonTo ? e.amount : 0;
     const credit = isPersonFrom ? e.amount : 0;
-    running += debit - credit;
+    running += viewMode === "person" ? credit - debit : debit - credit;
 
     if (isInRange) {
       rows.push({
@@ -524,13 +551,16 @@ export async function getLiabilityPersonLedger(
   }
 
   return {
+    viewMode,
     person: {
       _id: String(person._id),
       name: person.name,
       openingBalance: person.openingBalance ?? 0,
+      openingSide: resolveSideFromBalance(person.openingBalance ?? 0, viewMode),
     },
     rows,
     closingBalance: running,
+    closingSide: resolveSideFromBalance(running, viewMode),
   };
 }
 
@@ -611,20 +641,41 @@ export async function exportLiabilityLedgerToBuffer(
     "Reference No": r.referenceNo ?? "",
     Remark: r.remark ?? "",
   }));
-
+  const perspective = result.viewMode === "person" ? "Person-side" : "Platform-side";
+  exportData.unshift({
+    Date: "",
+    "Entry Type": `${perspective} perspective`,
+    From: "",
+    To: "",
+    Debit: "",
+    Credit: "",
+    "Running Balance": "",
+    "Reference No": "",
+    Remark: "",
+  } as unknown as (typeof exportData)[number]);
   return generateExcelBuffer(exportData, `Ledger - ${result.person.name}`);
 }
-export async function getLiabilityReportSummary() {
+export async function getLiabilityReportSummary(query?: { viewMode?: string }) {
+  const viewMode = normalizeViewMode(query?.viewMode);
   const persons = await LiabilityPersonModel.find({ isActive: true }).lean();
   let totalReceivable = 0;
   let totalPayable = 0;
   persons.forEach((p) => {
-    const bal = Number(p.closingBalance ?? p.openingBalance ?? 0);
-    if (bal > 0) totalReceivable += bal;
-    if (bal < 0) totalPayable += Math.abs(bal);
+    const bal = resolveBalanceByViewMode(
+      {
+        openingBalance: p.openingBalance,
+        totalDebits: p.totalDebits,
+        totalCredits: p.totalCredits,
+      },
+      viewMode,
+    );
+    const side = resolveSideFromBalance(bal, viewMode);
+    if (side === "receivable") totalReceivable += Math.abs(bal);
+    if (side === "payable") totalPayable += Math.abs(bal);
   });
 
   return {
+    viewMode,
     totalReceivable,
     totalPayable,
     netPosition: totalReceivable - totalPayable,
@@ -632,11 +683,20 @@ export async function getLiabilityReportSummary() {
   };
 }
 
-export async function getLiabilityReportPersonWise() {
+export async function getLiabilityReportPersonWise(query?: { viewMode?: string }) {
+  const viewMode = normalizeViewMode(query?.viewMode);
   const persons = await LiabilityPersonModel.find({}).lean();
 
   return persons.map((p) => {
-    const balance = Number(p.closingBalance ?? p.openingBalance ?? 0);
+    const balance = resolveBalanceByViewMode(
+      {
+        openingBalance: p.openingBalance,
+        totalDebits: p.totalDebits,
+        totalCredits: p.totalCredits,
+      },
+      viewMode,
+    );
+    const resolvedSide = resolveSideFromBalance(balance, viewMode);
     return {
       personId: String(p._id),
       name: p.name,
@@ -644,7 +704,9 @@ export async function getLiabilityReportPersonWise() {
       balance,
       totalCredits: Number(p.totalCredits ?? 0),
       totalDebits: Number(p.totalDebits ?? 0),
-      side: balance >= 0 ? "receivable" : "payable",
+      side: resolvedSide === "settled" ? "receivable" : resolvedSide,
+      sideLabel: resolvedSide === "settled" ? "settled" : resolvedSide,
+      viewMode,
     };
   });
 }
