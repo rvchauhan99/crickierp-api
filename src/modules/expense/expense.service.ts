@@ -151,6 +151,7 @@ export async function createExpense(
     expenseDate: string;
     description?: string;
     bankId?: string;
+    liabilityPersonId?: string;
   },
   actorId: string,
   requestId?: string,
@@ -159,10 +160,33 @@ export async function createExpense(
   if (!et || et.deletedAt) throw new AppError("not_found", "Expense type not found", 404);
   if (!et.isActive) throw new AppError("business_rule_error", "Expense type is inactive", 400);
 
+  const skipAudit = et.auditRequired === false;
+  const bankIdTrim = trimUndef(input.bankId);
+  const liabilityPersonIdTrim = trimUndef(input.liabilityPersonId);
+  const hasBank = Boolean(bankIdTrim);
+  const hasPerson = Boolean(liabilityPersonIdTrim);
+
+  if (skipAudit) {
+    if (hasBank && hasPerson) {
+      throw new AppError(
+        "business_rule_error",
+        "Provide either bank or liability person for settlement, not both",
+        400,
+      );
+    }
+    if (!hasBank && !hasPerson) {
+      throw new AppError(
+        "business_rule_error",
+        "This expense type skips audit: choose settlement from a bank or a liability person",
+        400,
+      );
+    }
+  }
+
   let bankName = "";
   let bankObjectId: Types.ObjectId | undefined;
-  if (input.bankId) {
-    const bank = await BankModel.findById(input.bankId);
+  if (bankIdTrim) {
+    const bank = await BankModel.findById(bankIdTrim);
     if (!bank) throw new AppError("not_found", "Bank not found", 404);
     if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
     bankObjectId = bank._id;
@@ -189,12 +213,33 @@ export async function createExpense(
       expenseTypeId: input.expenseTypeId,
       amount: input.amount,
       expenseDate: input.expenseDate,
-      bankId: input.bankId,
+      bankId: bankIdTrim,
+      liabilityPersonId: liabilityPersonIdTrim,
     },
     requestId,
   });
 
-  return doc;
+  if (!skipAudit) {
+    return doc;
+  }
+
+  const expenseId = doc._id.toString();
+
+  if (hasBank && bankIdTrim) {
+    return approveExpense(
+      expenseId,
+      { settlementAccountType: "bank", bankId: bankIdTrim },
+      actorId,
+      requestId,
+    );
+  }
+
+  return approveExpense(
+    expenseId,
+    { settlementAccountType: "person", liabilityPersonId: liabilityPersonIdTrim! },
+    actorId,
+    requestId,
+  );
 }
 
 export async function updateExpense(
@@ -335,10 +380,15 @@ export async function approveExpense(
   if (!person) throw new AppError("not_found", "Liability person not found", 404);
   if (!person.isActive) throw new AppError("business_rule_error", "Liability person is inactive", 400);
 
+  const prevBankId = doc.bankId;
+  const prevBankName = doc.bankName;
+
   doc.settlementAccountType = "person";
   doc.liabilityPersonId = person._id;
   doc.liabilityPersonName = person.name;
   doc.liabilityEntryId = undefined;
+  doc.bankId = undefined;
+  doc.bankName = "";
   doc.status = "approved";
   doc.approvedBy = new Types.ObjectId(actorId);
   doc.approvedAt = new Date();
@@ -348,9 +398,12 @@ export async function approveExpense(
 
   try {
     const referenceNo = `EXP-${String(doc._id).slice(-8).toUpperCase()}`;
+    /** Match business calendar (same as createExpense `parseYmdToDate`); UTC `toISOString` slice can shift the day vs ledger filters. */
+    const liabilityEntryYmd =
+      formatDateForTimeZone(doc.expenseDate, DEFAULT_TIMEZONE) || doc.expenseDate.toISOString().slice(0, 10);
     const liabilityEntry = await createLiabilityEntry(
       {
-        entryDate: doc.expenseDate.toISOString().slice(0, 10),
+        entryDate: liabilityEntryYmd,
         entryType: "journal",
         amount: doc.amount,
         fromAccountType: "person",
@@ -377,6 +430,8 @@ export async function approveExpense(
     doc.liabilityPersonId = undefined;
     doc.liabilityPersonName = "";
     doc.liabilityEntryId = undefined;
+    doc.bankId = prevBankId;
+    doc.bankName = prevBankName ?? "";
     doc.updatedBy = new Types.ObjectId(actorId);
     await doc.save();
     throw err;
@@ -537,7 +592,7 @@ export async function listActiveExpenseTypes() {
     deletedAt: null,
   })
     .sort({ name: 1 })
-    .select("_id name code description")
+    .select("_id name code description auditRequired")
     .lean();
   return rows;
 }
@@ -570,8 +625,15 @@ export async function uploadExpenseDocuments(
 ) {
   const doc = await ExpenseModel.findById(id);
   if (!doc) throw new AppError("not_found", "Expense not found", 404);
-  if (doc.status !== "pending_audit") {
-    throw new AppError("business_rule_error", "Only pending expenses can receive documents", 400);
+  const canUpload =
+    doc.status === "pending_audit" ||
+    (doc.status === "approved" && (!doc.documents || doc.documents.length === 0));
+  if (!canUpload) {
+    throw new AppError(
+      "business_rule_error",
+      "Documents can only be added while pending audit, or once when the expense was auto-approved and has no documents yet",
+      400,
+    );
   }
   if (!files || files.length === 0) {
     throw new AppError("validation_error", "At least one document is required", 400);

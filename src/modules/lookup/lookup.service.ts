@@ -5,9 +5,10 @@ import { ExpenseTypeModel } from "../masters/expense-type.model";
 import { Types } from "mongoose";
 import { AppError } from "../../shared/errors/AppError";
 
-type LookupQueryParams = {
+export type LookupQueryParams = {
   q?: string;
   limit: number;
+  id?: string;
 };
 
 function escapeRegex(input: string): string {
@@ -41,7 +42,43 @@ export async function listBankLookupOptions({ q, limit }: LookupQueryParams) {
   }));
 }
 
-export async function listExpenseTypeLookupOptions({ q, limit }: LookupQueryParams) {
+type ExpenseTypeLookupLean = {
+  _id: unknown;
+  name?: unknown;
+  code?: unknown;
+  description?: unknown;
+  auditRequired?: boolean;
+};
+
+function mapExpenseTypeLookupRow(row: ExpenseTypeLookupLean) {
+  const ar = row.auditRequired;
+  const requiresAudit = ar !== false;
+  return {
+    id: String(row._id),
+    label: String(row.name ?? ""),
+    name: String(row.name ?? ""),
+    code: row.code != null ? String(row.code) : undefined,
+    description: row.description != null ? String(row.description) : undefined,
+    requiresAudit,
+    auditNotRequired: ar === false,
+  };
+}
+
+export async function listExpenseTypeLookupOptions({ q, limit, id }: LookupQueryParams) {
+  const idTrim = id?.trim();
+  if (idTrim && Types.ObjectId.isValid(idTrim)) {
+    const row = await ExpenseTypeModel.findOne({
+      _id: new Types.ObjectId(idTrim),
+      isActive: true,
+      $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+    })
+      .select({ name: 1, code: 1, description: 1, auditRequired: 1 })
+      .lean()
+      .exec();
+    if (!row) return [];
+    return [mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean)];
+  }
+
   const qTrim = q?.trim();
   const filter: Record<string, unknown> = {
     isActive: true,
@@ -64,16 +101,10 @@ export async function listExpenseTypeLookupOptions({ q, limit }: LookupQueryPara
   const rows = await ExpenseTypeModel.find(filter)
     .sort({ name: 1 })
     .limit(limit)
-    .select({ name: 1, code: 1, description: 1 })
+    .select({ name: 1, code: 1, description: 1, auditRequired: 1 })
     .lean()
     .exec();
-  return rows.map((row) => ({
-    id: String(row._id),
-    label: String(row.name ?? ""),
-    name: String(row.name ?? ""),
-    code: row.code != null ? String(row.code) : undefined,
-    description: row.description != null ? String(row.description) : undefined,
-  }));
+  return rows.map((row) => mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean));
 }
 
 export async function listPlayerLookupOptions({ q, limit }: LookupQueryParams) {

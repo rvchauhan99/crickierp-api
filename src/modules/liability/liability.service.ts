@@ -96,7 +96,8 @@ export async function recomputePersonRollup(personId: string): Promise<void> {
 
   const totalCredits = Number(creditAgg[0]?.total ?? 0);
   const totalDebits = Number(debitAgg[0]?.total ?? 0);
-  const closingBalance = (person.openingBalance ?? 0) + totalDebits - totalCredits;
+  /** Person-side closing: opening − debits + credits (matches migration 003 and getLiabilityPersonLedger person viewMode). */
+  const closingBalance = (person.openingBalance ?? 0) + totalCredits - totalDebits;
 
   person.totalCredits = totalCredits;
   person.totalDebits = totalDebits;
