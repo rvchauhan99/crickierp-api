@@ -194,7 +194,10 @@ async function buildDashboardFilterContext(
     query.playerId && Types.ObjectId.isValid(query.playerId) ? new Types.ObjectId(query.playerId) : null;
   const bankObjectId = query.bankId && Types.ObjectId.isValid(query.bankId) ? new Types.ObjectId(query.bankId) : null;
   const scopedPlayerIds = exchangeObjectId
-    ? await (await import("../player/player.model")).PlayerModel.distinct("_id", { exchange: exchangeObjectId })
+    ? await (await import("../player/player.model")).PlayerModel.distinct("_id", {
+        exchange: exchangeObjectId,
+        isMigratedOldUser: { $ne: true },
+      })
     : null;
 
   const playerFilter =
@@ -556,6 +559,7 @@ export async function getDashboardSummary(
   };
   const todayRange = resolveTodayRangeForTimeZone(timeZone);
   const todayPlayerFilter = {
+    isMigratedOldUser: { $ne: true },
     createdAt: {
       $gte: todayRange.startUtc,
       $lte: todayRange.endUtc,
@@ -780,6 +784,16 @@ export async function getDashboardSummary(
       : DepositModel.aggregate([
           { $match: firstDepositBaseMatch },
           {
+            $lookup: {
+              from: "players",
+              localField: "player",
+              foreignField: "_id",
+              as: "playerDoc",
+            },
+          },
+          { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
+          { $match: { "playerDoc.isMigratedOldUser": { $ne: true } } },
+          {
             $addFields: {
               firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
             },
@@ -823,6 +837,16 @@ export async function getDashboardSummary(
       : DepositModel.aggregate([
           { $match: firstDepositBaseMatch },
           {
+            $lookup: {
+              from: "players",
+              localField: "player",
+              foreignField: "_id",
+              as: "playerDoc",
+            },
+          },
+          { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
+          { $match: { "playerDoc.isMigratedOldUser": { $ne: true } } },
+          {
             $addFields: {
               firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
             },
@@ -843,15 +867,6 @@ export async function getDashboardSummary(
               },
             },
           },
-          {
-            $lookup: {
-              from: "players",
-              localField: "_id",
-              foreignField: "_id",
-              as: "playerDoc",
-            },
-          },
-          { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
           ...(exchangeObjectId ? [{ $match: { "playerDoc.exchange": exchangeObjectId } }] : []),
           {
             $group: {
