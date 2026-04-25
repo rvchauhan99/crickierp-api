@@ -13,6 +13,7 @@ import {
 } from "../../shared/utils/timezone";
 import { PlayerModel } from "./player.model";
 import { listPlayerQuerySchema } from "./player.validation";
+import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPagination";
 
 type ListPlayerQuery = z.infer<typeof listPlayerQuerySchema>;
 
@@ -248,6 +249,8 @@ export async function createPlayer(
     phone: string;
     regularBonusPercentage: number;
     firstDepositBonusPercentage: number;
+    referredByPlayerId?: string | null;
+    referralPercentage?: number;
   },
   actorId: string,
   requestId?: string,
@@ -261,6 +264,19 @@ export async function createPlayer(
   const phone = input.phone.trim();
   const regularBonusPercentage = input.regularBonusPercentage;
   const firstDepositBonusPercentage = input.firstDepositBonusPercentage;
+  const referralPercentage = input.referralPercentage ?? 1;
+
+  let referredByPlayerId: Types.ObjectId | undefined;
+  if (input.referredByPlayerId) {
+    if (!Types.ObjectId.isValid(input.referredByPlayerId)) {
+      throw new AppError("validation_error", "Invalid referredByPlayerId", 400);
+    }
+    referredByPlayerId = new Types.ObjectId(input.referredByPlayerId);
+    const referrer = await PlayerModel.findById(referredByPlayerId).select("_id");
+    if (!referrer) {
+      throw new AppError("not_found", "Referrer player not found", 404);
+    }
+  }
 
   try {
     const doc = await PlayerModel.create({
@@ -269,6 +285,8 @@ export async function createPlayer(
       phone,
       regularBonusPercentage,
       firstDepositBonusPercentage,
+      referredByPlayerId,
+      referralPercentage,
       createdBy: new Types.ObjectId(actorId),
       updatedBy: new Types.ObjectId(actorId),
     });
@@ -284,6 +302,8 @@ export async function createPlayer(
         phone,
         regularBonusPercentage,
         firstDepositBonusPercentage,
+        referredByPlayerId: referredByPlayerId?.toString(),
+        referralPercentage,
       },
       requestId,
     });
@@ -303,8 +323,9 @@ export async function getPlayerById(id: string) {
     throw new AppError("validation_error", "Invalid player id", 400);
   }
   const doc = await PlayerModel.findById(id)
-    .select("exchange playerId phone regularBonusPercentage firstDepositBonusPercentage")
+    .select("exchange playerId phone regularBonusPercentage firstDepositBonusPercentage referredByPlayerId referralPercentage")
     .populate("exchange", "name provider")
+    .populate("referredByPlayerId", "playerId phone exchange")
     .lean();
   if (!doc) {
     throw new AppError("not_found", "Player not found", 404);
@@ -321,6 +342,8 @@ export async function updatePlayer(
     phone: string;
     regularBonusPercentage: number;
     firstDepositBonusPercentage: number;
+    referredByPlayerId?: string | null;
+    referralPercentage?: number;
   },
   actorId: string,
   requestId?: string,
@@ -337,11 +360,30 @@ export async function updatePlayer(
     phone: doc.phone,
     regularBonusPercentage: doc.regularBonusPercentage,
     firstDepositBonusPercentage: doc.firstDepositBonusPercentage,
+    referredByPlayerId: doc.referredByPlayerId?.toString(),
+    referralPercentage: doc.referralPercentage ?? 1,
   };
+
+  let referredByPlayerId: Types.ObjectId | undefined;
+  if (input.referredByPlayerId) {
+    if (!Types.ObjectId.isValid(input.referredByPlayerId)) {
+      throw new AppError("validation_error", "Invalid referredByPlayerId", 400);
+    }
+    if (String(doc._id) === input.referredByPlayerId) {
+      throw new AppError("business_rule_error", "Player cannot refer themselves", 400);
+    }
+    referredByPlayerId = new Types.ObjectId(input.referredByPlayerId);
+    const referrer = await PlayerModel.findById(referredByPlayerId).select("_id");
+    if (!referrer) {
+      throw new AppError("not_found", "Referrer player not found", 404);
+    }
+  }
 
   doc.phone = input.phone.trim();
   doc.regularBonusPercentage = input.regularBonusPercentage;
   doc.firstDepositBonusPercentage = input.firstDepositBonusPercentage;
+  doc.referredByPlayerId = referredByPlayerId;
+  doc.referralPercentage = input.referralPercentage ?? 1;
   doc.updatedBy = new Types.ObjectId(actorId);
   await doc.save();
 
@@ -355,6 +397,8 @@ export async function updatePlayer(
       phone: doc.phone,
       regularBonusPercentage: doc.regularBonusPercentage,
       firstDepositBonusPercentage: doc.firstDepositBonusPercentage,
+      referredByPlayerId: doc.referredByPlayerId?.toString(),
+      referralPercentage: doc.referralPercentage ?? 1,
     },
     requestId,
   });
@@ -370,15 +414,28 @@ export async function listPlayers(query: ListPlayerQuery, options?: { timeZone?:
   const requestedSortBy = query.sortBy ?? "createdAt";
   const sortBy = requestedSortBy === "bonusPercentage" ? "regularBonusPercentage" : requestedSortBy;
   const sortOrder = query.sortOrder === "asc" ? 1 : -1;
+  const supportsCursor = sortOrder === -1 && sortBy === "createdAt";
+  const cursor = supportsCursor ? decodeTimeCursor(query.cursor) : null;
 
   const filter = await buildPlayerListFilter(query, timeZone);
+  const queryFilter: Record<string, unknown> = { ...filter };
+  if (cursor) {
+    const cursorDate = new Date(cursor.t);
+    if (!Number.isNaN(cursorDate.getTime()) && Types.ObjectId.isValid(cursor.id)) {
+      queryFilter.$or = [
+        { createdAt: { $lt: cursorDate } },
+        { createdAt: cursorDate, _id: { $lt: new Types.ObjectId(cursor.id) } },
+      ];
+    }
+  }
 
   const [rows, total] = await Promise.all([
-    PlayerModel.find(filter)
+    PlayerModel.find(queryFilter)
       .sort({ [sortBy]: sortOrder })
-      .skip(skip)
+      .skip(cursor ? 0 : skip)
       .limit(pageSize)
       .populate("exchange", "name provider")
+      .populate("referredByPlayerId", "playerId phone exchange")
       .populate("createdBy", "fullName username")
       .populate("updatedBy", "fullName username")
       .lean(),
@@ -399,6 +456,14 @@ export async function listPlayers(query: ListPlayerQuery, options?: { timeZone?:
       total,
       page,
       pageSize,
+      ...(cursor && rows.length
+        ? {
+            nextCursor: encodeTimeCursor({
+              t: (rows[rows.length - 1] as { createdAt?: Date }).createdAt ?? new Date(),
+              id: String((rows[rows.length - 1] as { _id?: unknown })._id ?? ""),
+            }),
+          }
+        : {}),
     },
   };
 }
@@ -442,6 +507,12 @@ export async function exportPlayersToBuffer(
       Phone: r.phone,
       "Regular Bonus %": r.regularBonusPercentage ?? 0,
       "First Deposit Bonus %": r.firstDepositBonusPercentage ?? 0,
+      "Referral %": r.referralPercentage ?? 1,
+      "Referred By Player": (() => {
+        const referredBy = r.referredByPlayerId as { playerId?: string; phone?: string } | null | undefined;
+        if (!referredBy?.playerId) return "";
+        return referredBy.phone ? `${referredBy.playerId} (${referredBy.phone})` : referredBy.playerId;
+      })(),
       "Created By": formatCreatedBy(r.createdBy),
       "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
     };

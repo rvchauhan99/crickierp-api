@@ -7,7 +7,6 @@ import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
 import { DepositModel } from "../deposit/deposit.model";
 import { ExpenseModel } from "../expense/expense.model";
-import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
@@ -22,6 +21,9 @@ import type { WithdrawalAmendmentSnapshot } from "./withdrawal.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
 import { amendWithdrawalBodySchema, listWithdrawalQuerySchema } from "./withdrawal.validation";
 import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
+import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPagination";
+import { enqueueExchangeRecompute } from "../../shared/queue/queue";
+import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -348,7 +350,8 @@ export async function createWithdrawal(
   if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
-      await recomputeExchangeCurrentBalance(String(player.exchange));
+      await enqueueExchangeRecompute(String(player.exchange));
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 
@@ -417,7 +420,8 @@ export async function updateWithdrawalByExchange(
   if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
-      await recomputeExchangeCurrentBalance(String(player.exchange));
+      await enqueueExchangeRecompute(String(player.exchange));
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 
@@ -544,15 +548,27 @@ export async function listWithdrawals(
   const skip = (page - 1) * pageSize;
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
   const sortField = query.sortBy;
+  const supportsCursor = sortValue === -1 && (sortField === "requestedAt" || sortField === "createdAt");
+  const cursor = supportsCursor ? decodeTimeCursor(query.cursor) : null;
+  const queryFilter: Record<string, unknown> = { ...filter };
+  if (cursor) {
+    const cursorDate = new Date(cursor.t);
+    if (!Number.isNaN(cursorDate.getTime()) && Types.ObjectId.isValid(cursor.id)) {
+      queryFilter.$or = [
+        { [sortField]: { $lt: cursorDate } },
+        { [sortField]: cursorDate, _id: { $lt: new Types.ObjectId(cursor.id) } },
+      ];
+    }
+  }
 
   const [rows, total, lastBankerPayout] = await Promise.all([
-    WithdrawalModel.find(filter)
+    WithdrawalModel.find(queryFilter)
       .populate("player", "playerId phone")
       .populate("payoutBankId", "holderName bankName accountNumber")
       .populate("createdBy", "fullName username")
       .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
-      .skip(skip)
+      .skip(cursor ? 0 : skip)
       .limit(pageSize)
       .lean(),
     WithdrawalModel.countDocuments(filter),
@@ -571,6 +587,13 @@ export async function listWithdrawals(
   };
   if (query.view === "banker") {
     meta.lastBankerPayout = lastBankerPayout;
+  }
+  const lastRow = rows[rows.length - 1] as { _id?: unknown; requestedAt?: Date; createdAt?: Date } | undefined;
+  if (cursor && lastRow?._id) {
+    const ts = sortField === "requestedAt" ? (lastRow.requestedAt ?? lastRow.createdAt) : lastRow.createdAt;
+    if (ts) {
+      (meta as Record<string, unknown>).nextCursor = encodeTimeCursor({ t: ts, id: String(lastRow._id) });
+    }
   }
 
   return {
@@ -629,7 +652,8 @@ export async function updateWithdrawalStatus(
     if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
       const player = await PlayerModel.findById(doc.player).select("exchange").lean();
       if (player?.exchange) {
-        await recomputeExchangeCurrentBalance(String(player.exchange));
+        await enqueueExchangeRecompute(String(player.exchange));
+        await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
       }
     }
   }
@@ -763,7 +787,8 @@ export async function deleteWithdrawalWithReversal(id: string, actorId: string, 
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
       recomputedExchangeId = String(player.exchange);
-      await recomputeExchangeCurrentBalance(recomputedExchangeId);
+      await enqueueExchangeRecompute(recomputedExchangeId);
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 
@@ -925,7 +950,8 @@ export async function amendWithdrawal(
   if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
-      await recomputeExchangeCurrentBalance(String(player.exchange));
+      await enqueueExchangeRecompute(String(player.exchange));
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 

@@ -4,7 +4,6 @@ import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
-import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { PlayerModel } from "../player/player.model";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
@@ -18,6 +17,14 @@ import type { DepositAmendmentSnapshot } from "./deposit.model";
 import { DepositModel, DepositStatus } from "./deposit.model";
 import { amendDepositBodySchema, listDepositQuerySchema } from "./deposit.validation";
 import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
+import {
+  cancelReferralAccrualForDeposit,
+  ensureDepositReferralAccrualMutable,
+  syncReferralAccrualForDeposit,
+} from "../referral/referral.service";
+import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPagination";
+import { enqueueExchangeRecompute } from "../../shared/queue/queue";
+import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
 type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
@@ -406,16 +413,28 @@ export async function listDeposits(
   const skip = (page - 1) * pageSize;
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
   const sortField = query.sortBy;
+  const supportsCursor = sortValue === -1 && (sortField === "entryAt" || sortField === "createdAt");
+  const cursor = supportsCursor ? decodeTimeCursor(query.cursor) : null;
+  const queryFilter: Record<string, unknown> = { ...filter };
+  if (cursor) {
+    const cursorDate = new Date(cursor.t);
+    if (!Number.isNaN(cursorDate.getTime()) && Types.ObjectId.isValid(cursor.id)) {
+      queryFilter.$or = [
+        { [sortField]: { $lt: cursorDate } },
+        { [sortField]: cursorDate, _id: { $lt: new Types.ObjectId(cursor.id) } },
+      ];
+    }
+  }
 
   const [rows, total, lastBankerDeposit] = await Promise.all([
-    DepositModel.find(filter)
+    DepositModel.find(queryFilter)
       .populate("bankId", "holderName bankName accountNumber ifsc openingBalance currentBalance")
       .populate("player", "playerId phone exchange")
       .populate("createdBy", "fullName username")
       .populate("exchangeActionBy", "fullName username")
       .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
-      .skip(skip)
+      .skip(cursor ? 0 : skip)
       .limit(pageSize)
       .lean(),
     DepositModel.countDocuments(filter),
@@ -434,6 +453,13 @@ export async function listDeposits(
   };
   if (query.view === "banker") {
     meta.lastBankerDeposit = lastBankerDeposit;
+  }
+  const lastRow = rows[rows.length - 1] as { _id?: unknown; entryAt?: Date; createdAt?: Date } | undefined;
+  if (cursor && lastRow?._id) {
+    const ts = sortField === "entryAt" ? (lastRow.entryAt ?? lastRow.createdAt) : lastRow.createdAt;
+    if (ts) {
+      (meta as Record<string, unknown>).nextCursor = encodeTimeCursor({ t: ts, id: String(lastRow._id) });
+    }
   }
 
   return {
@@ -523,13 +549,15 @@ async function recomputeExchangesForDepositPlayers(doc: {
     }
   }
   for (const exchangeId of exchangeIds) {
-    await recomputeExchangeCurrentBalance(exchangeId);
+    await enqueueExchangeRecompute(exchangeId);
+    await invalidateCacheDomains(["deposit", "exchange", "referral", "player"]);
   }
 }
 
 export async function deleteDepositWithReversal(id: string, actorId: string, requestId?: string) {
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+  await ensureDepositReferralAccrualMutable(doc._id);
 
   const oldValue = {
     bankId: doc.bankId?.toString(),
@@ -549,6 +577,7 @@ export async function deleteDepositWithReversal(id: string, actorId: string, req
 
   const shouldReverseBank =
     (doc.status === "verified" || doc.status === "finalized") &&
+    doc.bankImpact !== false &&
     !!doc.bankId &&
     Number.isFinite(Number(doc.amount));
 
@@ -586,6 +615,7 @@ export async function deleteDepositWithReversal(id: string, actorId: string, req
     player: doc.player,
     amendmentHistory: doc.amendmentHistory as Array<{ old?: { playerId?: string }; new?: { playerId?: string } }>,
   });
+  await cancelReferralAccrualForDeposit(doc._id, "Source deposit deleted");
 
   await createAuditLog({
     actorId,
@@ -700,7 +730,9 @@ export async function exchangeApproveDeposit(
     requestId,
   });
 
-  await recomputeExchangeCurrentBalance(String(playerDoc.exchange));
+  await enqueueExchangeRecompute(String(playerDoc.exchange));
+  await invalidateCacheDomains(["deposit", "exchange", "referral", "player"]);
+  await syncReferralAccrualForDeposit(doc._id);
 
   return doc;
 }
@@ -760,6 +792,7 @@ export async function exchangeRejectDeposit(
   doc.exchangeActionBy = new Types.ObjectId(actorId);
   doc.exchangeActionAt = new Date();
   await doc.save();
+  await cancelReferralAccrualForDeposit(doc._id, "Source deposit rejected");
 
   await createAuditLog({
     actorId,
@@ -788,6 +821,7 @@ export async function amendVerifiedDeposit(
 ) {
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+  await ensureDepositReferralAccrualMutable(doc._id);
   if (doc.status !== "verified") {
     throw new AppError("business_rule_error", "Only verified deposits can be amended", 400);
   }
@@ -926,8 +960,10 @@ export async function amendVerifiedDeposit(
   if (oldPlayer?.exchange) exchanges.add(String(oldPlayer.exchange));
   if (newPlayerDoc.exchange) exchanges.add(String(newPlayerDoc.exchange));
   for (const ex of exchanges) {
-    await recomputeExchangeCurrentBalance(ex);
+    await enqueueExchangeRecompute(ex);
   }
+  await invalidateCacheDomains(["deposit", "exchange", "referral", "player"]);
+  await syncReferralAccrualForDeposit(doc._id);
 
   await createAuditLog({
     actorId,

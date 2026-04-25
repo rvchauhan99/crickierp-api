@@ -40,6 +40,9 @@ export interface DepositDocument {
   exchangeActionBy?: Types.ObjectId;
   exchangeActionAt?: Date;
   bankBalanceAfter?: number;
+  bankImpact?: boolean;
+  isReferralSettlement?: boolean;
+  referralSettlementRemark?: string;
   /** Business entry datetime selected by banker (can be backdated). */
   entryAt?: Date;
   settledAt?: Date;
@@ -96,6 +99,9 @@ const depositSchema = new Schema<DepositDocument>(
     exchangeActionBy: { type: Schema.Types.ObjectId, ref: "User" },
     exchangeActionAt: { type: Date },
     bankBalanceAfter: { type: Number, min: 0 },
+    bankImpact: { type: Boolean, default: true },
+    isReferralSettlement: { type: Boolean, default: false },
+    referralSettlementRemark: { type: String, trim: true, maxlength: 1000 },
     entryAt: { type: Date },
     settledAt: { type: Date },
     amendmentCount: { type: Number, min: 0, default: 0 },
@@ -111,5 +117,9 @@ depositSchema.index(
   { utr: 1 },
   { unique: true, partialFilterExpression: { status: { $ne: "rejected" } } },
 );
+depositSchema.index({ status: 1, entryAt: -1, _id: -1 });
+depositSchema.index({ status: 1, createdAt: -1, _id: -1 });
+depositSchema.index({ player: 1, createdAt: -1, _id: -1 });
+depositSchema.index({ bankId: 1, createdAt: -1, _id: -1 });
 
 export const DepositModel = model<DepositDocument>("Deposit", depositSchema);

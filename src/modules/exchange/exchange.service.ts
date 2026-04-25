@@ -272,7 +272,8 @@ export async function listExchanges(query: ListExchangeQuery, options?: { timeZo
       .populate("createdBy", "fullName username")
       .sort({ [query.sortBy]: sortValue })
       .skip(skip)
-      .limit(query.pageSize),
+      .limit(query.pageSize)
+      .lean(),
     ExchangeModel.countDocuments(filter),
   ]);
 
