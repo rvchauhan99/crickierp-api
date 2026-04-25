@@ -14,11 +14,24 @@ import { expenseRouter } from "../modules/expense/expense.route";
 import { reasonRouter } from "../modules/reason/reason.route";
 import { liabilityRouter } from "../modules/liability/liability.route";
 import { lookupRouter } from "../modules/lookup/lookup.route";
+import { referralRouter } from "../modules/referral/referral.route";
+import { collectRouteMetrics } from "../shared/observability/performance-metrics";
+import { evaluatePerformanceGates } from "../shared/observability/performance-gates";
 
 const apiRouter = Router();
 
 apiRouter.get("/health", (_req, res) => {
   res.status(200).json({ success: true, data: { status: "ok" } });
+});
+apiRouter.get("/metrics", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    data: {
+      routes: collectRouteMetrics(),
+      gates: evaluatePerformanceGates(),
+      generatedAt: new Date().toISOString(),
+    },
+  });
 });
 apiRouter.use("/auth", authRouter);
 apiRouter.use("/exchange", exchangeRouter);
@@ -35,5 +48,6 @@ apiRouter.use("/expense", expenseRouter);
 apiRouter.use("/reasons", reasonRouter);
 apiRouter.use("/liability", liabilityRouter);
 apiRouter.use("/lookup", lookupRouter);
+apiRouter.use("/referral", referralRouter);
 
 export { apiRouter };
