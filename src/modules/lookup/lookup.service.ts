@@ -77,9 +77,6 @@ function mapExpenseTypeLookupRow(row: ExpenseTypeLookupLean) {
 
 export async function listExpenseTypeLookupOptions({ q, limit, id }: LookupQueryParams) {
   const version = await getCacheVersion("expenseType");
-  const cacheKey = stableLookupKey("expenseType", { q: q ?? "", id: id ?? "", limit }, version);
-  const cached = await getCachedJson<any[]>(cacheKey);
-  if (cached) return cached;
   const idTrim = id?.trim();
   if (idTrim && Types.ObjectId.isValid(idTrim)) {
     const row = await ExpenseTypeModel.findOne({
@@ -91,10 +88,12 @@ export async function listExpenseTypeLookupOptions({ q, limit, id }: LookupQuery
       .lean()
       .exec();
     if (!row) return [];
-    const data = [mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean)];
-    await setCachedJson(cacheKey, data, 60 * 10);
-    return data;
+    return [mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean)];
   }
+
+  const cacheKey = stableLookupKey("expenseType", { q: q ?? "", id: "", limit }, version);
+  const cached = await getCachedJson<any[]>(cacheKey);
+  if (cached) return cached;
 
   const qTrim = q?.trim();
   const filter: Record<string, unknown> = {

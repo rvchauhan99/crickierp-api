@@ -2,6 +2,7 @@ import type { Model } from "mongoose";
 import { Types } from "mongoose";
 import type { Schema, SchemaType } from "mongoose";
 import { AppError } from "../../shared/errors/AppError";
+import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 import {
   getMasterModel,
   getRegistryEntry,
@@ -38,6 +39,11 @@ const SERVER_ONLY: Set<string> = new Set([
   "updatedBy",
   "deletedAt",
 ]);
+
+function cacheDomainsForModel(modelKey: MasterModelKey): string[] {
+  if (modelKey === "expenseType") return ["expenseType"];
+  return [];
+}
 
 function pathToFieldType(path: SchemaType, pathName: string): MasterFieldType {
   const inst = path.instance;
@@ -204,6 +210,8 @@ export async function createMaster(modelKey: string, body: Record<string, unknow
     deletedAt: null,
   });
   const lean = await Model.findById(doc._id).lean().exec();
+  const domains = cacheDomainsForModel(modelKey as MasterModelKey);
+  if (domains.length > 0) await invalidateCacheDomains(domains);
   return leanToPlain(lean as Record<string, unknown>);
 }
 
@@ -227,6 +235,8 @@ export async function updateMaster(modelKey: string, id: string, body: Record<st
   if (!updated) {
     throw new AppError("not_found", "Record not found", 404);
   }
+  const domains = cacheDomainsForModel(modelKey as MasterModelKey);
+  if (domains.length > 0) await invalidateCacheDomains(domains);
   return leanToPlain(updated as Record<string, unknown>);
 }
 
@@ -249,6 +259,8 @@ export async function softDeleteMaster(modelKey: string, id: string, actorId: st
   if (!updated) {
     throw new AppError("not_found", "Record not found", 404);
   }
+  const domains = cacheDomainsForModel(modelKey as MasterModelKey);
+  if (domains.length > 0) await invalidateCacheDomains(domains);
   return { success: true };
 }
 
