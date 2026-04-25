@@ -20,6 +20,21 @@ type EnvConfig = {
   bucketSecretAccessKey?: string;
   bucketRegion: string;
   bucketPublicUrlBase?: string;
+
+  // Performance / observability
+  mongoMaxPoolSize: number;
+  mongoMinPoolSize: number;
+  mongoMaxConnecting: number;
+  mongoWaitQueueTimeoutMs: number;
+  mongoSocketTimeoutMs: number;
+  mongoServerSelectionTimeoutMs: number;
+  mongoSlowQueryMs: number;
+  enableMongoSlowQueryLog: boolean;
+  enablePerformanceMetrics: boolean;
+  apiP95WarnMs: number;
+
+  // Cache / queue
+  redisUrl?: string;
 };
 
 function required(name: string, fallback?: string): string {
@@ -63,4 +78,16 @@ export const env: EnvConfig = {
   bucketSecretAccessKey: process.env.BUCKET_SECRET_ACCESS_KEY,
   bucketRegion: process.env.BUCKET_REGION ?? "auto",
   bucketPublicUrlBase: process.env.BUCKET_PUBLIC_URL_BASE,
+
+  mongoMaxPoolSize: Number(process.env.MONGO_MAX_POOL_SIZE ?? 80),
+  mongoMinPoolSize: Number(process.env.MONGO_MIN_POOL_SIZE ?? 10),
+  mongoMaxConnecting: Number(process.env.MONGO_MAX_CONNECTING ?? 8),
+  mongoWaitQueueTimeoutMs: Number(process.env.MONGO_WAIT_QUEUE_TIMEOUT_MS ?? 5000),
+  mongoSocketTimeoutMs: Number(process.env.MONGO_SOCKET_TIMEOUT_MS ?? 45000),
+  mongoServerSelectionTimeoutMs: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS ?? 5000),
+  mongoSlowQueryMs: Number(process.env.MONGO_SLOW_QUERY_MS ?? 120),
+  enableMongoSlowQueryLog: (process.env.ENABLE_MONGO_SLOW_QUERY_LOG ?? "true") === "true",
+  enablePerformanceMetrics: (process.env.ENABLE_PERFORMANCE_METRICS ?? "true") === "true",
+  apiP95WarnMs: Number(process.env.API_P95_WARN_MS ?? 500),
+  redisUrl: process.env.REDIS_URL,
 };

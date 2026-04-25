@@ -44,6 +44,7 @@ export const listWithdrawalQuerySchema = z.object({
     .enum(["requestedAt", "createdAt", "amount", "payableAmount", "status", "playerName", "bankName", "utr"])
     .default("requestedAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
+  cursor: z.string().optional(),
   status: z.string().optional(),
   playerName: z.string().optional(),
   playerName_op: z.string().optional(),
@@ -61,6 +62,10 @@ export const listWithdrawalQuerySchema = z.object({
   createdAt_to: z.string().optional(),
   createdAt_op: z.string().optional(),
   hasAmendment: z.enum(["yes", "no"]).optional(),
+});
+
+export const approvalQueueEventsQuerySchema = z.object({
+  view: z.enum(["banker", "exchange"]),
 });
 
 export const updateWithdrawalStatusBodySchema = z.discriminatedUnion("status", [

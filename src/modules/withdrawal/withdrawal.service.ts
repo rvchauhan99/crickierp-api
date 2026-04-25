@@ -7,7 +7,6 @@ import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
 import { DepositModel } from "../deposit/deposit.model";
 import { ExpenseModel } from "../expense/expense.model";
-import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
@@ -21,6 +20,11 @@ import {
 import type { WithdrawalAmendmentSnapshot } from "./withdrawal.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
 import { amendWithdrawalBodySchema, listWithdrawalQuerySchema } from "./withdrawal.validation";
+import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
+import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPagination";
+import { enqueueExchangeRecompute } from "../../shared/queue/queue";
+import { invalidateCacheDomains } from "../../shared/cache/domainCache";
+import { logger } from "../../shared/logger";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -347,10 +351,12 @@ export async function createWithdrawal(
   if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
-      await recomputeExchangeCurrentBalance(String(player.exchange));
+      await enqueueExchangeRecompute(String(player.exchange));
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 
+  emitApprovalQueueEvent("withdrawal", "banker");
   return doc;
 }
 
@@ -415,10 +421,12 @@ export async function updateWithdrawalByExchange(
   if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
-      await recomputeExchangeCurrentBalance(String(player.exchange));
+      await enqueueExchangeRecompute(String(player.exchange));
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 
+  emitApprovalQueueEvent("withdrawal", "banker");
   return doc;
 }
 
@@ -428,6 +436,7 @@ export async function updateWithdrawalByBanker(
   actorId: string,
   requestId?: string,
 ) {
+  const startedAtMs = Date.now();
   const doc = await WithdrawalModel.findById(id);
   if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
   if (doc.status !== "requested") {
@@ -455,20 +464,61 @@ export async function updateWithdrawalByBanker(
   doc.status = "approved";
   await doc.save();
 
-  await createAuditLog({
-    actorId,
-    action: "withdrawal.banker_payout",
-    entity: "withdrawal",
-    entityId: doc._id.toString(),
-    oldValue: prev as unknown as Record<string, unknown>,
-    newValue: {
-      bankId: input.bankId,
-      utr: utrTrim,
-      status: "approved",
-    } as unknown as Record<string, unknown>,
+  const afterCoreCommitMs = Date.now();
+  logger.info(
+    {
+      requestId,
+      withdrawalId: doc._id.toString(),
+      actorId,
+      coreCommitMs: afterCoreCommitMs - startedAtMs,
+    },
+    "Withdrawal banker payout core commit completed",
+  );
+
+  const sideEffectContext = {
     requestId,
+    withdrawalId: doc._id.toString(),
+    actorId,
+  };
+  const runSideEffect = async (step: string, task: () => Promise<void> | void) => {
+    const stepStartedAtMs = Date.now();
+    try {
+      await task();
+      logger.info(
+        { ...sideEffectContext, step, durationMs: Date.now() - stepStartedAtMs },
+        "Withdrawal banker payout side-effect completed",
+      );
+    } catch (err) {
+      logger.error({ err, ...sideEffectContext, step }, "Withdrawal banker payout side-effect failed");
+    }
+  };
+
+  await runSideEffect("audit_log", async () => {
+    await createAuditLog({
+      actorId,
+      action: "withdrawal.banker_payout",
+      entity: "withdrawal",
+      entityId: doc._id.toString(),
+      oldValue: prev as unknown as Record<string, unknown>,
+      newValue: {
+        bankId: input.bankId,
+        utr: utrTrim,
+        status: "approved",
+      } as unknown as Record<string, unknown>,
+      requestId,
+    });
+  });
+  await runSideEffect("emit_withdrawal_exchange_queue_event", () => {
+    emitApprovalQueueEvent("withdrawal", "exchange");
   });
 
+  logger.info(
+    {
+      ...sideEffectContext,
+      totalDurationMs: Date.now() - startedAtMs,
+    },
+    "Withdrawal banker payout request completed",
+  );
   return doc;
 }
 
@@ -540,15 +590,27 @@ export async function listWithdrawals(
   const skip = (page - 1) * pageSize;
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
   const sortField = query.sortBy;
+  const supportsCursor = sortValue === -1 && (sortField === "requestedAt" || sortField === "createdAt");
+  const cursor = supportsCursor ? decodeTimeCursor(query.cursor) : null;
+  const queryFilter: Record<string, unknown> = { ...filter };
+  if (cursor) {
+    const cursorDate = new Date(cursor.t);
+    if (!Number.isNaN(cursorDate.getTime()) && Types.ObjectId.isValid(cursor.id)) {
+      queryFilter.$or = [
+        { [sortField]: { $lt: cursorDate } },
+        { [sortField]: cursorDate, _id: { $lt: new Types.ObjectId(cursor.id) } },
+      ];
+    }
+  }
 
   const [rows, total, lastBankerPayout] = await Promise.all([
-    WithdrawalModel.find(filter)
+    WithdrawalModel.find(queryFilter)
       .populate("player", "playerId phone")
       .populate("payoutBankId", "holderName bankName accountNumber")
       .populate("createdBy", "fullName username")
       .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
-      .skip(skip)
+      .skip(cursor ? 0 : skip)
       .limit(pageSize)
       .lean(),
     WithdrawalModel.countDocuments(filter),
@@ -567,6 +629,13 @@ export async function listWithdrawals(
   };
   if (query.view === "banker") {
     meta.lastBankerPayout = lastBankerPayout;
+  }
+  const lastRow = rows[rows.length - 1] as { _id?: unknown; requestedAt?: Date; createdAt?: Date } | undefined;
+  if (cursor && lastRow?._id) {
+    const ts = sortField === "requestedAt" ? (lastRow.requestedAt ?? lastRow.createdAt) : lastRow.createdAt;
+    if (ts) {
+      (meta as Record<string, unknown>).nextCursor = encodeTimeCursor({ t: ts, id: String(lastRow._id) });
+    }
   }
 
   return {
@@ -625,10 +694,12 @@ export async function updateWithdrawalStatus(
     if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
       const player = await PlayerModel.findById(doc.player).select("exchange").lean();
       if (player?.exchange) {
-        await recomputeExchangeCurrentBalance(String(player.exchange));
+        await enqueueExchangeRecompute(String(player.exchange));
+        await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
       }
     }
   }
+  emitApprovalQueueEvent("withdrawal", "exchange");
   return doc;
 }
 
@@ -758,7 +829,8 @@ export async function deleteWithdrawalWithReversal(id: string, actorId: string, 
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
       recomputedExchangeId = String(player.exchange);
-      await recomputeExchangeCurrentBalance(recomputedExchangeId);
+      await enqueueExchangeRecompute(recomputedExchangeId);
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 
@@ -833,7 +905,7 @@ export async function amendWithdrawal(
     utr: input.utr.trim(),
   };
 
-  let rollbackBankChanges: (() => Promise<void>) | null = null;
+  let rollbackBankChanges: (() => Promise<void>) | undefined;
   if (oldBankId === newBankId) {
     const bank = await BankModel.findById(oldBankId);
     if (!bank) throw new AppError("not_found", "Bank not found", 404);
@@ -920,7 +992,8 @@ export async function amendWithdrawal(
   if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
     const player = await PlayerModel.findById(doc.player).select("exchange").lean();
     if (player?.exchange) {
-      await recomputeExchangeCurrentBalance(String(player.exchange));
+      await enqueueExchangeRecompute(String(player.exchange));
+      await invalidateCacheDomains(["withdrawal", "exchange", "player"]);
     }
   }
 

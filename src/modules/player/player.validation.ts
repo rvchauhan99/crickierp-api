@@ -6,12 +6,16 @@ export const createPlayerBodySchema = z.object({
   phone: z.string().min(1).max(40).trim(),
   regularBonusPercentage: z.number().min(0).max(100),
   firstDepositBonusPercentage: z.number().min(0).max(100),
+  referredByPlayerId: z.string().length(24).optional().nullable(),
+  referralPercentage: z.number().min(0).max(100).default(1),
 });
 
 export const updatePlayerBodySchema = z.object({
   phone: z.string().min(1).max(40).trim(),
   regularBonusPercentage: z.number().min(0).max(100),
   firstDepositBonusPercentage: z.number().min(0).max(100),
+  referredByPlayerId: z.string().length(24).optional().nullable(),
+  referralPercentage: z.number().min(0).max(100).default(1),
 });
 
 export const listPlayerQuerySchema = z.object({
@@ -21,6 +25,7 @@ export const listPlayerQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(500).optional(),
   sortBy: z.enum(["createdAt", "playerId", "phone", "regularBonusPercentage", "firstDepositBonusPercentage", "bonusPercentage"]).default("createdAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
+  cursor: z.string().optional(),
   playerId: z.string().optional(),
   playerId_op: z.string().optional(),
   phone: z.string().optional(),

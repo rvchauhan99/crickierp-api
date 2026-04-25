@@ -5,6 +5,7 @@ export interface ExpenseTypeDocument {
   name: string;
   code?: string;
   description?: string;
+  auditRequired?: boolean;
   isActive: boolean;
   createdBy: Types.ObjectId;
   updatedBy: Types.ObjectId;
@@ -18,6 +19,7 @@ const expenseTypeSchema = new Schema<ExpenseTypeDocument>(
     name: { type: String, required: true, trim: true },
     code: { type: String, trim: true, sparse: true, unique: true },
     description: { type: String, trim: true },
+    auditRequired: { type: Boolean, default: false },
     isActive: { type: Boolean, default: true },
     createdBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },
     updatedBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },

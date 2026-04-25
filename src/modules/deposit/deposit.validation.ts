@@ -28,6 +28,7 @@ export const listDepositQuerySchema = z.object({
     .enum(["entryAt", "createdAt", "amount", "utr", "status", "totalAmount", "settledAt", "bankName"])
     .default("entryAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
+  cursor: z.string().optional(),
   utr: z.string().optional(),
   utr_op: z.string().optional(),
   bankName: z.string().optional(),
@@ -47,6 +48,10 @@ export const listDepositQuerySchema = z.object({
   createdAt_op: z.string().optional(),
   /** Filter: deposits that have at least one amendment (`yes`) or none (`no`). */
   hasAmendment: z.enum(["yes", "no"]).optional(),
+});
+
+export const approvalQueueEventsQuerySchema = z.object({
+  view: z.enum(["banker", "exchange"]),
 });
 
 export const exchangeActionBodySchema = z.discriminatedUnion("action", [
