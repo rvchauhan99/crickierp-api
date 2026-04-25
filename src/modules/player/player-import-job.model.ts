@@ -17,6 +17,7 @@ export interface PlayerImportJobErrorItem {
     phone: string;
     bonus_percentage: string;
     first_deposit_bonus_percentage: string;
+    old_player: string;
   };
 }
 
@@ -73,6 +74,7 @@ const errorItemSchema = new Schema<PlayerImportJobErrorItem>(
       phone: { type: String, required: true, default: "" },
       bonus_percentage: { type: String, required: true, default: "" },
       first_deposit_bonus_percentage: { type: String, required: true, default: "" },
+      old_player: { type: String, required: true, default: "" },
     },
   },
   { _id: false },

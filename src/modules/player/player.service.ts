@@ -522,8 +522,9 @@ export async function exportPlayersToBuffer(
 }
 
 export function getSampleCsvBuffer(): Buffer {
-  const header = "exchange_name,player_id,phone,bonus_percentage,first_deposit_bonus_percentage\n";
-  const example = "Example Exchange,PLAYER001,9876543210,5,10\n";
+  const header =
+    "exchange_name,player_id,phone,bonus_percentage,first_deposit_bonus_percentage,old_player\n";
+  const example = "Example Exchange,PLAYER001,9876543210,5,10,no\n";
   return Buffer.from(header + example, "utf-8");
 }
 
@@ -559,6 +560,7 @@ export type ImportErrorRowData = {
   phone: string;
   bonus_percentage: string;
   first_deposit_bonus_percentage: string;
+  old_player: string;
 };
 
 export type ImportRowError = {
@@ -589,6 +591,7 @@ export function buildPlayerImportErrorCsvBuffer(errors: ImportRowError[]): Buffe
     "phone",
     "bonus_percentage",
     "first_deposit_bonus_percentage",
+    "old_player",
     "error_reason",
   ];
   const lines = [header.join(",")];
@@ -601,6 +604,7 @@ export function buildPlayerImportErrorCsvBuffer(errors: ImportRowError[]): Buffe
         quoteCsvValue(error.rowData.phone),
         quoteCsvValue(error.rowData.bonus_percentage),
         quoteCsvValue(error.rowData.first_deposit_bonus_percentage),
+        quoteCsvValue(error.rowData.old_player),
         quoteCsvValue(error.reason),
       ].join(","),
     );
@@ -634,6 +638,25 @@ function parsePercentageCell(
   return { ok: true, value: n };
 }
 
+function parseMigratedOldUserCell(
+  raw: string,
+  rowNum: number,
+  rowData: ImportErrorRowData,
+): { ok: true; value: boolean | undefined } | { ok: false; error: ImportRowError } {
+  const t = raw.trim().toLowerCase();
+  if (t === "") return { ok: true, value: false };
+  if (t === "yes") return { ok: true, value: true };
+  if (t === "no") return { ok: true, value: false };
+  return {
+    ok: false,
+    error: buildImportError(
+      rowNum,
+      "old_player must be yes/no (or blank)",
+      rowData,
+    ),
+  };
+}
+
 function sheetRowsToObjects(sheet: xlsx.WorkSheet): Record<string, unknown>[] {
   return xlsx.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "", raw: false });
 }
@@ -646,6 +669,7 @@ type ParsedImportRow = {
   phone: string;
   regularBonusPercentage: number;
   firstDepositBonusPercentage: number;
+  isMigratedOldUser?: boolean;
 };
 
 export type PlayerImportProgress = {
@@ -735,6 +759,7 @@ export async function parsePlayerImportFile(
     phone: string;
     regularBonusRaw: string;
     firstDepositBonusRaw: string;
+    isMigratedOldUserRaw: string;
     rowData: ImportErrorRowData;
   }> = [];
 
@@ -760,12 +785,17 @@ export async function parsePlayerImportFile(
       "first deposit bonus%",
       "firstdepositbonuspercentage",
     );
+    const isMigratedOldUserRaw = pickCellRaw(
+      row,
+      "old_player",
+    );
     const rowData: ImportErrorRowData = {
       exchange_name: exchangeName,
       player_id: playerId,
       phone,
       bonus_percentage: regularBonusRaw,
       first_deposit_bonus_percentage: firstDepositBonusRaw,
+      old_player: isMigratedOldUserRaw,
     };
 
     if (!exchangeName && !playerId && !phone) {
@@ -794,6 +824,7 @@ export async function parsePlayerImportFile(
       phone,
       regularBonusRaw,
       firstDepositBonusRaw,
+      isMigratedOldUserRaw,
       rowData,
     });
   }
@@ -838,6 +869,11 @@ export async function parsePlayerImportFile(
       errors.push(firstDepositBonusParsed.error);
       continue;
     }
+    const migratedOldUserParsed = parseMigratedOldUserCell(row.isMigratedOldUserRaw, row.rowNum, row.rowData);
+    if (!migratedOldUserParsed.ok) {
+      errors.push(migratedOldUserParsed.error);
+      continue;
+    }
 
     parsedRows.push({
       rowNum: row.rowNum,
@@ -847,6 +883,7 @@ export async function parsePlayerImportFile(
       phone: row.phone,
       regularBonusPercentage: regularBonusParsed.value,
       firstDepositBonusPercentage: firstDepositBonusParsed.value,
+      isMigratedOldUser: migratedOldUserParsed.value,
     });
   }
 
@@ -865,6 +902,7 @@ export async function parsePlayerImportFile(
           phone: p.phone,
           bonus_percentage: String(p.regularBonusPercentage),
           first_deposit_bonus_percentage: String(p.firstDepositBonusPercentage),
+          old_player: p.isMigratedOldUser ? "yes" : "no",
         },
       });
     } else {
@@ -928,6 +966,7 @@ export async function applyPlayerImportRows(
         phone: p.phone,
         regularBonusPercentage: p.regularBonusPercentage,
         firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+        isMigratedOldUser: p.isMigratedOldUser ?? false,
         createdBy: actorOid,
         updatedBy: actorOid,
       }));
@@ -945,6 +984,7 @@ export async function applyPlayerImportRows(
                 phone: p.phone,
                 regularBonusPercentage: p.regularBonusPercentage,
                 firstDepositBonusPercentage: p.firstDepositBonusPercentage,
+                ...(typeof p.isMigratedOldUser === "boolean" ? { isMigratedOldUser: p.isMigratedOldUser } : {}),
                 updatedBy: actorOid,
               },
             },
