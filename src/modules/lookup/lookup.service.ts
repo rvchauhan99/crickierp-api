@@ -4,6 +4,7 @@ import { PlayerModel } from "../player/player.model";
 import { ExpenseTypeModel } from "../masters/expense-type.model";
 import { Types } from "mongoose";
 import { AppError } from "../../shared/errors/AppError";
+import { getCachedJson, getCacheVersion, setCachedJson } from "../../shared/cache/cache.service";
 
 export type LookupQueryParams = {
   q?: string;
@@ -15,7 +16,15 @@ function escapeRegex(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function stableLookupKey(prefix: string, payload: Record<string, unknown>, version: number): string {
+  return `v${version}:lookup:${prefix}:${JSON.stringify(payload)}`;
+}
+
 export async function listBankLookupOptions({ q, limit }: LookupQueryParams) {
+  const version = await getCacheVersion("bank");
+  const cacheKey = stableLookupKey("bank", { q: q ?? "", limit }, version);
+  const cached = await getCachedJson<any[]>(cacheKey);
+  if (cached) return cached;
   const qTrim = q?.trim();
   const filter: Record<string, unknown> = { status: "active" };
   if (qTrim) {
@@ -33,13 +42,15 @@ export async function listBankLookupOptions({ q, limit }: LookupQueryParams) {
     .select({ holderName: 1, bankName: 1, accountNumber: 1 })
     .lean()
     .exec();
-  return rows.map((row) => ({
+  const data = rows.map((row) => ({
     id: String(row._id),
     label: `${row.holderName} - ${row.bankName} (${String(row.accountNumber || "").slice(-4)})`,
     holderName: String(row.holderName ?? ""),
     bankName: String(row.bankName ?? ""),
     accountNumber: String(row.accountNumber ?? ""),
   }));
+  await setCachedJson(cacheKey, data, 60 * 10);
+  return data;
 }
 
 type ExpenseTypeLookupLean = {
@@ -65,6 +76,10 @@ function mapExpenseTypeLookupRow(row: ExpenseTypeLookupLean) {
 }
 
 export async function listExpenseTypeLookupOptions({ q, limit, id }: LookupQueryParams) {
+  const version = await getCacheVersion("expenseType");
+  const cacheKey = stableLookupKey("expenseType", { q: q ?? "", id: id ?? "", limit }, version);
+  const cached = await getCachedJson<any[]>(cacheKey);
+  if (cached) return cached;
   const idTrim = id?.trim();
   if (idTrim && Types.ObjectId.isValid(idTrim)) {
     const row = await ExpenseTypeModel.findOne({
@@ -76,7 +91,9 @@ export async function listExpenseTypeLookupOptions({ q, limit, id }: LookupQuery
       .lean()
       .exec();
     if (!row) return [];
-    return [mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean)];
+    const data = [mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean)];
+    await setCachedJson(cacheKey, data, 60 * 10);
+    return data;
   }
 
   const qTrim = q?.trim();
@@ -104,10 +121,16 @@ export async function listExpenseTypeLookupOptions({ q, limit, id }: LookupQuery
     .select({ name: 1, code: 1, description: 1, auditRequired: 1 })
     .lean()
     .exec();
-  return rows.map((row) => mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean));
+  const data = rows.map((row) => mapExpenseTypeLookupRow(row as ExpenseTypeLookupLean));
+  await setCachedJson(cacheKey, data, 60 * 10);
+  return data;
 }
 
 export async function listPlayerLookupOptions({ q, limit }: LookupQueryParams) {
+  const version = await getCacheVersion("player");
+  const cacheKey = stableLookupKey("player", { q: q ?? "", limit }, version);
+  const cached = await getCachedJson<any[]>(cacheKey);
+  if (cached) return cached;
   const qTrim = q?.trim();
   const filter: Record<string, unknown> = {};
   if (qTrim) {
@@ -124,7 +147,7 @@ export async function listPlayerLookupOptions({ q, limit }: LookupQueryParams) {
     .select({ playerId: 1, phone: 1, exchange: 1 })
     .lean()
     .exec();
-  return rows.map((row) => {
+  const data = rows.map((row) => {
     const exchange = row.exchange as { _id?: unknown; name?: unknown; provider?: unknown } | undefined;
     const exchangeName = exchange?.name != null ? String(exchange.name) : "";
     const exchangeProvider = exchange?.provider != null ? String(exchange.provider) : "";
@@ -139,9 +162,15 @@ export async function listPlayerLookupOptions({ q, limit }: LookupQueryParams) {
       exchangeProvider,
     };
   });
+  await setCachedJson(cacheKey, data, 60);
+  return data;
 }
 
 export async function listExchangeLookupOptions({ q, limit }: LookupQueryParams) {
+  const version = await getCacheVersion("exchange");
+  const cacheKey = stableLookupKey("exchange", { q: q ?? "", limit }, version);
+  const cached = await getCachedJson<any[]>(cacheKey);
+  if (cached) return cached;
   const qTrim = q?.trim();
   const filter: Record<string, unknown> = { status: "active" };
   if (qTrim) {
@@ -157,13 +186,15 @@ export async function listExchangeLookupOptions({ q, limit }: LookupQueryParams)
     .select({ name: 1, provider: 1, status: 1 })
     .lean()
     .exec();
-  return rows.map((row) => ({
+  const data = rows.map((row) => ({
     id: String(row._id),
     label: `${String(row.name ?? "")}${row.provider ? ` (${String(row.provider)})` : ""}`,
     name: String(row.name ?? ""),
     provider: String(row.provider ?? ""),
     status: String(row.status ?? ""),
   }));
+  await setCachedJson(cacheKey, data, 60 * 5);
+  return data;
 }
 
 export async function getPlayerBonusProfileLookup(playerId: string) {
