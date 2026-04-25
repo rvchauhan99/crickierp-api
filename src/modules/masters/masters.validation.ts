@@ -61,6 +61,7 @@ export const createExpenseTypeBodySchema = z
       z.string().max(10000).trim().optional(),
     ),
     isActive: z.boolean().optional(),
+    auditRequired: z.boolean().optional().default(false),
   })
   .strict();
 

@@ -10,6 +10,7 @@ export const createExpenseBodySchema = z.object({
   expenseDate: ymd,
   description: z.string().trim().max(5000).optional(),
   bankId: z.string().length(24).optional(),
+  liabilityPersonId: z.string().length(24).optional(),
 });
 
 export const updateExpenseBodySchema = z.object({
