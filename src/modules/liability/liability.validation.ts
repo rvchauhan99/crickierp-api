@@ -15,23 +15,49 @@ export const liabilityPersonIdParamSchema = z.object({
   id: z.string().length(24),
 });
 
-export const createLiabilityPersonBodySchema = z.object({
-  name: z.string().trim().min(2).max(120),
-  phone: optionalTrimmed,
-  email: optionalTrimmed,
-  notes: optionalTrimmed,
-  isActive: z.boolean().optional(),
-  openingBalance: z.number().optional().default(0),
-});
+const openingPersonBodyRefine = (data: { openingAmount?: number; openingKind?: "payable" | "receivable" }, ctx: z.RefinementCtx) => {
+  if (data.openingKind !== undefined && data.openingAmount === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "openingAmount is required when openingKind is set",
+      path: ["openingAmount"],
+    });
+  }
+  if (data.openingAmount !== undefined && data.openingAmount > 0 && data.openingKind === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "openingKind is required when openingAmount > 0",
+      path: ["openingKind"],
+    });
+  }
+};
 
-export const updateLiabilityPersonBodySchema = z.object({
-  name: z.string().trim().min(2).max(120).optional(),
-  phone: optionalTrimmed,
-  email: optionalTrimmed,
-  notes: optionalTrimmed,
-  isActive: z.boolean().optional(),
-  openingBalance: z.number().optional(),
-});
+export const createLiabilityPersonBodySchema = z
+  .object({
+    name: z.string().trim().min(2).max(120),
+    phone: optionalTrimmed,
+    email: optionalTrimmed,
+    notes: optionalTrimmed,
+    isActive: z.boolean().optional(),
+    /** Legacy signed value; ignored when openingAmount is present. */
+    openingBalance: z.number().optional(),
+    openingAmount: z.number().min(0).optional(),
+    openingKind: z.enum(["payable", "receivable"]).optional(),
+  })
+  .superRefine(openingPersonBodyRefine);
+
+export const updateLiabilityPersonBodySchema = z
+  .object({
+    name: z.string().trim().min(2).max(120).optional(),
+    phone: optionalTrimmed,
+    email: optionalTrimmed,
+    notes: optionalTrimmed,
+    isActive: z.boolean().optional(),
+    openingBalance: z.number().optional(),
+    openingAmount: z.number().min(0).optional(),
+    openingKind: z.enum(["payable", "receivable"]).optional(),
+  })
+  .superRefine(openingPersonBodyRefine);
 
 export const listLiabilityPersonQuerySchema = z.object({
   search: optionalTrimmed,

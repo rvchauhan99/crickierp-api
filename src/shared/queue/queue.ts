@@ -1,6 +1,6 @@
 import { Queue, Worker, type JobsOptions } from "bullmq";
 import { env } from "../../config/env";
-import { getRedisClient } from "../cache/redis";
+import { getRedisQueueClient } from "../cache/redis";
 import { logger } from "../logger";
 import { recomputeExchangeCurrentBalance } from "../../modules/exchange/exchange.service";
 
@@ -15,7 +15,7 @@ let worker: Worker<ExchangeRecomputeJob> | null = null;
 function getQueue(): Queue<ExchangeRecomputeJob> | null {
   if (!env.redisUrl) return null;
   if (!queue) {
-    const connection = getRedisClient();
+    const connection = getRedisQueueClient();
     if (!connection) return null;
     queue = new Queue<ExchangeRecomputeJob>(QUEUE_NAME, { connection });
   }
@@ -40,7 +40,7 @@ export async function enqueueExchangeRecompute(exchangeId: string): Promise<void
 
 export function startQueueWorkers() {
   if (!env.redisUrl || worker) return;
-  const connection = getRedisClient();
+  const connection = getRedisQueueClient();
   if (!connection) return;
   worker = new Worker<ExchangeRecomputeJob>(
     QUEUE_NAME,

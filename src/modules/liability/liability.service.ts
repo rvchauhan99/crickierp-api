@@ -42,14 +42,8 @@ function parseYmdToDate(ymd: string, timeZone: string = DEFAULT_TIMEZONE): Date 
   return ymdToUtcNoon(ymd, timeZone) ?? new Date(ymd);
 }
 
-function resolveSideFromBalance(
-  balance: number,
-  viewMode: LiabilityViewMode,
-): "receivable" | "payable" | "settled" {
+function resolveSideFromBalance(balance: number): "receivable" | "payable" | "settled" {
   if (balance === 0) return "settled";
-  if (viewMode === "person") {
-    return balance < 0 ? "receivable" : "payable";
-  }
   return balance > 0 ? "receivable" : "payable";
 }
 
@@ -65,6 +59,47 @@ function resolveBalanceByViewMode(input: { openingBalance?: number; totalDebits?
     return opening - debits + credits;
   }
   return opening + debits - credits;
+}
+
+const PLATFORM_LIST_VIEW: LiabilityViewMode = "platform";
+
+function resolveSignedOpeningFromPersonBody(
+  input: {
+    openingBalance?: number;
+    openingAmount?: number;
+    openingKind?: "payable" | "receivable";
+  },
+  mode: "create" | "update",
+): number | undefined {
+  if (input.openingAmount !== undefined) {
+    const amt = Number(input.openingAmount);
+    if (!Number.isFinite(amt) || amt < 0) throw new AppError("validation_error", "Invalid openingAmount", 400);
+    if (amt === 0) return 0;
+    if (input.openingKind === "receivable") return amt;
+    if (input.openingKind === "payable") return -amt;
+    throw new AppError("validation_error", "openingKind is required when openingAmount > 0", 400);
+  }
+  if (input.openingBalance !== undefined) return Number(input.openingBalance);
+  return mode === "create" ? 0 : undefined;
+}
+
+function enrichPersonListRow<T extends { openingBalance?: number; totalDebits?: number; totalCredits?: number }>(row: T) {
+  const opening = Number(row.openingBalance ?? 0);
+  const closingBal = resolveBalanceByViewMode(
+    {
+      openingBalance: row.openingBalance,
+      totalDebits: row.totalDebits,
+      totalCredits: row.totalCredits,
+    },
+    PLATFORM_LIST_VIEW,
+  );
+  return {
+    ...row,
+    openingBalanceAbs: Math.abs(opening),
+    openingBalanceSide: resolveSideFromBalance(opening),
+    closingBalanceAbs: Math.abs(closingBal),
+    closingBalanceSide: resolveSideFromBalance(closingBal),
+  };
 }
 
 export async function recomputePersonRollup(personId: string): Promise<void> {
@@ -142,20 +177,23 @@ export async function createLiabilityPerson(
     notes?: string;
     isActive?: boolean;
     openingBalance?: number;
+    openingAmount?: number;
+    openingKind?: "payable" | "receivable";
   },
   actorId: string,
   requestId?: string,
 ) {
+  const signedOpening = resolveSignedOpeningFromPersonBody(input, "create") ?? 0;
   const doc = await LiabilityPersonModel.create({
     name: input.name.trim(),
     phone: input.phone?.trim() ?? "",
     email: input.email?.trim() ?? "",
     notes: input.notes?.trim() ?? "",
     isActive: input.isActive ?? true,
-    openingBalance: input.openingBalance ?? 0,
+    openingBalance: signedOpening,
     totalDebits: 0,
     totalCredits: 0,
-    closingBalance: input.openingBalance ?? 0,
+    closingBalance: signedOpening,
     createdBy: new Types.ObjectId(actorId),
   });
 
@@ -184,6 +222,8 @@ export async function updateLiabilityPerson(
     notes?: string;
     isActive?: boolean;
     openingBalance?: number;
+    openingAmount?: number;
+    openingKind?: "payable" | "receivable";
   },
   actorId: string,
   requestId?: string,
@@ -200,15 +240,18 @@ export async function updateLiabilityPerson(
     openingBalance: doc.openingBalance,
   };
 
+  const signedOpening = resolveSignedOpeningFromPersonBody(input, "update");
+  const openingUpdated = signedOpening !== undefined;
+
   if (input.name !== undefined) doc.name = input.name.trim();
   if (input.phone !== undefined) doc.phone = input.phone.trim();
   if (input.email !== undefined) doc.email = input.email.trim();
   if (input.notes !== undefined) doc.notes = input.notes.trim();
   if (input.isActive !== undefined) doc.isActive = input.isActive;
-  if (input.openingBalance !== undefined) doc.openingBalance = input.openingBalance;
+  if (openingUpdated) doc.openingBalance = signedOpening;
   doc.updatedBy = new Types.ObjectId(actorId);
   await doc.save();
-  if (input.openingBalance !== undefined) {
+  if (openingUpdated) {
     await recomputePersonRollup(id);
     const refreshed = await LiabilityPersonModel.findById(id);
     if (refreshed) doc.set(refreshed.toObject());
@@ -257,7 +300,7 @@ export async function listLiabilityPersons(query: ListLiabilityPersonQuery, _opt
 
   const filter = conditions.length === 0 ? {} : conditions.length === 1 ? conditions[0] : { $and: conditions };
 
-  const [rows, total] = await Promise.all([
+  const [rawRows, total] = await Promise.all([
     LiabilityPersonModel.find(filter)
       .populate("createdBy", "fullName username")
       .populate("updatedBy", "fullName username")
@@ -267,6 +310,8 @@ export async function listLiabilityPersons(query: ListLiabilityPersonQuery, _opt
       .lean(),
     LiabilityPersonModel.countDocuments(filter),
   ]);
+
+  const rows = rawRows.map((r) => enrichPersonListRow(r));
 
   return {
     rows,
@@ -477,6 +522,7 @@ export async function getLiabilityPersonLedger(
   const to = query.toDate ? ymdToUtcEnd(query.toDate, timeZone) : null;
 
   let running = person.openingBalance ?? 0;
+  let periodOpeningBalance: number | undefined;
   const rows: Array<{
     _id: string;
     at: string;
@@ -486,6 +532,8 @@ export async function getLiabilityPersonLedger(
     debit: number;
     credit: number;
     runningBalance: number;
+    runningBalanceAbs: number;
+    runningBalanceSide: ReturnType<typeof resolveSideFromBalance>;
     referenceNo?: string;
     remark?: string;
   }> = [];
@@ -523,9 +571,13 @@ export async function getLiabilityPersonLedger(
     const isPersonTo = e.toAccountType === "person" && toId === personId;
     const debit = isPersonTo ? e.amount : 0;
     const credit = isPersonFrom ? e.amount : 0;
-    running += viewMode === "person" ? credit - debit : debit - credit;
+    const delta = viewMode === "person" ? credit - debit : debit - credit;
 
     if (isInRange) {
+      if (periodOpeningBalance === undefined) {
+        periodOpeningBalance = running;
+      }
+      running += delta;
       rows.push({
         _id: String(e._id),
         at: formatDateTimeForTimeZone(at, timeZone),
@@ -545,23 +597,36 @@ export async function getLiabilityPersonLedger(
         debit,
         credit,
         runningBalance: running,
+        runningBalanceAbs: Math.abs(running),
+        runningBalanceSide: resolveSideFromBalance(running),
         referenceNo: e.referenceNo?.trim() || undefined,
         remark: e.remark?.trim() || undefined,
       });
+    } else {
+      running += delta;
     }
   }
 
+  const openingBal = person.openingBalance ?? 0;
   return {
     viewMode,
     person: {
       _id: String(person._id),
       name: person.name,
-      openingBalance: person.openingBalance ?? 0,
-      openingSide: resolveSideFromBalance(person.openingBalance ?? 0, viewMode),
+      openingBalance: openingBal,
+      openingBalanceAbs: Math.abs(openingBal),
+      openingSide: resolveSideFromBalance(openingBal),
     },
     rows,
     closingBalance: running,
-    closingSide: resolveSideFromBalance(running, viewMode),
+    closingSide: resolveSideFromBalance(running),
+    ...(periodOpeningBalance !== undefined
+      ? {
+          periodOpeningBalance,
+          periodOpeningBalanceAbs: Math.abs(periodOpeningBalance),
+          periodOpeningSide: resolveSideFromBalance(periodOpeningBalance),
+        }
+      : {}),
   };
 }
 
@@ -589,10 +654,14 @@ export async function exportLiabilityPersonsToBuffer(
     Phone: r.phone ?? "",
     Email: r.email ?? "",
     Status: r.isActive ? "Active" : "Inactive",
-    "Opening Balance": r.openingBalance ?? 0,
+    "Opening Amount": r.openingBalanceAbs,
+    "Opening Side": r.openingBalanceSide,
+    "Opening Balance (signed)": r.openingBalance ?? 0,
     "Total Credits": r.totalCredits ?? 0,
     "Total Debits": r.totalDebits ?? 0,
-    "Closing Balance": r.closingBalance ?? 0,
+    "Closing Amount": r.closingBalanceAbs,
+    "Closing Side": r.closingBalanceSide,
+    "Closing Balance (signed)": r.closingBalance ?? 0,
     Notes: r.notes ?? "",
     "Created By": formatUserForExport(r.createdBy),
     "Updated By": formatUserForExport(r.updatedBy),
@@ -638,7 +707,9 @@ export async function exportLiabilityLedgerToBuffer(
     To: r.to,
     Debit: r.debit,
     Credit: r.credit,
-    "Running Balance": r.runningBalance,
+    "Running Amount": r.runningBalanceAbs,
+    "Running Side": r.runningBalanceSide,
+    "Running Balance (signed)": r.runningBalance,
     "Reference No": r.referenceNo ?? "",
     Remark: r.remark ?? "",
   }));
@@ -650,7 +721,9 @@ export async function exportLiabilityLedgerToBuffer(
     To: "",
     Debit: "",
     Credit: "",
-    "Running Balance": "",
+    "Running Amount": "",
+    "Running Side": "",
+    "Running Balance (signed)": "",
     "Reference No": "",
     Remark: "",
   } as unknown as (typeof exportData)[number]);
@@ -670,16 +743,19 @@ export async function getLiabilityReportSummary(query?: { viewMode?: string }) {
       },
       viewMode,
     );
-    const side = resolveSideFromBalance(bal, viewMode);
+    const side = resolveSideFromBalance(bal);
     if (side === "receivable") totalReceivable += Math.abs(bal);
     if (side === "payable") totalPayable += Math.abs(bal);
   });
 
+  const netPosition = totalReceivable - totalPayable;
   return {
     viewMode,
     totalReceivable,
     totalPayable,
-    netPosition: totalReceivable - totalPayable,
+    netPosition,
+    netPositionAbs: Math.abs(netPosition),
+    netPositionSide: resolveSideFromBalance(netPosition),
     totalPersons: persons.length,
   };
 }
@@ -697,12 +773,13 @@ export async function getLiabilityReportPersonWise(query?: { viewMode?: string }
       },
       viewMode,
     );
-    const resolvedSide = resolveSideFromBalance(balance, viewMode);
+    const resolvedSide = resolveSideFromBalance(balance);
     return {
       personId: String(p._id),
       name: p.name,
       isActive: p.isActive,
       balance,
+      balanceAbs: Math.abs(balance),
       totalCredits: Number(p.totalCredits ?? 0),
       totalDebits: Number(p.totalDebits ?? 0),
       side: resolvedSide === "settled" ? "receivable" : resolvedSide,

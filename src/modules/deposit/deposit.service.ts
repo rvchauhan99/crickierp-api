@@ -25,6 +25,7 @@ import {
 import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPagination";
 import { enqueueExchangeRecompute } from "../../shared/queue/queue";
 import { invalidateCacheDomains } from "../../shared/cache/domainCache";
+import { logger } from "../../shared/logger";
 
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
 type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
@@ -655,6 +656,7 @@ export async function exchangeApproveDeposit(
   actorId: string,
   requestId?: string,
 ) {
+  const startedAtMs = Date.now();
   const requestedBonus = Number(input.bonusAmount);
   if (!Number.isFinite(requestedBonus) || requestedBonus < 0) {
     throw new AppError("validation_error", "Invalid bonus amount", 400);
@@ -662,6 +664,16 @@ export async function exchangeApproveDeposit(
 
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
+  const requestedBonusRounded = Math.round(requestedBonus);
+  if (doc.status === "verified") {
+    const samePlayer = doc.player && String(doc.player) === input.playerId;
+    const sameBonus = Number(doc.bonusAmount ?? 0) === requestedBonusRounded;
+    if (samePlayer && sameBonus) {
+      // Idempotent success: approval already applied with same effective input.
+      return doc;
+    }
+    throw new AppError("business_rule_error", "Deposit already verified with different settlement details", 409);
+  }
   if (doc.status !== "pending" && doc.status !== "not_settled") {
     throw new AppError("business_rule_error", "Deposit is not pending/not-settled exchange action", 400);
   }
@@ -683,7 +695,7 @@ export async function exchangeApproveDeposit(
     ? playerDoc.firstDepositBonusPercentage
     : playerDoc.regularBonusPercentage;
   const bonusFromRule = bonusAmountFromPercent(doc.amount, appliedBonusPercent);
-  const bonus = Math.round(requestedBonus);
+  const bonus = requestedBonusRounded;
   const totalAmount = Math.round(Number(doc.amount) + bonus);
   const bankCashCredit = doc.amount;
   const bank = await BankModel.findById(doc.bankId);
@@ -711,28 +723,73 @@ export async function exchangeApproveDeposit(
     throw err;
   }
 
-  await createAuditLog({
-    actorId,
-    action: "deposit.exchange_approve",
-    entity: "deposit",
-    entityId: doc._id.toString(),
-    newValue: {
-      playerId: input.playerId,
-      bonusAmount: bonus,
-      requestedBonusAmount: requestedBonus,
-      bonusFromRule,
-      appliedBonusPercent,
-      appliedBonusType: isFirstDeposit ? "first_deposit" : "regular",
-      totalAmount,
-      bankCashCredit,
-      bankBalanceAfter,
+  const afterCoreCommitMs = Date.now();
+  logger.info(
+    {
+      requestId,
+      depositId: doc._id.toString(),
+      exchangeId: String(playerDoc.exchange),
+      actorId,
+      coreCommitMs: afterCoreCommitMs - startedAtMs,
     },
-    requestId,
-  });
+    "Deposit exchange approve core commit completed",
+  );
 
-  await enqueueExchangeRecompute(String(playerDoc.exchange));
-  await invalidateCacheDomains(["deposit", "exchange", "referral", "player"]);
-  await syncReferralAccrualForDeposit(doc._id);
+  const sideEffectContext = {
+    requestId,
+    depositId: doc._id.toString(),
+    exchangeId: String(playerDoc.exchange),
+    actorId,
+  };
+  const runSideEffect = async (step: string, task: () => Promise<void>) => {
+    const stepStartedAtMs = Date.now();
+    try {
+      await task();
+      logger.info(
+        { ...sideEffectContext, step, durationMs: Date.now() - stepStartedAtMs },
+        "Deposit exchange approve side-effect completed",
+      );
+    } catch (err) {
+      logger.error({ err, ...sideEffectContext, step }, "Deposit exchange approve side-effect failed");
+    }
+  };
+
+  await runSideEffect("audit_log", async () => {
+    await createAuditLog({
+      actorId,
+      action: "deposit.exchange_approve",
+      entity: "deposit",
+      entityId: doc._id.toString(),
+      newValue: {
+        playerId: input.playerId,
+        bonusAmount: bonus,
+        requestedBonusAmount: requestedBonus,
+        bonusFromRule,
+        appliedBonusPercent,
+        appliedBonusType: isFirstDeposit ? "first_deposit" : "regular",
+        totalAmount,
+        bankCashCredit,
+        bankBalanceAfter,
+      },
+      requestId,
+    });
+  });
+  await runSideEffect("enqueue_exchange_recompute", async () => {
+    await enqueueExchangeRecompute(String(playerDoc.exchange));
+  });
+  await runSideEffect("invalidate_cache_domains", async () => {
+    await invalidateCacheDomains(["deposit", "exchange", "referral", "player"]);
+  });
+  await runSideEffect("sync_referral_accrual", async () => {
+    await syncReferralAccrualForDeposit(doc._id);
+  });
+  logger.info(
+    {
+      ...sideEffectContext,
+      totalDurationMs: Date.now() - startedAtMs,
+    },
+    "Deposit exchange approve request completed",
+  );
 
   return doc;
 }

@@ -24,6 +24,7 @@ import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
 import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPagination";
 import { enqueueExchangeRecompute } from "../../shared/queue/queue";
 import { invalidateCacheDomains } from "../../shared/cache/domainCache";
+import { logger } from "../../shared/logger";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -435,6 +436,7 @@ export async function updateWithdrawalByBanker(
   actorId: string,
   requestId?: string,
 ) {
+  const startedAtMs = Date.now();
   const doc = await WithdrawalModel.findById(id);
   if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
   if (doc.status !== "requested") {
@@ -462,21 +464,61 @@ export async function updateWithdrawalByBanker(
   doc.status = "approved";
   await doc.save();
 
-  await createAuditLog({
-    actorId,
-    action: "withdrawal.banker_payout",
-    entity: "withdrawal",
-    entityId: doc._id.toString(),
-    oldValue: prev as unknown as Record<string, unknown>,
-    newValue: {
-      bankId: input.bankId,
-      utr: utrTrim,
-      status: "approved",
-    } as unknown as Record<string, unknown>,
+  const afterCoreCommitMs = Date.now();
+  logger.info(
+    {
+      requestId,
+      withdrawalId: doc._id.toString(),
+      actorId,
+      coreCommitMs: afterCoreCommitMs - startedAtMs,
+    },
+    "Withdrawal banker payout core commit completed",
+  );
+
+  const sideEffectContext = {
     requestId,
+    withdrawalId: doc._id.toString(),
+    actorId,
+  };
+  const runSideEffect = async (step: string, task: () => Promise<void> | void) => {
+    const stepStartedAtMs = Date.now();
+    try {
+      await task();
+      logger.info(
+        { ...sideEffectContext, step, durationMs: Date.now() - stepStartedAtMs },
+        "Withdrawal banker payout side-effect completed",
+      );
+    } catch (err) {
+      logger.error({ err, ...sideEffectContext, step }, "Withdrawal banker payout side-effect failed");
+    }
+  };
+
+  await runSideEffect("audit_log", async () => {
+    await createAuditLog({
+      actorId,
+      action: "withdrawal.banker_payout",
+      entity: "withdrawal",
+      entityId: doc._id.toString(),
+      oldValue: prev as unknown as Record<string, unknown>,
+      newValue: {
+        bankId: input.bankId,
+        utr: utrTrim,
+        status: "approved",
+      } as unknown as Record<string, unknown>,
+      requestId,
+    });
+  });
+  await runSideEffect("emit_withdrawal_exchange_queue_event", () => {
+    emitApprovalQueueEvent("withdrawal", "exchange");
   });
 
-  emitApprovalQueueEvent("withdrawal", "exchange");
+  logger.info(
+    {
+      ...sideEffectContext,
+      totalDurationMs: Date.now() - startedAtMs,
+    },
+    "Withdrawal banker payout request completed",
+  );
   return doc;
 }
 
