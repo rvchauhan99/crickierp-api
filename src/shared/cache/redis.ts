@@ -4,6 +4,18 @@ import { logger } from "../logger";
 
 let redisClient: IORedis | null = null;
 let redisQueueClient: IORedis | null = null;
+let redisClientConnectPromise: Promise<void> | null = null;
+
+/** Coalesces concurrent connect() on the lazy singleton (ioredis rejects parallel connect). */
+export async function ensureRedisClientConnected(): Promise<void> {
+  const redis = getRedisClient();
+  if (!redis) return;
+  if (redis.status === "ready") return;
+  redisClientConnectPromise ??= redis.connect().finally(() => {
+    redisClientConnectPromise = null;
+  });
+  await redisClientConnectPromise;
+}
 
 export function getRedisClient(): IORedis | null {
   if (!env.redisUrl) return null;
