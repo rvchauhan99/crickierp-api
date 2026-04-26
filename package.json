@@ -9,6 +9,7 @@
     "start": "node dist/src/server.js",
     "lint": "eslint .",
     "test": "jest --runInBand",
+    "reset:database": "tsx src/scripts/reset-database.ts",
     "reconcile:bank-balances": "tsx src/scripts/reconcile-bank-balances.ts",
     "backfill:business-datetimes:dry-run": "tsx src/scripts/backfill-business-datetimes.ts --dry-run",
     "backfill:business-datetimes": "tsx src/scripts/backfill-business-datetimes.ts"
