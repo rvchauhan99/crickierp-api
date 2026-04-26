@@ -29,7 +29,7 @@ export async function enqueueExchangeRecompute(exchangeId: string): Promise<void
     return;
   }
   const opts: JobsOptions = {
-    jobId: `exchange:${exchangeId}`,
+    jobId: `exchange-recompute-${exchangeId}`,
     removeOnComplete: 1000,
     removeOnFail: 2000,
     attempts: 5,
