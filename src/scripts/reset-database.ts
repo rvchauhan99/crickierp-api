@@ -1,10 +1,31 @@
 // import "dotenv/config";
 // import mongoose from "mongoose";
+// import IORedis from "ioredis";
 // import { ExpenseTypeModel } from "../modules/masters/expense-type.model";
 // import { UserModel } from "../modules/users/user.model";
 // import { connectDb } from "../shared/db/connect";
 // import { bootstrapData } from "../shared/db/bootstrap";
 // import { logger } from "../shared/logger";
+
+// async function flushRedisIfConfigured(): Promise<void> {
+//     const url = process.env.REDIS_URL?.trim();
+//     if (!url) {
+//         logger.info("REDIS_URL not set; skipping Redis flush");
+//         return;
+//     }
+
+//     const redis = new IORedis(url, {
+//         maxRetriesPerRequest: 2,
+//         enableReadyCheck: true,
+//     });
+
+//     try {
+//         await redis.flushdb();
+//         logger.info("Redis FLUSHDB completed for the database index in REDIS_URL");
+//     } finally {
+//         await redis.quit();
+//     }
+// }
 
 // async function main() {
 //     if (process.env.NODE_ENV === "production") {
@@ -33,6 +54,7 @@
 //     logger.info(
 //         "Seeded permissions and superadmin — username: superadmin, password: SuperAdmin@123",
 //     );
+//     await flushRedisIfConfigured();
 //     await mongoose.disconnect();
 // }
 
