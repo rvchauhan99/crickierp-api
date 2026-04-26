@@ -1,11 +1,11 @@
-import { getRedisClient } from "./redis";
+import { ensureRedisClientConnected, getRedisClient } from "./redis";
 import { logger } from "../logger";
 
 export async function getCachedJson<T>(key: string): Promise<T | null> {
   const redis = getRedisClient();
   if (!redis) return null;
   try {
-    await redis.connect();
+    await ensureRedisClientConnected();
     const raw = await redis.get(key);
     if (!raw) return null;
     return JSON.parse(raw) as T;
@@ -19,7 +19,7 @@ export async function setCachedJson(key: string, data: unknown, ttlSeconds: numb
   const redis = getRedisClient();
   if (!redis) return;
   try {
-    await redis.connect();
+    await ensureRedisClientConnected();
     await redis.set(key, JSON.stringify(data), "EX", ttlSeconds);
   } catch (err) {
     logger.warn({ err, key, ttlSeconds }, "Cache write failed; continuing without cache");
@@ -30,7 +30,7 @@ export async function bumpCacheVersion(namespace: string): Promise<number> {
   const redis = getRedisClient();
   if (!redis) return 1;
   try {
-    await redis.connect();
+    await ensureRedisClientConnected();
     const key = `cache:version:${namespace}`;
     const next = await redis.incr(key);
     if (next === 1) {
@@ -47,7 +47,7 @@ export async function getCacheVersion(namespace: string): Promise<number> {
   const redis = getRedisClient();
   if (!redis) return 1;
   try {
-    await redis.connect();
+    await ensureRedisClientConnected();
     const key = `cache:version:${namespace}`;
     const value = await redis.get(key);
     if (!value) return 1;
