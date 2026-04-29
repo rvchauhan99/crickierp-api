@@ -29,6 +29,12 @@ import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
+type DuplicateTransactionContext = {
+  type: "deposit" | "withdrawal";
+  id: string;
+  status: string;
+  dateTime: Date;
+};
 
 function pageSizeFromQuery(q: ListWithdrawalQuery): number {
   return q.limit ?? q.pageSize;
@@ -58,7 +64,9 @@ async function utrConflictsWithNonRejectedDeposit(utr: string) {
   return DepositModel.findOne({
     utr: { $regex: `^${escapeUtrRegex(normalized)}$`, $options: "i" },
     status: { $ne: "rejected" },
-  });
+  })
+    .select({ _id: 1, status: 1, entryAt: 1, createdAt: 1 })
+    .lean();
 }
 
 async function utrConflictsWithNonRejectedWithdrawal(utr: string, excludeId?: Types.ObjectId) {
@@ -70,7 +78,7 @@ async function utrConflictsWithNonRejectedWithdrawal(utr: string, excludeId?: Ty
   if (excludeId) {
     filter._id = { $ne: excludeId };
   }
-  return WithdrawalModel.findOne(filter);
+  return WithdrawalModel.findOne(filter).select({ _id: 1, status: 1, requestedAt: 1, createdAt: 1 }).lean();
 }
 
 async function ensureGlobalUtrUniqueForWithdrawal(utr: string, excludeWithdrawalId?: Types.ObjectId) {
@@ -79,7 +87,24 @@ async function ensureGlobalUtrUniqueForWithdrawal(utr: string, excludeWithdrawal
     utrConflictsWithNonRejectedWithdrawal(utr, excludeWithdrawalId),
   ]);
   if (depositConflict || withdrawalConflict) {
-    throw new AppError("business_rule_error", "UTR already exists in another transaction", 409);
+    const duplicateTransaction: DuplicateTransactionContext | null = depositConflict
+      ? {
+          type: "deposit",
+          id: String(depositConflict._id),
+          status: String(depositConflict.status ?? ""),
+          dateTime: (depositConflict.entryAt as Date | undefined) ?? (depositConflict.createdAt as Date),
+        }
+      : withdrawalConflict
+        ? {
+            type: "withdrawal",
+            id: String(withdrawalConflict._id),
+            status: String(withdrawalConflict.status ?? ""),
+            dateTime: (withdrawalConflict.requestedAt as Date | undefined) ?? (withdrawalConflict.createdAt as Date),
+          }
+        : null;
+    throw new AppError("business_rule_error", "UTR already exists in another transaction", 409, {
+      duplicateTransaction,
+    });
   }
 }
 
