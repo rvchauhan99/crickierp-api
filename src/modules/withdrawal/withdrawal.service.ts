@@ -25,6 +25,7 @@ import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPag
 import { enqueueExchangeRecompute } from "../../shared/queue/queue";
 import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 import { logger } from "../../shared/logger";
+import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/utr";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -50,6 +51,36 @@ function parseBusinessDateTime(value: string | undefined, fieldName: string): Da
     throw new AppError("validation_error", `${fieldName} must be a valid datetime`, 400);
   }
   return parsed;
+}
+
+async function utrConflictsWithNonRejectedDeposit(utr: string) {
+  const normalized = normalizeUtr(utr);
+  return DepositModel.findOne({
+    utr: { $regex: `^${escapeUtrRegex(normalized)}$`, $options: "i" },
+    status: { $ne: "rejected" },
+  });
+}
+
+async function utrConflictsWithNonRejectedWithdrawal(utr: string, excludeId?: Types.ObjectId) {
+  const normalized = normalizeUtr(utr);
+  const filter: { utr: { $regex: string; $options: string }; status: { $ne: string }; _id?: { $ne: Types.ObjectId } } = {
+    utr: { $regex: `^${escapeUtrRegex(normalized)}$`, $options: "i" },
+    status: { $ne: "rejected" },
+  };
+  if (excludeId) {
+    filter._id = { $ne: excludeId };
+  }
+  return WithdrawalModel.findOne(filter);
+}
+
+async function ensureGlobalUtrUniqueForWithdrawal(utr: string, excludeWithdrawalId?: Types.ObjectId) {
+  const [depositConflict, withdrawalConflict] = await Promise.all([
+    utrConflictsWithNonRejectedDeposit(utr),
+    utrConflictsWithNonRejectedWithdrawal(utr, excludeWithdrawalId),
+  ]);
+  if (depositConflict || withdrawalConflict) {
+    throw new AppError("business_rule_error", "UTR already exists in another transaction", 409);
+  }
 }
 
 function textFieldCondition(field: string, value: string, op: string | undefined): Record<string, unknown> {
@@ -442,10 +473,11 @@ export async function updateWithdrawalByBanker(
   if (doc.status !== "requested") {
     throw new AppError("business_rule_error", "Only pending banker withdrawals can be updated", 400);
   }
-  const utrTrim = input.utr.trim();
+  const utrTrim = normalizeUtr(input.utr);
   if (doc.utr && doc.utr.trim() !== "") {
     throw new AppError("business_rule_error", "UTR already recorded for this withdrawal", 400);
   }
+  await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
 
   const bank = await BankModel.findById(input.bankId);
   if (!bank) throw new AppError("not_found", "Bank not found", 404);
@@ -876,6 +908,10 @@ export async function amendWithdrawal(
   const newBank = await BankModel.findById(input.payoutBankId);
   if (!newBank) throw new AppError("not_found", "Bank not found", 404);
   if (newBank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+  const utrTrim = normalizeUtr(input.utr);
+  if (utrTrim !== normalizeUtr(doc.utr ?? "")) {
+    await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
+  }
 
   const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
   const newPayable = payableFromAmounts(input.amount, input.reverseBonus);
@@ -902,7 +938,7 @@ export async function amendWithdrawal(
     payableAmount: newPayable,
     payoutBankId: newBankId,
     payoutBankName: bankDisplayName(newBank),
-    utr: input.utr.trim(),
+    utr: utrTrim,
   };
 
   let rollbackBankChanges: (() => Promise<void>) | undefined;
@@ -953,7 +989,7 @@ export async function amendWithdrawal(
     doc.payableAmount = newPayable;
     doc.payoutBankId = new Types.ObjectId(newBankId);
     doc.payoutBankName = newSnapshot.payoutBankName ?? doc.payoutBankName;
-    doc.utr = input.utr.trim();
+    doc.utr = utrTrim;
     doc.requestedAt = nextRequestedAt;
     doc.amendmentCount = (doc.amendmentCount ?? 0) + 1;
     doc.lastAmendedAt = new Date();
