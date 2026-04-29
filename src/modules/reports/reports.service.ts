@@ -196,7 +196,7 @@ async function buildDashboardFilterContext(
   const scopedPlayerIds = exchangeObjectId
     ? await (await import("../player/player.model")).PlayerModel.distinct("_id", {
         exchange: exchangeObjectId,
-        isMigratedOldUser: { $ne: true },
+        isMigratedOldUser: false,
       })
     : null;
 
@@ -558,11 +558,11 @@ export async function getDashboardSummary(
     ...liabilityDateBeforeExpr(rangeStartUtc),
   };
   const todayRange = resolveTodayRangeForTimeZone(timeZone);
-  const todayPlayerFilter = {
-    isMigratedOldUser: { $ne: true },
+  const periodPlayerFilter = {
+    isMigratedOldUser: false,
     createdAt: {
-      $gte: todayRange.startUtc,
-      $lte: todayRange.endUtc,
+      $gte: rangeStartUtc,
+      $lte: rangeEndUtc,
     },
     ...(exchangeObjectId ? { exchange: exchangeObjectId } : {}),
   };
@@ -584,10 +584,10 @@ export async function getDashboardSummary(
     withdrawalTrend,
     exchangeDeposits,
     exchangeWithdrawals,
-    todayNewPlayersCount,
-    firstTimeDepositTodayAgg,
-    exchangeNewPlayersTodayAgg,
-    exchangeFirstTimeDepositTodayAgg,
+    periodNewPlayersCount,
+    firstTimeDepositPeriodAgg,
+    exchangeNewPlayersAgg,
+    exchangeFirstTimeDepositAgg,
     activeBanks,
     depositByBankInRange,
     depositByBankBeforeRange,
@@ -777,7 +777,7 @@ export async function getDashboardSummary(
       },
     ]),
 
-    PlayerModel.countDocuments(todayPlayerFilter),
+    PlayerModel.countDocuments(periodPlayerFilter),
 
     scopedPlayerIds && scopedPlayerIds.length === 0
       ? Promise.resolve([{ totalAmount: 0 }])
@@ -792,12 +792,13 @@ export async function getDashboardSummary(
             },
           },
           { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
-          { $match: { "playerDoc.isMigratedOldUser": { $ne: true } } },
+          { $match: { "playerDoc.isMigratedOldUser": false } },
           {
             $addFields: {
               firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
             },
           },
+          { $match: { firstDepositEventAt: { $type: "date" } } },
           { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
           {
             $group: {
@@ -809,8 +810,8 @@ export async function getDashboardSummary(
           {
             $match: {
               firstDepositAt: {
-                $gte: todayRange.startUtc,
-                $lte: todayRange.endUtc,
+                $gte: rangeStartUtc,
+                $lte: rangeEndUtc,
               },
             },
           },
@@ -823,11 +824,11 @@ export async function getDashboardSummary(
         ]),
 
     PlayerModel.aggregate([
-      { $match: todayPlayerFilter },
+      { $match: periodPlayerFilter },
       {
         $group: {
           _id: "$exchange",
-          newPlayersToday: { $sum: 1 },
+          newPlayers: { $sum: 1 },
         },
       },
     ]),
@@ -845,12 +846,13 @@ export async function getDashboardSummary(
             },
           },
           { $unwind: { path: "$playerDoc", preserveNullAndEmptyArrays: false } },
-          { $match: { "playerDoc.isMigratedOldUser": { $ne: true } } },
+          { $match: { "playerDoc.isMigratedOldUser": false } },
           {
             $addFields: {
-              firstDepositEventAt: { $ifNull: ["$entryAt", "$createdAt"] },
+              firstDepositEventAt: "$entryAt",
             },
           },
+          { $match: { firstDepositEventAt: { $type: "date" } } },
           { $sort: { player: 1, firstDepositEventAt: 1, createdAt: 1, _id: 1 } },
           {
             $group: {
@@ -862,8 +864,8 @@ export async function getDashboardSummary(
           {
             $match: {
               firstDepositAt: {
-                $gte: todayRange.startUtc,
-                $lte: todayRange.endUtc,
+                $gte: rangeStartUtc,
+                $lte: rangeEndUtc,
               },
             },
           },
@@ -871,7 +873,7 @@ export async function getDashboardSummary(
           {
             $group: {
               _id: "$playerDoc.exchange",
-              firstTimeDepositAmountToday: { $sum: "$firstDepositAmount" },
+              firstTimeDepositAmount: { $sum: "$firstDepositAmount" },
             },
           },
         ]),
@@ -1166,21 +1168,21 @@ export async function getDashboardSummary(
     .map((e) => ({
       ...e,
       exchangeId: e.exchangeIdString,
-      newPlayersToday:
-        exchangeNewPlayersTodayAgg.find((row: { _id?: unknown; newPlayersToday?: number }) => String(row._id) === e.exchangeId)
-          ?.newPlayersToday ?? 0,
-      firstTimeDepositAmountToday:
-        exchangeFirstTimeDepositTodayAgg.find(
-          (row: { _id?: unknown; firstTimeDepositAmountToday?: number }) => String(row._id) === e.exchangeId,
-        )?.firstTimeDepositAmountToday ?? 0,
+      newPlayers:
+        exchangeNewPlayersAgg.find((row: { _id?: unknown; newPlayers?: number }) => String(row._id) === e.exchangeId)
+          ?.newPlayers ?? 0,
+      firstTimeDepositAmount:
+        exchangeFirstTimeDepositAgg.find(
+          (row: { _id?: unknown; firstTimeDepositAmount?: number }) => String(row._id) === e.exchangeId,
+        )?.firstTimeDepositAmount ?? 0,
       netPL: e.depositVerified - e.withdrawalApproved,
       netBonus: e.bonusGiven - e.bonusRecovered,
       periodOpeningBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodOpeningBalance ?? 0 : 0,
       periodClosingBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodClosingBalance ?? 0 : 0,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
-  const firstTimeDepositAmountToday =
-    (firstTimeDepositTodayAgg as Array<{ totalAmount?: number }>)[0]?.totalAmount ?? 0;
+  const firstTimeDepositAmount =
+    (firstTimeDepositPeriodAgg as Array<{ totalAmount?: number }>)[0]?.totalAmount ?? 0;
 
   const asNumber = (value: unknown) => Number(value ?? 0);
   const groupToAmountMap = (rows: Array<{ _id?: unknown; totalAmount?: number }>) => {
@@ -1317,9 +1319,9 @@ export async function getDashboardSummary(
     users: {
       total: totalUsers,
     },
-    todayMetrics: {
-      newPlayersToday: todayNewPlayersCount ?? 0,
-      firstTimeDepositAmountToday,
+    periodMetrics: {
+      newPlayers: periodNewPlayersCount ?? 0,
+      firstTimeDepositAmount,
     },
     trendData,
     recentActivity,
@@ -1446,8 +1448,8 @@ export async function exportDashboardSummaryToBuffer(
     { KPI: "Reverse Bonus", Value: data.withdrawal.reverseBonusTotal },
     { KPI: "Total Expenses", Value: data.expense.totalAmount },
     { KPI: "Net P&L", Value: data.pnl.net },
-    { KPI: "New Players Today", Value: data.todayMetrics.newPlayersToday },
-    { KPI: "First-Time Deposit Amount Today", Value: data.todayMetrics.firstTimeDepositAmountToday },
+    { KPI: "New Players (Selected Period)", Value: data.periodMetrics.newPlayers },
+    { KPI: "First-Time Deposit Amount (Selected Period)", Value: data.periodMetrics.firstTimeDepositAmount },
   ];
 
   const exchangeData = data.exchangesBreakdown.map((ex) => ({

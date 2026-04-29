@@ -26,9 +26,17 @@ import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPag
 import { enqueueExchangeRecompute } from "../../shared/queue/queue";
 import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 import { logger } from "../../shared/logger";
+import { WithdrawalModel } from "../withdrawal/withdrawal.model";
+import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/utr";
 
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
 type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
+type DuplicateTransactionContext = {
+  type: "deposit" | "withdrawal";
+  id: string;
+  status: string;
+  dateTime: Date;
+};
 
 function pageSizeFromQuery(q: ListDepositQuery): number {
   return q.limit ?? q.pageSize;
@@ -276,15 +284,58 @@ function bankDisplayName(b: { holderName: string; bankName: string; accountNumbe
 
 /** UTR must be unique among non-rejected deposits; rejected rows do not block reuse. */
 async function utrConflictsWithNonRejected(utr: string, excludeId?: Types.ObjectId) {
-  const trimmed = utr.trim();
-  const filter: { utr: string; status: { $ne: string }; _id?: { $ne: Types.ObjectId } } = {
-    utr: trimmed,
+  const normalized = normalizeUtr(utr);
+  const filter: { utr: { $regex: string; $options: string }; status: { $ne: string }; _id?: { $ne: Types.ObjectId } } = {
+    utr: { $regex: `^${escapeUtrRegex(normalized)}$`, $options: "i" },
     status: { $ne: "rejected" },
   };
   if (excludeId) {
     filter._id = { $ne: excludeId };
   }
-  return DepositModel.findOne(filter);
+  return DepositModel.findOne(filter).select({ _id: 1, status: 1, entryAt: 1, createdAt: 1 }).lean();
+}
+
+async function utrConflictsWithWithdrawalNonRejected(utr: string, excludeWithdrawalId?: Types.ObjectId) {
+  const normalized = normalizeUtr(utr);
+  const filter: {
+    utr: { $regex: string; $options: string };
+    status: { $ne: string };
+    _id?: { $ne: Types.ObjectId };
+  } = {
+    utr: { $regex: `^${escapeUtrRegex(normalized)}$`, $options: "i" },
+    status: { $ne: "rejected" },
+  };
+  if (excludeWithdrawalId) {
+    filter._id = { $ne: excludeWithdrawalId };
+  }
+  return WithdrawalModel.findOne(filter).select({ _id: 1, status: 1, requestedAt: 1, createdAt: 1 }).lean();
+}
+
+async function ensureGlobalUtrUniqueForDeposit(utr: string, excludeDepositId?: Types.ObjectId) {
+  const [depositConflict, withdrawalConflict] = await Promise.all([
+    utrConflictsWithNonRejected(utr, excludeDepositId),
+    utrConflictsWithWithdrawalNonRejected(utr),
+  ]);
+  if (depositConflict || withdrawalConflict) {
+    const duplicateTransaction: DuplicateTransactionContext | null = depositConflict
+      ? {
+          type: "deposit",
+          id: String(depositConflict._id),
+          status: String(depositConflict.status ?? ""),
+          dateTime: (depositConflict.entryAt as Date | undefined) ?? (depositConflict.createdAt as Date),
+        }
+      : withdrawalConflict
+        ? {
+            type: "withdrawal",
+            id: String(withdrawalConflict._id),
+            status: String(withdrawalConflict.status ?? ""),
+            dateTime: (withdrawalConflict.requestedAt as Date | undefined) ?? (withdrawalConflict.createdAt as Date),
+          }
+        : null;
+    throw new AppError("business_rule_error", "UTR already exists in another transaction", 409, {
+      duplicateTransaction,
+    });
+  }
 }
 
 export async function createDeposit(
@@ -292,8 +343,7 @@ export async function createDeposit(
   actorId: string,
   requestId?: string,
 ) {
-  const exists = await utrConflictsWithNonRejected(input.utr);
-  if (exists) throw new AppError("business_rule_error", "UTR already exists", 409);
+  await ensureGlobalUtrUniqueForDeposit(input.utr);
 
   const bank = await BankModel.findById(input.bankId);
   if (!bank) throw new AppError("not_found", "Bank not found", 404);
@@ -302,7 +352,7 @@ export async function createDeposit(
   const doc = await DepositModel.create({
     bankId: new Types.ObjectId(input.bankId),
     bankName: bankDisplayName(bank),
-    utr: input.utr.trim(),
+    utr: normalizeUtr(input.utr),
     amount: input.amount,
     status: "pending",
     entryAt: parseBusinessDateTime(input.entryAt, "entryAt"),
@@ -316,7 +366,7 @@ export async function createDeposit(
     entityId: doc._id.toString(),
     newValue: {
       bankId: input.bankId,
-      utr: input.utr,
+      utr: normalizeUtr(input.utr),
       amount: input.amount,
       entryAt: doc.entryAt,
     } as unknown as Record<string, unknown>,
@@ -338,10 +388,9 @@ export async function updateDepositByBanker(
     throw new AppError("business_rule_error", "Only pending deposits can be updated", 400);
   }
 
-  const utrTrim = input.utr.trim();
-  if (utrTrim !== doc.utr) {
-    const exists = await utrConflictsWithNonRejected(utrTrim, doc._id);
-    if (exists) throw new AppError("business_rule_error", "UTR already exists", 409);
+  const utrTrim = normalizeUtr(input.utr);
+  if (utrTrim !== normalizeUtr(doc.utr)) {
+    await ensureGlobalUtrUniqueForDeposit(utrTrim, doc._id);
   }
 
   const bank = await BankModel.findById(input.bankId);
@@ -886,10 +935,9 @@ export async function amendVerifiedDeposit(
     throw new AppError("business_rule_error", "Deposit is missing bank or player", 400);
   }
 
-  const utrTrim = input.utr.trim();
-  if (utrTrim !== doc.utr) {
-    const exists = await utrConflictsWithNonRejected(utrTrim, doc._id);
-    if (exists) throw new AppError("business_rule_error", "UTR already exists", 409);
+  const utrTrim = normalizeUtr(input.utr);
+  if (utrTrim !== normalizeUtr(doc.utr)) {
+    await ensureGlobalUtrUniqueForDeposit(utrTrim, doc._id);
   }
 
   const newBankDoc = await BankModel.findById(input.bankId);
