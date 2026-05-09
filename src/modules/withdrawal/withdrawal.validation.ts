@@ -20,10 +20,27 @@ export const createWithdrawalBodySchema = z.object({
   requestedAt: optionalDateTime,
 });
 
-export const withdrawalBankerPayoutBodySchema = z.object({
-  bankId: z.string().length(24),
-  utr: z.string().min(4).max(120).trim(),
-});
+export const withdrawalBankerPayoutBodySchema = z
+  .object({
+    payoutSettlementType: z.enum(["bank", "person"]).optional().default("bank"),
+    bankId: z.string().length(24).optional(),
+    liabilityPersonId: z.string().length(24).optional(),
+    utr: z.string().min(4).max(120).trim(),
+  })
+  .superRefine((data, ctx) => {
+    const mode = data.payoutSettlementType ?? "bank";
+    if (mode === "bank") {
+      if (!data.bankId?.trim()) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Payout bank is required.", path: ["bankId"] });
+      }
+    } else if (!data.liabilityPersonId?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Liability person is required.",
+        path: ["liabilityPersonId"],
+      });
+    }
+  });
 
 export const updateWithdrawalBodySchema = z.object({
   accountNumber: z.string().min(1).max(40).trim(),
@@ -82,7 +99,7 @@ export const updateWithdrawalStatusBodySchema = z.discriminatedUnion("status", [
 export const amendWithdrawalBodySchema = z.object({
   amount: z.number().int().min(1),
   reverseBonus: z.number().int().min(0),
-  payoutBankId: z.string().length(24),
+  payoutBankId: z.string().length(24).optional(),
   utr: z.string().min(4).max(120).trim(),
   requestedAt: optionalDateTime,
   reasonId: z.string().length(24),

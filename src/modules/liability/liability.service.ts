@@ -4,7 +4,9 @@ import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
+import { DepositModel } from "../deposit/deposit.model";
 import { ExpenseModel } from "../expense/expense.model";
+import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import {
   DEFAULT_TIMEZONE,
   formatDateForTimeZone,
@@ -13,7 +15,7 @@ import {
   ymdToUtcNoon,
   ymdToUtcStart,
 } from "../../shared/utils/timezone";
-import { LiabilityEntryModel } from "./liability-entry.model";
+import { type LiabilityEntryDocument, LiabilityEntryModel } from "./liability-entry.model";
 import { LiabilityPersonModel } from "./liability-person.model";
 import { liabilityLedgerQuerySchema, listLiabilityEntryQuerySchema, listLiabilityPersonQuerySchema } from "./liability.validation";
 
@@ -61,8 +63,6 @@ function resolveBalanceByViewMode(input: { openingBalance?: number; totalDebits?
   return opening + debits - credits;
 }
 
-const PLATFORM_LIST_VIEW: LiabilityViewMode = "platform";
-
 function resolveSignedOpeningFromPersonBody(
   input: {
     openingBalance?: number;
@@ -83,16 +83,22 @@ function resolveSignedOpeningFromPersonBody(
   return mode === "create" ? 0 : undefined;
 }
 
-function enrichPersonListRow<T extends { openingBalance?: number; totalDebits?: number; totalCredits?: number }>(row: T) {
+function enrichPersonListRow<
+  T extends { openingBalance?: number; totalDebits?: number; totalCredits?: number; closingBalance?: number },
+>(row: T) {
   const opening = Number(row.openingBalance ?? 0);
-  const closingBal = resolveBalanceByViewMode(
-    {
-      openingBalance: row.openingBalance,
-      totalDebits: row.totalDebits,
-      totalCredits: row.totalCredits,
-    },
-    PLATFORM_LIST_VIEW,
-  );
+  const stored = row.closingBalance;
+  const closingBal =
+    stored !== undefined && stored !== null && Number.isFinite(Number(stored))
+      ? Number(stored)
+      : resolveBalanceByViewMode(
+          {
+            openingBalance: row.openingBalance,
+            totalDebits: row.totalDebits,
+            totalCredits: row.totalCredits,
+          },
+          "person",
+        );
   return {
     ...row,
     openingBalanceAbs: Math.abs(opening),
@@ -140,10 +146,12 @@ export async function recomputePersonRollup(personId: string): Promise<void> {
   await person.save();
 }
 
+export type LiabilityEntryAccountLiteral = "bank" | "person" | "expense" | "deposit" | "withdrawal";
+
 function validateDistinctEndpoints(input: {
-  fromAccountType: "bank" | "person" | "expense";
+  fromAccountType: LiabilityEntryAccountLiteral;
   fromAccountId: string;
-  toAccountType: "bank" | "person" | "expense";
+  toAccountType: LiabilityEntryAccountLiteral;
   toAccountId: string;
 }) {
   if (input.fromAccountType === input.toAccountType && input.fromAccountId === input.toAccountId) {
@@ -151,7 +159,7 @@ function validateDistinctEndpoints(input: {
   }
 }
 
-async function ensureAccountExists(type: "bank" | "person" | "expense", id: string) {
+async function ensureAccountExists(type: LiabilityEntryAccountLiteral, id: string) {
   if (!Types.ObjectId.isValid(id)) throw new AppError("validation_error", "Invalid account id", 400);
   if (type === "bank") {
     const bank = await BankModel.findById(id).lean();
@@ -162,6 +170,16 @@ async function ensureAccountExists(type: "bank" | "person" | "expense", id: stri
   if (type === "expense") {
     const expense = await ExpenseModel.findById(id).select("_id").lean();
     if (!expense) throw new AppError("not_found", "Expense not found", 404);
+    return;
+  }
+  if (type === "deposit") {
+    const dep = await DepositModel.findById(id).select("_id").lean();
+    if (!dep) throw new AppError("not_found", "Deposit not found", 404);
+    return;
+  }
+  if (type === "withdrawal") {
+    const w = await WithdrawalModel.findById(id).select("_id").lean();
+    if (!w) throw new AppError("not_found", "Withdrawal not found", 404);
     return;
   }
   const person = await LiabilityPersonModel.findById(id).lean();
@@ -324,12 +342,14 @@ export async function createLiabilityEntry(
     entryDate: string;
     entryType: "receipt" | "payment" | "contra" | "journal";
     amount: number;
-    fromAccountType: "bank" | "person" | "expense";
+    fromAccountType: LiabilityEntryAccountLiteral;
     fromAccountId: string;
-    toAccountType: "bank" | "person" | "expense";
+    toAccountType: LiabilityEntryAccountLiteral;
     toAccountId: string;
-    sourceType?: "expense";
+    sourceType?: "expense" | "deposit" | "withdrawal";
     sourceExpenseId?: string;
+    sourceDepositId?: string;
+    sourceWithdrawalId?: string;
     referenceNo?: string;
     remark?: string;
   },
@@ -352,6 +372,8 @@ export async function createLiabilityEntry(
     toAccountId: new Types.ObjectId(input.toAccountId),
     sourceType: input.sourceType,
     sourceExpenseId: input.sourceExpenseId ? new Types.ObjectId(input.sourceExpenseId) : undefined,
+    sourceDepositId: input.sourceDepositId ? new Types.ObjectId(input.sourceDepositId) : undefined,
+    sourceWithdrawalId: input.sourceWithdrawalId ? new Types.ObjectId(input.sourceWithdrawalId) : undefined,
     referenceNo: input.referenceNo?.trim() ?? "",
     remark: input.remark?.trim() ?? "",
     createdBy: new Types.ObjectId(actorId),
@@ -377,6 +399,8 @@ export async function createLiabilityEntry(
       toAccountId: input.toAccountId,
       sourceType: input.sourceType,
       sourceExpenseId: input.sourceExpenseId,
+      sourceDepositId: input.sourceDepositId,
+      sourceWithdrawalId: input.sourceWithdrawalId,
       referenceNo: input.referenceNo?.trim() || undefined,
       remark: input.remark?.trim() || undefined,
     },
@@ -384,6 +408,34 @@ export async function createLiabilityEntry(
   });
 
   return doc;
+}
+
+/** Remove a system-generated liability entry (e.g. deposit/withdrawal settlement) for reversal flows. */
+export async function deleteLiabilityEntryForReversal(entryId: string, actorId: string, requestId?: string): Promise<boolean> {
+  if (!Types.ObjectId.isValid(entryId)) throw new AppError("validation_error", "Invalid liability entry id", 400);
+  const eid = new Types.ObjectId(entryId);
+  const doc = await LiabilityEntryModel.findById(eid).lean();
+  if (!doc) return false;
+  const recalcTargets = new Set<string>();
+  if (doc.fromAccountType === "person") recalcTargets.add(String(doc.fromAccountId));
+  if (doc.toAccountType === "person") recalcTargets.add(String(doc.toAccountId));
+  await LiabilityEntryModel.deleteOne({ _id: eid });
+  await Promise.all([...recalcTargets].map((personId) => recomputePersonRollup(personId)));
+  await createAuditLog({
+    actorId,
+    action: "liability.entry.delete",
+    entity: "liability_entry",
+    entityId: entryId,
+    oldValue: {
+      entryDate: doc.entryDate,
+      amount: doc.amount,
+      fromAccountType: doc.fromAccountType,
+      toAccountType: doc.toAccountType,
+      sourceType: doc.sourceType,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+  return true;
 }
 
 export async function listLiabilityEntries(
@@ -455,10 +507,12 @@ export async function listLiabilityEntries(
   const objectIds = [...accountIds]
     .filter((id) => Types.ObjectId.isValid(id))
     .map((id) => new Types.ObjectId(id));
-  const [banks, persons, expenses] = await Promise.all([
+  const [banks, persons, expenses, deposits, withdrawals] = await Promise.all([
     BankModel.find({ _id: { $in: objectIds } }).select("_id holderName bankName accountNumber").lean(),
     LiabilityPersonModel.find({ _id: { $in: objectIds } }).select("_id name").lean(),
     ExpenseModel.find({ _id: { $in: objectIds } }).select("_id description").lean(),
+    DepositModel.find({ _id: { $in: objectIds } }).select("_id utr").lean(),
+    WithdrawalModel.find({ _id: { $in: objectIds } }).select("_id utr payableAmount").lean(),
   ]);
   const bankMap = new Map(
     banks.map((b) => [
@@ -470,24 +524,35 @@ export async function listLiabilityEntries(
   const expenseMap = new Map(
     expenses.map((e) => [String(e._id), e.description?.trim() ? `Expense: ${e.description.trim()}` : `Expense ${String(e._id).slice(-6)}`]),
   );
+  const depositMap = new Map(
+    deposits.map((d) => [
+      String(d._id),
+      d.utr?.trim()
+        ? `Deposit UTR ${d.utr.trim()}`
+        : `Deposit ${String(d._id).slice(-8)}`,
+    ]),
+  );
+  const withdrawalMap = new Map(withdrawals.map((w) => [String(w._id), `Withdrawal ${String(w._id).slice(-8)}`]));
+
+  const resolveAcctName = (
+    t: LiabilityEntryDocument["fromAccountType"],
+    idStr: string,
+  ): string => {
+    if (t === "bank") return bankMap.get(idStr) ?? idStr;
+    if (t === "person") return personMap.get(idStr) ?? idStr;
+    if (t === "expense") return expenseMap.get(idStr) ?? idStr;
+    if (t === "deposit") return depositMap.get(idStr) ?? idStr;
+    if (t === "withdrawal") return withdrawalMap.get(idStr) ?? idStr;
+    return idStr;
+  };
 
   const mapped = rows.map((r) => {
     const fromId = String(r.fromAccountId);
     const toId = String(r.toAccountId);
     return {
       ...r,
-      fromAccountName:
-        r.fromAccountType === "bank"
-          ? bankMap.get(fromId) ?? fromId
-          : r.fromAccountType === "person"
-            ? personMap.get(fromId) ?? fromId
-            : expenseMap.get(fromId) ?? fromId,
-      toAccountName:
-        r.toAccountType === "bank"
-          ? bankMap.get(toId) ?? toId
-          : r.toAccountType === "person"
-            ? personMap.get(toId) ?? toId
-            : expenseMap.get(toId) ?? toId,
+      fromAccountName: resolveAcctName(r.fromAccountType as LiabilityEntryDocument["fromAccountType"], fromId),
+      toAccountName: resolveAcctName(r.toAccountType as LiabilityEntryDocument["toAccountType"], toId),
     };
   });
 
@@ -546,10 +611,12 @@ export async function getLiabilityPersonLedger(
   const objectIds = [...accountIds]
     .filter((id) => Types.ObjectId.isValid(id))
     .map((id) => new Types.ObjectId(id));
-  const [banks, persons, expenses] = await Promise.all([
+  const [banks, persons, expenses, depositsList, withdrawalsList] = await Promise.all([
     BankModel.find({ _id: { $in: objectIds } }).select("_id holderName bankName accountNumber").lean(),
     LiabilityPersonModel.find({ _id: { $in: objectIds } }).select("_id name").lean(),
     ExpenseModel.find({ _id: { $in: objectIds } }).select("_id description").lean(),
+    DepositModel.find({ _id: { $in: objectIds } }).select("_id utr").lean(),
+    WithdrawalModel.find({ _id: { $in: objectIds } }).select("_id utr").lean(),
   ]);
   const bankMap = new Map(
     banks.map((b) => [
@@ -561,6 +628,34 @@ export async function getLiabilityPersonLedger(
   const expenseMap = new Map(
     expenses.map((e) => [String(e._id), e.description?.trim() ? `Expense: ${e.description.trim()}` : `Expense ${String(e._id).slice(-6)}`]),
   );
+  const depositLblMap = new Map(
+    depositsList.map((d) => [
+      String(d._id),
+      d.utr?.trim()
+        ? `Deposit UTR ${d.utr.trim()}`
+        : `Deposit ${String(d._id).slice(-8)}`,
+    ]),
+  );
+  const withdrawalLblMap = new Map(
+    withdrawalsList.map((w) => [
+      String(w._id),
+      w.utr?.trim()
+        ? `Withdrawal UTR ${w.utr.trim()}`
+        : `Withdrawal ${String(w._id).slice(-8)}`,
+    ]),
+  );
+
+  const labelForLedger = (
+    t: LiabilityEntryDocument["fromAccountType"],
+    idStr: string,
+  ): string => {
+    if (t === "bank") return bankMap.get(idStr) ?? idStr;
+    if (t === "person") return personMap.get(idStr) ?? idStr;
+    if (t === "expense") return expenseMap.get(idStr) ?? idStr;
+    if (t === "deposit") return depositLblMap.get(idStr) ?? idStr;
+    if (t === "withdrawal") return withdrawalLblMap.get(idStr) ?? idStr;
+    return idStr;
+  };
 
   for (const e of entries) {
     const at = new Date(e.entryDate ?? e.createdAt ?? new Date(0));
@@ -582,18 +677,8 @@ export async function getLiabilityPersonLedger(
         _id: String(e._id),
         at: formatDateTimeForTimeZone(at, timeZone),
         entryType: e.entryType,
-        from:
-          e.fromAccountType === "bank"
-            ? bankMap.get(fromId) ?? fromId
-            : e.fromAccountType === "person"
-              ? personMap.get(fromId) ?? fromId
-              : expenseMap.get(fromId) ?? fromId,
-        to:
-          e.toAccountType === "bank"
-            ? bankMap.get(toId) ?? toId
-            : e.toAccountType === "person"
-              ? personMap.get(toId) ?? toId
-              : expenseMap.get(toId) ?? toId,
+        from: labelForLedger(e.fromAccountType as LiabilityEntryDocument["fromAccountType"], fromId),
+        to: labelForLedger(e.toAccountType as LiabilityEntryDocument["fromAccountType"], toId),
         debit,
         credit,
         runningBalance: running,
