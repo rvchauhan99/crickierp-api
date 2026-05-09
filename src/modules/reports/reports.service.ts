@@ -1247,12 +1247,14 @@ export async function getDashboardSummary(
       const expenses = asNumber(expenseInRangeMap.get(bankId));
       const transferOut = asNumber(transferOutInRangeMap.get(bankId));
       const transferIn = asNumber(transferInInRangeMap.get(bankId));
+      const depositCount = asNumber(depositCountMap.get(bankId));
+      const withdrawalCount = asNumber(withdrawalCountMap.get(bankId));
+      const expenseCount = asNumber(expenseCountMap.get(bankId));
+      const transferOutCount = asNumber(transferOutCountMap.get(bankId));
+      const transferInCount = asNumber(transferInCountMap.get(bankId));
+      // Total txns in period — sum of the five type counts above
       const entries =
-        asNumber(depositCountMap.get(bankId)) +
-        asNumber(withdrawalCountMap.get(bankId)) +
-        asNumber(expenseCountMap.get(bankId)) +
-        asNumber(transferOutCountMap.get(bankId)) +
-        asNumber(transferInCountMap.get(bankId));
+        depositCount + withdrawalCount + expenseCount + transferOutCount + transferInCount;
       const closingBalance = openingBalance + deposit + transferIn - withdrawal - expenses - transferOut;
 
       return {
@@ -1262,6 +1264,11 @@ export async function getDashboardSummary(
         bankName: String(bank.bankName ?? ""),
         openingBalance,
         entries,
+        depositCount,
+        withdrawalCount,
+        expenseCount,
+        transferOutCount,
+        transferInCount,
         deposit,
         withdrawal,
         expenses,
