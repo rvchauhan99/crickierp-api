@@ -3,12 +3,16 @@ import { Schema, model, Types } from "mongoose";
 /** requested = awaiting banker payout UTR; approved = banker completed; rejected; finalized = closed */
 export type WithdrawalStatus = "requested" | "approved" | "rejected" | "finalized";
 
+export type WithdrawalPayoutSettlementType = "bank" | "person";
+
 export interface WithdrawalAmendmentSnapshot {
   amount?: number;
   reverseBonus?: number;
   payableAmount?: number;
   payoutBankId?: string;
   payoutBankName?: string;
+  payoutLiabilityPersonId?: string;
+  payoutLiabilityPersonName?: string;
   utr?: string;
 }
 
@@ -36,6 +40,11 @@ export interface WithdrawalDocument {
   reverseBonus?: number;
   /** amount - reverseBonus (stored for audit) */
   payableAmount?: number;
+  /** Bank (default) vs liability person intermediary payout */
+  payoutSettlementType?: WithdrawalPayoutSettlementType;
+  payoutLiabilityPersonId?: Types.ObjectId;
+  payoutLiabilityPersonName?: string;
+  payoutLiabilityEntryId?: Types.ObjectId;
   /** Company bank used for payout (set by banker) */
   payoutBankId?: Types.ObjectId;
   payoutBankName?: string;
@@ -64,6 +73,8 @@ const withdrawalAmendmentSnapshotSchema = new Schema<WithdrawalAmendmentSnapshot
     payableAmount: { type: Number },
     payoutBankId: { type: String, trim: true },
     payoutBankName: { type: String, trim: true },
+    payoutLiabilityPersonId: { type: String, trim: true },
+    payoutLiabilityPersonName: { type: String, trim: true },
     utr: { type: String, trim: true },
   },
   { _id: false },
@@ -82,6 +93,10 @@ const withdrawalAmendmentEntrySchema = new Schema<WithdrawalAmendmentEntry>(
 
 const withdrawalSchema = new Schema<WithdrawalDocument>(
   {
+    payoutSettlementType: { type: String, enum: ["bank", "person"] },
+    payoutLiabilityPersonId: { type: Schema.Types.ObjectId, ref: "LiabilityPerson" },
+    payoutLiabilityPersonName: { type: String, trim: true, default: "" },
+    payoutLiabilityEntryId: { type: Schema.Types.ObjectId, ref: "LiabilityEntry" },
     player: { type: Schema.Types.ObjectId, ref: "Player" },
     playerName: { type: String, required: true, trim: true },
     accountNumber: { type: String, trim: true, default: "" },

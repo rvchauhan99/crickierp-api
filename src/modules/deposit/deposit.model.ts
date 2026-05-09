@@ -7,6 +7,8 @@ export type DepositStatus = "pending" | "not_settled" | "verified" | "rejected" 
 export interface DepositAmendmentSnapshot {
   bankId?: string;
   bankName?: string;
+  liabilityPersonId?: string;
+  liabilityPersonName?: string;
   utr?: string;
   amount?: number;
   playerId?: string;
@@ -22,11 +24,18 @@ export interface DepositAmendmentEntry {
   new: DepositAmendmentSnapshot;
 }
 
+/** Cash settlement anchor: bank (default) or liability person intermediary. */
+export type DepositSettlementAccountType = "bank" | "person";
+
 export interface DepositDocument {
   _id: Types.ObjectId;
+  settlementAccountType?: DepositSettlementAccountType;
   bankId?: Types.ObjectId;
   /** Denormalized display label (legacy rows may only have this). */
   bankName: string;
+  liabilityPersonId?: Types.ObjectId;
+  liabilityPersonName?: string;
+  liabilityEntryId?: Types.ObjectId;
   utr: string;
   amount: number;
   status: DepositStatus;
@@ -59,6 +68,8 @@ const amendmentSnapshotSchema = new Schema<DepositAmendmentSnapshot>(
   {
     bankId: { type: String, trim: true },
     bankName: { type: String, trim: true },
+    liabilityPersonId: { type: String, trim: true },
+    liabilityPersonName: { type: String, trim: true },
     utr: { type: String, trim: true },
     amount: { type: Number },
     playerId: { type: String, trim: true },
@@ -81,8 +92,12 @@ const amendmentEntrySchema = new Schema<DepositAmendmentEntry>(
 
 const depositSchema = new Schema<DepositDocument>(
   {
+    settlementAccountType: { type: String, enum: ["bank", "person"] },
     bankId: { type: Schema.Types.ObjectId, ref: "Bank" },
     bankName: { type: String, trim: true, default: "" },
+    liabilityPersonId: { type: Schema.Types.ObjectId, ref: "LiabilityPerson" },
+    liabilityPersonName: { type: String, trim: true, default: "" },
+    liabilityEntryId: { type: Schema.Types.ObjectId, ref: "LiabilityEntry" },
     utr: { type: String, required: true, trim: true },
     amount: { type: Number, required: true, min: 1 },
     status: {

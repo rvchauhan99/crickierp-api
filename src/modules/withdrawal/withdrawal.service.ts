@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { Types, type HydratedDocument } from "mongoose";
 import type { z } from "zod";
 import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { REASON_TYPES } from "../../shared/constants/reasonTypes";
@@ -13,13 +13,20 @@ import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/re
 import { AuditLogModel } from "../audit/audit.model";
 import {
   DEFAULT_TIMEZONE,
+  formatDateForTimeZone,
   formatDateTimeForTimeZone,
   ymdToUtcEnd,
   ymdToUtcStart,
 } from "../../shared/utils/timezone";
-import type { WithdrawalAmendmentSnapshot } from "./withdrawal.model";
+import type { WithdrawalAmendmentSnapshot, WithdrawalDocument } from "./withdrawal.model";
 import { WithdrawalModel, WithdrawalStatus } from "./withdrawal.model";
-import { amendWithdrawalBodySchema, listWithdrawalQuerySchema } from "./withdrawal.validation";
+import {
+  amendWithdrawalBodySchema,
+  listWithdrawalQuerySchema,
+  withdrawalBankerPayoutBodySchema,
+} from "./withdrawal.validation";
+import { LiabilityPersonModel } from "../liability/liability-person.model";
+import { createLiabilityEntry, deleteLiabilityEntryForReversal } from "../liability/liability.service";
 import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
 import { decodeTimeCursor, encodeTimeCursor } from "../../shared/utils/cursorPagination";
 import { enqueueExchangeRecompute } from "../../shared/queue/queue";
@@ -29,6 +36,7 @@ import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
+type BankerPayoutInput = z.infer<typeof withdrawalBankerPayoutBodySchema>;
 type DuplicateTransactionContext = {
   type: "deposit" | "withdrawal";
   id: string;
@@ -208,6 +216,7 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Re
       $or: [
         { utr: { $regex: esc, $options: "i" } },
         { bankName: { $regex: esc, $options: "i" } },
+        { payoutLiabilityPersonName: { $regex: esc, $options: "i" } },
         { playerName: { $regex: esc, $options: "i" } },
         { accountNumber: { $regex: esc, $options: "i" } },
       ],
@@ -284,6 +293,15 @@ function payableFromAmounts(amount: number, reverseBonus: number): number {
   const raw = amount - reverseBonus;
   return Math.max(0, Math.round(raw));
 }
+
+function entryAtMsEqual(a: Date | undefined, b: Date | undefined): boolean {
+  const ta = a ? a.getTime() : NaN;
+  const tb = b ? b.getTime() : NaN;
+  if (Number.isNaN(ta) && Number.isNaN(tb)) return true;
+  return ta === tb;
+}
+
+type HydratedWithdrawalDoc = HydratedDocument<WithdrawalDocument>;
 
 async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<Map<string, number>> {
   if (bankIds.length === 0) return new Map();
@@ -486,12 +504,7 @@ export async function updateWithdrawalByExchange(
   return doc;
 }
 
-export async function updateWithdrawalByBanker(
-  id: string,
-  input: { bankId: string; utr: string },
-  actorId: string,
-  requestId?: string,
-) {
+export async function updateWithdrawalByBanker(id: string, input: BankerPayoutInput, actorId: string, requestId?: string) {
   const startedAtMs = Date.now();
   const doc = await WithdrawalModel.findById(id);
   if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
@@ -504,22 +517,91 @@ export async function updateWithdrawalByBanker(
   }
   await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
 
-  const bank = await BankModel.findById(input.bankId);
-  if (!bank) throw new AppError("not_found", "Bank not found", 404);
-  if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+  const mode = input.payoutSettlementType ?? "bank";
 
   const prev = {
+    payoutSettlementType: doc.payoutSettlementType,
     payoutBankId: doc.payoutBankId?.toString(),
     payoutBankName: doc.payoutBankName,
+    payoutLiabilityPersonId: doc.payoutLiabilityPersonId?.toString(),
+    payoutLiabilityPersonName: doc.payoutLiabilityPersonName,
+    payoutLiabilityEntryId: doc.payoutLiabilityEntryId?.toString(),
     utr: doc.utr,
     status: doc.status,
   };
 
-  doc.payoutBankId = new Types.ObjectId(input.bankId);
-  doc.payoutBankName = bankDisplayName(bank);
-  doc.utr = utrTrim;
-  doc.status = "approved";
-  await doc.save();
+  if (mode === "bank") {
+    const bankIdStr = input.bankId as string;
+    const bank = await BankModel.findById(bankIdStr);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+    doc.payoutSettlementType = "bank";
+    doc.payoutBankId = new Types.ObjectId(bankIdStr);
+    doc.payoutBankName = bankDisplayName(bank);
+    doc.payoutLiabilityPersonId = undefined;
+    doc.payoutLiabilityPersonName = "";
+    doc.payoutLiabilityEntryId = undefined;
+    doc.utr = utrTrim;
+    doc.status = "approved";
+    await doc.save();
+  } else {
+    const personId = input.liabilityPersonId as string;
+    const person = await LiabilityPersonModel.findById(personId).lean();
+    if (!person) throw new AppError("not_found", "Liability person not found", 404);
+    if (!person.isActive) throw new AppError("business_rule_error", "Liability person is inactive", 400);
+
+    doc.payoutSettlementType = "person";
+    doc.payoutBankId = undefined;
+    doc.payoutBankName = "";
+    doc.payoutLiabilityPersonId = new Types.ObjectId(personId);
+    doc.payoutLiabilityPersonName = person.name.trim();
+    doc.payoutLiabilityEntryId = undefined;
+    doc.utr = utrTrim;
+    doc.status = "approved";
+    await doc.save();
+
+    const payable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
+    try {
+      const entryAt = doc.requestedAt ?? doc.createdAt ?? new Date();
+      const liabilityEntryYmd = formatDateForTimeZone(entryAt, DEFAULT_TIMEZONE) || entryAt.toISOString().slice(0, 10);
+      const referenceNo = `WDR-${String(doc._id).slice(-8).toUpperCase()}`;
+      const liabilityEntry = await createLiabilityEntry(
+        {
+          entryDate: liabilityEntryYmd,
+          entryType: "journal",
+          amount: payable,
+          fromAccountType: "withdrawal",
+          fromAccountId: String(doc._id),
+          toAccountType: "person",
+          toAccountId: String(doc.payoutLiabilityPersonId),
+          sourceType: "withdrawal",
+          sourceWithdrawalId: String(doc._id),
+          referenceNo,
+          remark: `Withdrawal payout UTR ${utrTrim}`,
+        },
+        actorId,
+        requestId,
+      );
+      doc.payoutLiabilityEntryId = liabilityEntry._id;
+      await doc.save();
+    } catch (err) {
+      doc.payoutSettlementType = prev.payoutSettlementType as typeof doc.payoutSettlementType;
+      doc.payoutBankId = prev.payoutBankId ? new Types.ObjectId(prev.payoutBankId) : undefined;
+      doc.payoutBankName = prev.payoutBankName ?? "";
+      doc.payoutLiabilityPersonId = prev.payoutLiabilityPersonId
+        ? new Types.ObjectId(prev.payoutLiabilityPersonId)
+        : undefined;
+      doc.payoutLiabilityPersonName = prev.payoutLiabilityPersonName ?? "";
+      doc.payoutLiabilityEntryId = prev.payoutLiabilityEntryId
+        ? new Types.ObjectId(prev.payoutLiabilityEntryId)
+        : undefined;
+      doc.utr = prev.utr;
+      doc.status = prev.status;
+      await doc.save();
+      throw err;
+    }
+  }
 
   const afterCoreCommitMs = Date.now();
   logger.info(
@@ -557,17 +639,32 @@ export async function updateWithdrawalByBanker(
       entity: "withdrawal",
       entityId: doc._id.toString(),
       oldValue: prev as unknown as Record<string, unknown>,
-      newValue: {
-        bankId: input.bankId,
-        utr: utrTrim,
-        status: "approved",
-      } as unknown as Record<string, unknown>,
+      newValue:
+        mode === "bank"
+          ? ({
+              payoutSettlementType: "bank",
+              bankId: input.bankId,
+              utr: utrTrim,
+              status: "approved",
+            } as Record<string, unknown>)
+          : ({
+              payoutSettlementType: "person",
+              liabilityPersonId: input.liabilityPersonId,
+              liabilityEntryId: doc.payoutLiabilityEntryId?.toString(),
+              utr: utrTrim,
+              status: "approved",
+            } as Record<string, unknown>),
       requestId,
     });
   });
   await runSideEffect("emit_withdrawal_exchange_queue_event", () => {
     emitApprovalQueueEvent("withdrawal", "exchange");
   });
+  if (mode === "person") {
+    await runSideEffect("invalidate_cache", async () => {
+      await invalidateCacheDomains(["withdrawal", "exchange", "player", "liability"]);
+    });
+  }
 
   logger.info(
     {
@@ -664,6 +761,7 @@ export async function listWithdrawals(
     WithdrawalModel.find(queryFilter)
       .populate("player", "playerId phone")
       .populate("payoutBankId", "holderName bankName accountNumber")
+      .populate("payoutLiabilityPersonId", "name isActive")
       .populate("createdBy", "fullName username")
       .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
@@ -812,6 +910,7 @@ export async function exportWithdrawalsToBuffer(
   const rows = await WithdrawalModel.find(filter)
     .populate("player", "playerId phone")
     .populate("payoutBankId", "holderName bankName accountNumber")
+    .populate("payoutLiabilityPersonId", "name")
     .populate("createdBy", "fullName username")
     .sort({ [query.sortBy]: sortValue })
     .limit(EXPORT_MAX_ROWS)
@@ -829,6 +928,14 @@ export async function exportWithdrawalsToBuffer(
     { header: "Payable Amount", transform: (r) => Math.round(Number(r.payableAmount ?? 0)) },
     { header: "Status", key: "status" },
     { header: "UTR", key: "utr" },
+    {
+      header: "Payout settlement",
+      transform: (r) => (String((r as { payoutSettlementType?: string }).payoutSettlementType ?? "bank") === "person" ? "Liability person" : "Bank"),
+    },
+    {
+      header: "Payout liable person",
+      transform: (r) => String((r as { payoutLiabilityPersonName?: string }).payoutLiabilityPersonName ?? "").trim(),
+    },
     { header: "Payout Bank", key: "payoutBankName" },
     { header: "Amendment Count", key: "amendmentCount" },
     {
@@ -846,6 +953,10 @@ export async function exportWithdrawalsToBuffer(
 export async function deleteWithdrawalWithReversal(id: string, actorId: string, requestId?: string) {
   const doc = await WithdrawalModel.findById(id);
   if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
+
+  if (doc.payoutLiabilityEntryId) {
+    await deleteLiabilityEntryForReversal(String(doc.payoutLiabilityEntryId), actorId, requestId);
+  }
 
   const oldValue = {
     playerId: doc.player?.toString(),
@@ -915,6 +1026,197 @@ export async function deleteWithdrawalWithReversal(id: string, actorId: string, 
   return { id: String(doc._id), deleted: true };
 }
 
+/**
+ * Person-settled approved withdrawal amendment: no company bank balance; optionally refresh
+ * liability when payable / UTR / requested time change.
+ */
+async function amendWithdrawalPersonSettlement(
+  doc: HydratedWithdrawalDoc,
+  input: AmendWithdrawalInput,
+  actorId: string,
+  requestId?: string,
+) {
+  if (!doc.payoutLiabilityPersonId) {
+    throw new AppError("business_rule_error", "Withdrawal has no liability person linked", 400);
+  }
+
+  const utrTrim = normalizeUtr(input.utr);
+  if (utrTrim !== normalizeUtr(doc.utr ?? "")) {
+    await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
+  }
+
+  const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
+  const newPayable = payableFromAmounts(input.amount, input.reverseBonus);
+  const nextRequestedAt = input.requestedAt
+    ? parseBusinessDateTime(input.requestedAt, "requestedAt")
+    : doc.requestedAt;
+
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.WITHDRAWAL_FINAL_AMEND);
+  const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
+
+  const lpIdStr = doc.payoutLiabilityPersonId.toString();
+  const lpName = String(doc.payoutLiabilityPersonName ?? "").trim();
+
+  const needsLiabilityRefresh =
+    newPayable !== oldPayable ||
+    utrTrim !== normalizeUtr(doc.utr ?? "") ||
+    !entryAtMsEqual(nextRequestedAt, doc.requestedAt);
+
+  const oldRequestedAt = doc.requestedAt ? new Date(doc.requestedAt.getTime()) : undefined;
+
+  const oldSnapshot: WithdrawalAmendmentSnapshot = {
+    amount: doc.amount,
+    reverseBonus: doc.reverseBonus,
+    payableAmount: doc.payableAmount ?? oldPayable,
+    payoutLiabilityPersonId: lpIdStr,
+    payoutLiabilityPersonName: lpName || undefined,
+    utr: doc.utr,
+  };
+
+  const newSnapshot: WithdrawalAmendmentSnapshot = {
+    amount: input.amount,
+    reverseBonus: input.reverseBonus,
+    payableAmount: newPayable,
+    payoutLiabilityPersonId: lpIdStr,
+    payoutLiabilityPersonName: lpName || undefined,
+    utr: utrTrim,
+  };
+
+  const prevUtr = doc.utr;
+  const prevAmount = doc.amount;
+  const prevReverseBonus = doc.reverseBonus;
+  const prevPayableStored = doc.payableAmount;
+  const prevRequestedAt = doc.requestedAt ? new Date(doc.requestedAt.getTime()) : undefined;
+  const prevLiabilityEntryId = doc.payoutLiabilityEntryId;
+  const prevAmendCount = doc.amendmentCount ?? 0;
+  const prevHistory = [...(doc.amendmentHistory ?? [])];
+  const prevLastAmendedAt = doc.lastAmendedAt;
+  const prevLastAmendedBy = doc.lastAmendedBy;
+
+  if (needsLiabilityRefresh && doc.payoutLiabilityEntryId) {
+    await deleteLiabilityEntryForReversal(String(doc.payoutLiabilityEntryId), actorId, requestId);
+    doc.payoutLiabilityEntryId = undefined;
+  }
+
+  doc.amount = input.amount;
+  doc.reverseBonus = input.reverseBonus;
+  doc.payableAmount = newPayable;
+  doc.utr = utrTrim;
+  doc.requestedAt = nextRequestedAt;
+  doc.amendmentCount = prevAmendCount + 1;
+  doc.lastAmendedAt = new Date();
+  doc.lastAmendedBy = new Types.ObjectId(actorId);
+  const history = doc.amendmentHistory ?? [];
+  history.push({
+    at: new Date(),
+    by: new Types.ObjectId(actorId),
+    reason: amendReasonText,
+    old: oldSnapshot,
+    new: newSnapshot,
+  });
+  doc.amendmentHistory = history;
+
+  await doc.save();
+
+  if (needsLiabilityRefresh) {
+    try {
+      const entryAt = doc.requestedAt ?? doc.createdAt ?? new Date();
+      const liabilityEntryYmd =
+        formatDateForTimeZone(entryAt, DEFAULT_TIMEZONE) || entryAt.toISOString().slice(0, 10);
+      const referenceNo = `WDR-${String(doc._id).slice(-8).toUpperCase()}`;
+      const liabilityEntry = await createLiabilityEntry(
+        {
+          entryDate: liabilityEntryYmd,
+          entryType: "journal",
+          amount: newPayable,
+          fromAccountType: "withdrawal",
+          fromAccountId: String(doc._id),
+          toAccountType: "person",
+          toAccountId: String(doc.payoutLiabilityPersonId),
+          sourceType: "withdrawal",
+          sourceWithdrawalId: String(doc._id),
+          referenceNo,
+          remark: `Withdrawal payout UTR ${utrTrim}`,
+        },
+        actorId,
+        requestId,
+      );
+      doc.payoutLiabilityEntryId = liabilityEntry._id;
+      await doc.save();
+    } catch (err) {
+      doc.utr = prevUtr;
+      doc.amount = prevAmount;
+      doc.reverseBonus = prevReverseBonus;
+      doc.payableAmount = prevPayableStored;
+      doc.requestedAt = prevRequestedAt;
+      doc.amendmentCount = prevAmendCount;
+      doc.amendmentHistory = prevHistory;
+      doc.payoutLiabilityEntryId = prevLiabilityEntryId;
+      doc.lastAmendedAt = prevLastAmendedAt;
+      doc.lastAmendedBy = prevLastAmendedBy;
+      await doc.save();
+
+      if (prevLiabilityEntryId) {
+        const entryAtRb = prevRequestedAt ?? doc.createdAt ?? new Date();
+        const liabilityEntryYmd =
+          formatDateForTimeZone(entryAtRb, DEFAULT_TIMEZONE) || entryAtRb.toISOString().slice(0, 10);
+        const referenceNoRb = `WDR-${String(doc._id).slice(-8).toUpperCase()}-RB`;
+        const restored = await createLiabilityEntry(
+          {
+            entryDate: liabilityEntryYmd,
+            entryType: "journal",
+            amount: oldPayable,
+            fromAccountType: "withdrawal",
+            fromAccountId: String(doc._id),
+            toAccountType: "person",
+            toAccountId: String(doc.payoutLiabilityPersonId),
+            sourceType: "withdrawal",
+            sourceWithdrawalId: String(doc._id),
+            referenceNo: referenceNoRb,
+            remark: `Withdrawal payout UTR ${String(prevUtr ?? "").trim()} (rollback)`,
+          },
+          actorId,
+          requestId,
+        );
+        doc.payoutLiabilityEntryId = restored._id;
+        await doc.save();
+      }
+      throw err;
+    }
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "withdrawal.amend",
+    entity: "withdrawal",
+    entityId: doc._id.toString(),
+    oldValue: { ...oldSnapshot, requestedAt: oldRequestedAt, payoutSettlementType: "person" } as unknown as Record<
+      string,
+      unknown
+    >,
+    newValue: {
+      ...newSnapshot,
+      requestedAt: nextRequestedAt,
+      reason: amendReasonText,
+      reasonId: resolved.id,
+      remark: input.remark?.trim() || undefined,
+      payoutSettlementType: "person",
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
+  if (doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      await enqueueExchangeRecompute(String(player.exchange));
+      await invalidateCacheDomains(["withdrawal", "exchange", "player", "liability"]);
+      return doc;
+    }
+  }
+  await invalidateCacheDomains(["withdrawal", "liability"]);
+  return doc;
+}
+
 export async function amendWithdrawal(
   id: string,
   input: AmendWithdrawalInput,
@@ -925,6 +1227,13 @@ export async function amendWithdrawal(
   if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
   if (doc.status !== "approved") {
     throw new AppError("business_rule_error", "Only approved withdrawals can be amended", 400);
+  }
+  if (doc.payoutSettlementType === "person") {
+    return amendWithdrawalPersonSettlement(doc as HydratedWithdrawalDoc, input, actorId, requestId);
+  }
+
+  if (!input.payoutBankId) {
+    throw new AppError("validation_error", "Payout bank is required for bank-settled withdrawal amendments.", 400);
   }
   if (!doc.payoutBankId) {
     throw new AppError("business_rule_error", "Withdrawal has no payout bank linked", 400);

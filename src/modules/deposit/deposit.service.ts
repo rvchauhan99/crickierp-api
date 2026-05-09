@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { Types, type HydratedDocument } from "mongoose";
 import type { z } from "zod";
 import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { AppError } from "../../shared/errors/AppError";
@@ -9,13 +9,14 @@ import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import {
   DEFAULT_TIMEZONE,
+  formatDateForTimeZone,
   formatDateTimeForTimeZone,
   ymdToUtcEnd,
   ymdToUtcStart,
 } from "../../shared/utils/timezone";
-import type { DepositAmendmentSnapshot } from "./deposit.model";
+import type { DepositAmendmentSnapshot, DepositDocument } from "./deposit.model";
 import { DepositModel, DepositStatus } from "./deposit.model";
-import { amendDepositBodySchema, listDepositQuerySchema } from "./deposit.validation";
+import { amendDepositBodySchema, createDepositBodySchema, listDepositQuerySchema } from "./deposit.validation";
 import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
 import {
   cancelReferralAccrualForDeposit,
@@ -28,9 +29,12 @@ import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 import { logger } from "../../shared/logger";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/utr";
+import { createLiabilityEntry, deleteLiabilityEntryForReversal } from "../liability/liability.service";
+import { LiabilityPersonModel } from "../liability/liability-person.model";
 
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
 type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
+type BankerDepositCreateInput = z.infer<typeof createDepositBodySchema>;
 type DuplicateTransactionContext = {
   type: "deposit" | "withdrawal";
   id: string;
@@ -181,6 +185,7 @@ function buildDepositListFilter(q: ListDepositQuery, timeZone: string): Record<s
       $or: [
         { utr: { $regex: esc, $options: "i" } },
         { bankName: { $regex: esc, $options: "i" } },
+        { liabilityPersonName: { $regex: esc, $options: "i" } },
       ],
     });
   }
@@ -338,25 +343,61 @@ async function ensureGlobalUtrUniqueForDeposit(utr: string, excludeDepositId?: T
   }
 }
 
-export async function createDeposit(
-  input: { bankId: string; utr: string; amount: number; entryAt?: string },
-  actorId: string,
-  requestId?: string,
-) {
+export async function createDeposit(input: BankerDepositCreateInput, actorId: string, requestId?: string) {
   await ensureGlobalUtrUniqueForDeposit(input.utr);
+  const mode = input.settlementAccountType ?? "bank";
 
-  const bank = await BankModel.findById(input.bankId);
-  if (!bank) throw new AppError("not_found", "Bank not found", 404);
-  if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
-
-  const doc = await DepositModel.create({
-    bankId: new Types.ObjectId(input.bankId),
-    bankName: bankDisplayName(bank),
+  const base = {
     utr: normalizeUtr(input.utr),
     amount: input.amount,
-    status: "pending",
+    status: "pending" as const,
     entryAt: parseBusinessDateTime(input.entryAt, "entryAt"),
     createdBy: new Types.ObjectId(actorId),
+    settlementAccountType: mode as "bank" | "person",
+  };
+
+  if (mode === "bank") {
+    const bankIdStr = input.bankId as string;
+    const bank = await BankModel.findById(bankIdStr);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+    const doc = await DepositModel.create({
+      ...base,
+      bankId: new Types.ObjectId(bankIdStr),
+      bankName: bankDisplayName(bank),
+      bankImpact: true,
+    });
+
+    await createAuditLog({
+      actorId,
+      action: "deposit.create",
+      entity: "deposit",
+      entityId: doc._id.toString(),
+      newValue: {
+        settlementAccountType: "bank",
+        bankId: bankIdStr,
+        utr: base.utr,
+        amount: input.amount,
+        entryAt: doc.entryAt,
+      } as unknown as Record<string, unknown>,
+      requestId,
+    });
+    emitApprovalQueueEvent("deposit", "exchange");
+    return doc;
+  }
+
+  const personId = input.liabilityPersonId as string;
+  const person = await LiabilityPersonModel.findById(personId).lean();
+  if (!person) throw new AppError("not_found", "Liability person not found", 404);
+  if (!person.isActive) throw new AppError("business_rule_error", "Liability person is inactive", 400);
+
+  const doc = await DepositModel.create({
+    ...base,
+    liabilityPersonId: new Types.ObjectId(personId),
+    liabilityPersonName: person.name.trim(),
+    bankImpact: false,
+    bankName: "",
   });
 
   await createAuditLog({
@@ -365,8 +406,10 @@ export async function createDeposit(
     entity: "deposit",
     entityId: doc._id.toString(),
     newValue: {
-      bankId: input.bankId,
-      utr: normalizeUtr(input.utr),
+      settlementAccountType: "person",
+      liabilityPersonId: personId,
+      liabilityPersonName: doc.liabilityPersonName,
+      utr: base.utr,
       amount: input.amount,
       entryAt: doc.entryAt,
     } as unknown as Record<string, unknown>,
@@ -376,12 +419,7 @@ export async function createDeposit(
   return doc;
 }
 
-export async function updateDepositByBanker(
-  id: string,
-  input: { bankId: string; utr: string; amount: number },
-  actorId: string,
-  requestId?: string,
-) {
+export async function updateDepositByBanker(id: string, input: BankerDepositCreateInput, actorId: string, requestId?: string) {
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
   if (doc.status !== "pending") {
@@ -393,19 +431,44 @@ export async function updateDepositByBanker(
     await ensureGlobalUtrUniqueForDeposit(utrTrim, doc._id);
   }
 
-  const bank = await BankModel.findById(input.bankId);
-  if (!bank) throw new AppError("not_found", "Bank not found", 404);
-  if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
-
+  const mode = input.settlementAccountType ?? "bank";
   const prev = {
+    settlementAccountType: doc.settlementAccountType,
     bankId: doc.bankId?.toString(),
     bankName: doc.bankName,
+    liabilityPersonId: doc.liabilityPersonId?.toString(),
+    liabilityPersonName: doc.liabilityPersonName,
     utr: doc.utr,
     amount: doc.amount,
+    bankImpact: doc.bankImpact,
   };
 
-  doc.bankId = new Types.ObjectId(input.bankId);
-  doc.bankName = bankDisplayName(bank);
+  if (mode === "bank") {
+    const bankIdStr = input.bankId as string;
+    const bank = await BankModel.findById(bankIdStr);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+    if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
+
+    doc.settlementAccountType = "bank";
+    doc.bankId = new Types.ObjectId(bankIdStr);
+    doc.bankName = bankDisplayName(bank);
+    doc.liabilityPersonId = undefined;
+    doc.liabilityPersonName = "";
+    doc.bankImpact = true;
+  } else {
+    const personId = input.liabilityPersonId as string;
+    const person = await LiabilityPersonModel.findById(personId).lean();
+    if (!person) throw new AppError("not_found", "Liability person not found", 404);
+    if (!person.isActive) throw new AppError("business_rule_error", "Liability person is inactive", 400);
+
+    doc.settlementAccountType = "person";
+    doc.bankId = undefined;
+    doc.bankName = "";
+    doc.liabilityPersonId = new Types.ObjectId(personId);
+    doc.liabilityPersonName = person.name.trim();
+    doc.bankImpact = false;
+  }
+
   doc.utr = utrTrim;
   doc.amount = input.amount;
   await doc.save();
@@ -417,7 +480,9 @@ export async function updateDepositByBanker(
     entityId: doc._id.toString(),
     oldValue: prev as unknown as Record<string, unknown>,
     newValue: {
-      bankId: input.bankId,
+      settlementAccountType: mode,
+      bankId: mode === "bank" ? input.bankId : undefined,
+      liabilityPersonId: mode === "person" ? input.liabilityPersonId : undefined,
       utr: utrTrim,
       amount: input.amount,
     } as unknown as Record<string, unknown>,
@@ -435,7 +500,11 @@ async function lastBankerDepositForActor(
   actorId: string | undefined,
 ): Promise<LastBankerDepositMeta> {
   if (view !== "banker" || !actorId || !Types.ObjectId.isValid(actorId)) return null;
-  const row = await DepositModel.findOne({ createdBy: new Types.ObjectId(actorId) })
+  const row = await DepositModel.findOne({
+    createdBy: new Types.ObjectId(actorId),
+    bankId: { $exists: true, $ne: null },
+    $or: [{ settlementAccountType: { $exists: false } }, { settlementAccountType: "bank" }],
+  })
     .sort({ createdAt: -1 })
     .select({ bankId: 1, bankName: 1 })
     .lean();
@@ -479,6 +548,7 @@ export async function listDeposits(
   const [rows, total, lastBankerDeposit] = await Promise.all([
     DepositModel.find(queryFilter)
       .populate("bankId", "holderName bankName accountNumber ifsc openingBalance currentBalance")
+      .populate("liabilityPersonId", "name isActive")
       .populate("player", "playerId phone exchange")
       .populate("createdBy", "fullName username")
       .populate("exchangeActionBy", "fullName username")
@@ -543,6 +613,7 @@ export async function exportDepositsToBuffer(
 
   const rows = await DepositModel.find(filter)
     .populate("bankId", "holderName bankName accountNumber")
+    .populate("liabilityPersonId", "name")
     .populate("player", "playerId")
     .sort({ [query.sortBy]: sortValue })
     .limit(EXPORT_MAX_ROWS)
@@ -550,6 +621,14 @@ export async function exportDepositsToBuffer(
 
   return generateExcelBuffer(rows, [
     { header: "UTR", key: "utr" },
+    {
+      header: "Settlement",
+      transform: (r) => (String((r as { settlementAccountType?: string }).settlementAccountType ?? "bank") === "person" ? "Liability person" : "Bank"),
+    },
+    {
+      header: "Liability person",
+      transform: (r) => String((r as { liabilityPersonName?: string }).liabilityPersonName ?? "").trim(),
+    },
     { header: "Bank label", key: "bankName" },
     { header: "Amount", transform: (r) => Math.round(Number(r.amount ?? 0)) },
     { header: "Status", key: "status" },
@@ -608,6 +687,10 @@ export async function deleteDepositWithReversal(id: string, actorId: string, req
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
   await ensureDepositReferralAccrualMutable(doc._id);
+
+  if (doc.liabilityEntryId) {
+    await deleteLiabilityEntryForReversal(String(doc.liabilityEntryId), actorId, requestId);
+  }
 
   const oldValue = {
     bankId: doc.bankId?.toString(),
@@ -726,8 +809,13 @@ export async function exchangeApproveDeposit(
   if (doc.status !== "pending" && doc.status !== "not_settled") {
     throw new AppError("business_rule_error", "Deposit is not pending/not-settled exchange action", 400);
   }
-  if (!doc.bankId) {
+
+  const isPersonSettlement = doc.settlementAccountType === "person";
+  if (!isPersonSettlement && !doc.bankId) {
     throw new AppError("business_rule_error", "Deposit has no bank linked", 400);
+  }
+  if (isPersonSettlement && !doc.liabilityPersonId) {
+    throw new AppError("business_rule_error", "Deposit has no liability person linked", 400);
   }
 
   const playerDoc = await PlayerModel.findById(input.playerId).select(
@@ -747,29 +835,90 @@ export async function exchangeApproveDeposit(
   const bonus = requestedBonusRounded;
   const totalAmount = Math.round(Number(doc.amount) + bonus);
   const bankCashCredit = doc.amount;
-  const bank = await BankModel.findById(doc.bankId);
-  if (!bank) throw new AppError("not_found", "Bank not found", 404);
 
-  const prev = bank.currentBalance ?? bank.openingBalance;
-  const bankBalanceAfter = prev + bankCashCredit;
+  const previousStatus = doc.status;
+  const previousPlayer = doc.player;
+  const previousBonus = doc.bonusAmount;
+  const previousTotal = doc.totalAmount;
+  const previousExchangeBy = doc.exchangeActionBy;
+  const previousExchangeAt = doc.exchangeActionAt;
+  const previousSettledAt = doc.settledAt;
+  const previousBankBalAfter = doc.bankBalanceAfter;
+  const previousLiabilityEntryId = doc.liabilityEntryId;
 
-  bank.currentBalance = bankBalanceAfter;
-  await bank.save();
+  if (!isPersonSettlement) {
+    const bank = await BankModel.findById(doc.bankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
 
-  try {
+    const prev = bank.currentBalance ?? bank.openingBalance;
+    const bankBalanceAfter = prev + bankCashCredit;
+
+    bank.currentBalance = bankBalanceAfter;
+    await bank.save();
+
+    try {
+      doc.status = "verified" as DepositStatus;
+      doc.player = playerObjectId;
+      doc.bonusAmount = bonus;
+      doc.totalAmount = totalAmount;
+      doc.exchangeActionBy = new Types.ObjectId(actorId);
+      doc.exchangeActionAt = new Date();
+      doc.bankBalanceAfter = bankBalanceAfter;
+      doc.settledAt = new Date();
+      await doc.save();
+    } catch (err) {
+      bank.currentBalance = prev;
+      await bank.save();
+      throw err;
+    }
+  } else {
     doc.status = "verified" as DepositStatus;
     doc.player = playerObjectId;
     doc.bonusAmount = bonus;
     doc.totalAmount = totalAmount;
     doc.exchangeActionBy = new Types.ObjectId(actorId);
     doc.exchangeActionAt = new Date();
-    doc.bankBalanceAfter = bankBalanceAfter;
+    doc.bankBalanceAfter = undefined;
+    doc.bankImpact = false;
     doc.settledAt = new Date();
     await doc.save();
-  } catch (err) {
-    bank.currentBalance = prev;
-    await bank.save();
-    throw err;
+
+    try {
+      const entryAt = doc.entryAt ?? doc.createdAt ?? new Date();
+      const liabilityEntryYmd = formatDateForTimeZone(entryAt, DEFAULT_TIMEZONE) || entryAt.toISOString().slice(0, 10);
+      const referenceNo = `DEP-${String(doc._id).slice(-8).toUpperCase()}`;
+      const liabilityEntry = await createLiabilityEntry(
+        {
+          entryDate: liabilityEntryYmd,
+          entryType: "journal",
+          amount: doc.amount,
+          fromAccountType: "person",
+          fromAccountId: String(doc.liabilityPersonId),
+          toAccountType: "deposit",
+          toAccountId: String(doc._id),
+          sourceType: "deposit",
+          sourceDepositId: String(doc._id),
+          referenceNo,
+          remark: `Deposit settlement UTR ${String(doc.utr ?? "").trim()}`,
+        },
+        actorId,
+        requestId,
+      );
+      doc.liabilityEntryId = liabilityEntry._id;
+      await doc.save();
+    } catch (err) {
+      doc.status = previousStatus;
+      doc.player = previousPlayer;
+      doc.bonusAmount = previousBonus;
+      doc.totalAmount = previousTotal;
+      doc.exchangeActionBy = previousExchangeBy;
+      doc.exchangeActionAt = previousExchangeAt;
+      doc.settledAt = previousSettledAt;
+      doc.bankBalanceAfter = previousBankBalAfter;
+      doc.liabilityEntryId = previousLiabilityEntryId;
+      await doc.save();
+      throw err;
+    }
   }
 
   const afterCoreCommitMs = Date.now();
@@ -818,7 +967,10 @@ export async function exchangeApproveDeposit(
         appliedBonusType: isFirstDeposit ? "first_deposit" : "regular",
         totalAmount,
         bankCashCredit,
-        bankBalanceAfter,
+        settlementAccountType: isPersonSettlement ? "person" : "bank",
+        bankBalanceAfter: isPersonSettlement ? undefined : doc.bankBalanceAfter,
+        liabilityPersonId: isPersonSettlement ? doc.liabilityPersonId?.toString() : undefined,
+        liabilityEntryId: isPersonSettlement ? doc.liabilityEntryId?.toString() : undefined,
       },
       requestId,
     });
@@ -827,7 +979,11 @@ export async function exchangeApproveDeposit(
     await enqueueExchangeRecompute(String(playerDoc.exchange));
   });
   await runSideEffect("invalidate_cache_domains", async () => {
-    await invalidateCacheDomains(["deposit", "exchange", "referral", "player"]);
+    await invalidateCacheDomains(
+      isPersonSettlement
+        ? ["deposit", "exchange", "referral", "player", "liability"]
+        : ["deposit", "exchange", "referral", "player"],
+    );
   });
   await runSideEffect("sync_referral_accrual", async () => {
     await syncReferralAccrualForDeposit(doc._id);
@@ -915,6 +1071,223 @@ export async function exchangeRejectDeposit(
   return doc;
 }
 
+function entryAtMsEqual(a: Date | undefined, b: Date | undefined): boolean {
+  const ta = a ? a.getTime() : NaN;
+  const tb = b ? b.getTime() : NaN;
+  if (Number.isNaN(ta) && Number.isNaN(tb)) return true;
+  return ta === tb;
+}
+
+/**
+ * Person-settled verified amendment: no bank balance; optionally refresh liability ledger when
+ * cash leg (amount / entry / UTR) changes.
+ */
+type HydratedDepositDoc = HydratedDocument<DepositDocument>;
+
+async function amendVerifiedDepositPersonSettlement(
+  doc: HydratedDepositDoc,
+  input: AmendDepositInput,
+  actorId: string,
+  requestId?: string,
+) {
+  if (!doc.liabilityPersonId) {
+    throw new AppError("business_rule_error", "Deposit has no liability person linked", 400);
+  }
+  if (!doc.player) {
+    throw new AppError("business_rule_error", "Deposit is missing player", 400);
+  }
+
+  const utrTrim = normalizeUtr(input.utr);
+  if (utrTrim !== normalizeUtr(doc.utr)) {
+    await ensureGlobalUtrUniqueForDeposit(utrTrim, doc._id);
+  }
+
+  const newPlayerDoc = await PlayerModel.findById(input.playerId).select("exchange");
+  if (!newPlayerDoc) throw new AppError("not_found", "Player not found", 404);
+  if (!newPlayerDoc.exchange) {
+    throw new AppError("business_rule_error", "Player has no exchange assigned", 400);
+  }
+
+  const bonus = Math.round(Number(input.bonusAmount));
+  const totalAmount = Math.round(Number(input.amount) + bonus);
+  const nextEntryAt = input.entryAt ? parseBusinessDateTime(input.entryAt, "entryAt") : doc.entryAt;
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.DEPOSIT_FINAL_AMEND);
+  const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
+
+  const lpIdStr = doc.liabilityPersonId.toString();
+  const lpName = String(doc.liabilityPersonName ?? "").trim();
+
+  const needsLiabilityRefresh =
+    Number(input.amount) !== Number(doc.amount) ||
+    utrTrim !== normalizeUtr(doc.utr) ||
+    !entryAtMsEqual(nextEntryAt, doc.entryAt);
+
+  const oldSnapshot: DepositAmendmentSnapshot = {
+    bankId: doc.bankId?.toString(),
+    bankName: doc.bankName,
+    liabilityPersonId: lpIdStr,
+    liabilityPersonName: lpName || undefined,
+    utr: doc.utr,
+    amount: doc.amount,
+    playerId: doc.player?.toString(),
+    bonusAmount: doc.bonusAmount,
+    totalAmount: doc.totalAmount,
+  };
+
+  const newSnapshotPlain: DepositAmendmentSnapshot = {
+    liabilityPersonId: lpIdStr,
+    liabilityPersonName: lpName || undefined,
+    utr: utrTrim,
+    amount: input.amount,
+    playerId: input.playerId,
+    bonusAmount: bonus,
+    totalAmount,
+  };
+
+  const prevUtr = doc.utr;
+  const prevAmount = doc.amount;
+  const prevEntryAt = doc.entryAt ? new Date(doc.entryAt.getTime()) : undefined;
+  const prevBonus = doc.bonusAmount;
+  const prevTotal = doc.totalAmount;
+  const prevPlayer = doc.player;
+  const prevLiabilityEntryId = doc.liabilityEntryId;
+  const prevAmendCount = doc.amendmentCount ?? 0;
+  const prevHistory = [...(doc.amendmentHistory ?? [])];
+  const prevLastAmendedAt = doc.lastAmendedAt;
+  const prevLastAmendedBy = doc.lastAmendedBy;
+
+  const oldPlayerId = doc.player;
+
+  if (needsLiabilityRefresh && doc.liabilityEntryId) {
+    await deleteLiabilityEntryForReversal(String(doc.liabilityEntryId), actorId, requestId);
+    doc.liabilityEntryId = undefined;
+  }
+
+  doc.utr = utrTrim;
+  doc.amount = input.amount;
+  doc.player = new Types.ObjectId(input.playerId);
+  doc.bonusAmount = bonus;
+  doc.totalAmount = totalAmount;
+  doc.entryAt = nextEntryAt;
+  doc.bankBalanceAfter = undefined;
+  doc.bankImpact = false;
+  doc.amendmentCount = prevAmendCount + 1;
+  doc.lastAmendedAt = new Date();
+  doc.lastAmendedBy = new Types.ObjectId(actorId);
+  const history = doc.amendmentHistory ?? [];
+  history.push({
+    at: new Date(),
+    by: new Types.ObjectId(actorId),
+    reason: amendReasonText,
+    old: oldSnapshot,
+    new: newSnapshotPlain,
+  });
+  doc.amendmentHistory = history;
+
+  await doc.save();
+
+  if (needsLiabilityRefresh) {
+    try {
+      const entryAt = doc.entryAt ?? doc.createdAt ?? new Date();
+      const liabilityEntryYmd =
+        formatDateForTimeZone(entryAt, DEFAULT_TIMEZONE) || entryAt.toISOString().slice(0, 10);
+      const referenceNo = `DEP-${String(doc._id).slice(-8).toUpperCase()}`;
+      const liabilityEntry = await createLiabilityEntry(
+        {
+          entryDate: liabilityEntryYmd,
+          entryType: "journal",
+          amount: doc.amount,
+          fromAccountType: "person",
+          fromAccountId: String(doc.liabilityPersonId),
+          toAccountType: "deposit",
+          toAccountId: String(doc._id),
+          sourceType: "deposit",
+          sourceDepositId: String(doc._id),
+          referenceNo,
+          remark: `Deposit settlement UTR ${String(doc.utr ?? "").trim()}`,
+        },
+        actorId,
+        requestId,
+      );
+      doc.liabilityEntryId = liabilityEntry._id;
+      await doc.save();
+    } catch (err) {
+      doc.utr = prevUtr;
+      doc.amount = prevAmount;
+      doc.entryAt = prevEntryAt;
+      doc.player = prevPlayer;
+      doc.bonusAmount = prevBonus;
+      doc.totalAmount = prevTotal;
+      doc.amendmentCount = prevAmendCount;
+      doc.amendmentHistory = prevHistory;
+      doc.liabilityEntryId = prevLiabilityEntryId;
+
+      doc.lastAmendedAt = prevLastAmendedAt;
+      doc.lastAmendedBy = prevLastAmendedBy;
+      await doc.save();
+
+      if (needsLiabilityRefresh && prevLiabilityEntryId) {
+        const entryAtRb = prevEntryAt ?? doc.createdAt ?? new Date();
+        const liabilityEntryYmd =
+          formatDateForTimeZone(entryAtRb, DEFAULT_TIMEZONE) || entryAtRb.toISOString().slice(0, 10);
+        const referenceNoRb = `DEP-${String(doc._id).slice(-8).toUpperCase()}-RB`;
+        const restored = await createLiabilityEntry(
+          {
+            entryDate: liabilityEntryYmd,
+            entryType: "journal",
+            amount: prevAmount,
+            fromAccountType: "person",
+            fromAccountId: String(doc.liabilityPersonId),
+            toAccountType: "deposit",
+            toAccountId: String(doc._id),
+            sourceType: "deposit",
+            sourceDepositId: String(doc._id),
+            referenceNo: referenceNoRb,
+            remark: `Deposit settlement UTR ${String(prevUtr ?? "").trim()} (rollback)`,
+          },
+          actorId,
+          requestId,
+        );
+        doc.liabilityEntryId = restored._id;
+        await doc.save();
+      }
+      throw err;
+    }
+  }
+
+  const oldPlayer = await PlayerModel.findById(oldPlayerId).select("exchange");
+  const exchanges = new Set<string>();
+  if (oldPlayer?.exchange) exchanges.add(String(oldPlayer.exchange));
+  if (newPlayerDoc.exchange) exchanges.add(String(newPlayerDoc.exchange));
+  for (const ex of exchanges) {
+    await enqueueExchangeRecompute(ex);
+  }
+  await invalidateCacheDomains(["deposit", "exchange", "referral", "player", "liability"]);
+  await syncReferralAccrualForDeposit(doc._id);
+
+  await createAuditLog({
+    actorId,
+    action: "deposit.amend",
+    entity: "deposit",
+    entityId: doc._id.toString(),
+    oldValue: { ...oldSnapshot, entryAt: prevEntryAt, settlementAccountType: "person" } as unknown as Record<
+      string,
+      unknown
+    >,
+    newValue: {
+      ...newSnapshotPlain,
+      entryAt: nextEntryAt,
+      reason: amendReasonText,
+      reasonId: resolved.id,
+      remark: input.remark?.trim() || undefined,
+      settlementAccountType: "person",
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
+  return doc;
+}
+
 /**
  * In-place amendment for settled (`verified`) deposits. Updates bank cash balance delta,
  * exchange recomputation for affected players, and appends `amendmentHistory`.
@@ -931,7 +1304,20 @@ export async function amendVerifiedDeposit(
   if (doc.status !== "verified") {
     throw new AppError("business_rule_error", "Only verified deposits can be amended", 400);
   }
-  if (!doc.bankId || !doc.player) {
+
+  const isPersonSettlement = doc.settlementAccountType === "person";
+
+  if (isPersonSettlement) {
+    return amendVerifiedDepositPersonSettlement(doc as HydratedDepositDoc, input, actorId, requestId);
+  }
+
+  if (!input.bankId) {
+    throw new AppError("validation_error", "Bank is required for bank-settled deposit amendments.", 400);
+  }
+  if (!doc.bankId) {
+    throw new AppError("business_rule_error", "Deposit has no bank linked", 400);
+  }
+  if (!doc.player) {
     throw new AppError("business_rule_error", "Deposit is missing bank or player", 400);
   }
 

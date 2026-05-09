@@ -9,12 +9,34 @@ const optionalDateTime = z.preprocess(
   z.string().datetime({ offset: true }).optional(),
 );
 
-export const createDepositBodySchema = z.object({
-  bankId: z.string().length(24),
+const depositCoreFieldsSchema = z.object({
   utr: z.string().min(4).max(120).trim(),
   amount: z.number().int().min(1),
   entryAt: optionalDateTime,
 });
+
+export const createDepositBodySchema = depositCoreFieldsSchema
+  .extend({
+    settlementAccountType: z.enum(["bank", "person"]).optional().default("bank"),
+    bankId: z.string().length(24).optional(),
+    liabilityPersonId: z.string().length(24).optional(),
+  })
+  .superRefine((data, ctx) => {
+    const mode = data.settlementAccountType ?? "bank";
+    if (mode === "bank") {
+      if (!data.bankId || data.bankId.trim() === "") {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Bank is required.", path: ["bankId"] });
+      }
+    } else {
+      if (!data.liabilityPersonId || data.liabilityPersonId.trim() === "") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Liability person is required.",
+          path: ["liabilityPersonId"],
+        });
+      }
+    }
+  });
 
 export const updateDepositBodySchema = createDepositBodySchema;
 
@@ -25,7 +47,17 @@ export const listDepositQuerySchema = z.object({
   pageSize: z.coerce.number().int().positive().max(500).default(20),
   limit: z.coerce.number().int().positive().max(500).optional(),
   sortBy: z
-    .enum(["entryAt", "createdAt", "amount", "utr", "status", "totalAmount", "settledAt", "bankName"])
+    .enum([
+      "entryAt",
+      "createdAt",
+      "amount",
+      "utr",
+      "status",
+      "bonusAmount",
+      "totalAmount",
+      "settledAt",
+      "bankName",
+    ])
     .default("entryAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
   cursor: z.string().optional(),
@@ -70,9 +102,9 @@ export const exchangeActionBodySchema = z.discriminatedUnion("action", [
   }),
 ]);
 
-/** Post-settlement amendment for verified deposits (bank + UTR + amount + player + bonus). */
+/** Post-settlement amendment for verified deposits. `bankId` required for bank-settled rows; omitted for person-settled. */
 export const amendDepositBodySchema = z.object({
-  bankId: z.string().length(24),
+  bankId: z.string().length(24).optional(),
   utr: z.string().min(4).max(120).trim(),
   amount: z.number().int().min(1),
   playerId: z.string().length(24),
