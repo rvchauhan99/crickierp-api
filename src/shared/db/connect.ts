@@ -10,6 +10,7 @@ export async function connectDb() {
     waitQueueTimeoutMS: env.mongoWaitQueueTimeoutMs,
     socketTimeoutMS: env.mongoSocketTimeoutMs,
     serverSelectionTimeoutMS: env.mongoServerSelectionTimeoutMs,
+    ...(env.mongoFamily !== undefined ? { family: env.mongoFamily } : {}),
   });
 
   if (env.enableMongoSlowQueryLog) {
