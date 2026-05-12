@@ -29,6 +29,8 @@ type EnvConfig = {
   mongoSocketTimeoutMs: number;
   mongoServerSelectionTimeoutMs: number;
   mongoSlowQueryMs: number;
+  /** Passed to the driver as `family` (DNS / socket). Set `MONGO_FAMILY=6` to force IPv6. */
+  mongoFamily?: 4 | 6;
   enableMongoSlowQueryLog: boolean;
   enablePerformanceMetrics: boolean;
   apiP95WarnMs: number;
@@ -43,6 +45,13 @@ function required(name: string, fallback?: string): string {
     throw new Error(`Missing required env var: ${name}`);
   }
   return value;
+}
+
+function parseMongoFamily(): 4 | 6 | undefined {
+  const raw = process.env.MONGO_FAMILY?.trim();
+  if (raw === "4") return 4;
+  if (raw === "6") return 6;
+  return undefined;
 }
 
 function parseCorsOrigin(raw: string | undefined): string[] {
@@ -86,6 +95,9 @@ export const env: EnvConfig = {
   mongoSocketTimeoutMs: Number(process.env.MONGO_SOCKET_TIMEOUT_MS ?? 45000),
   mongoServerSelectionTimeoutMs: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS ?? 5000),
   mongoSlowQueryMs: Number(process.env.MONGO_SLOW_QUERY_MS ?? 120),
+  mongoFamily:
+    parseMongoFamily() ??
+    ((process.env.MONGO_URI ?? "mongodb://127.0.0.1:27017/crickierp").includes(".mongodb.net") ? 4 : undefined),
   enableMongoSlowQueryLog: (process.env.ENABLE_MONGO_SLOW_QUERY_LOG ?? "true") === "true",
   enablePerformanceMetrics: (process.env.ENABLE_PERFORMANCE_METRICS ?? "true") === "true",
   apiP95WarnMs: Number(process.env.API_P95_WARN_MS ?? 500),
