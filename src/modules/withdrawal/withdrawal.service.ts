@@ -5,6 +5,7 @@ import { REASON_TYPES } from "../../shared/constants/reasonTypes";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
+import { computeClosingBalanceActualByBankIds } from "../bank/bankClosingBalance";
 import { DepositModel } from "../deposit/deposit.model";
 import { ExpenseModel } from "../expense/expense.model";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
@@ -302,59 +303,6 @@ function entryAtMsEqual(a: Date | undefined, b: Date | undefined): boolean {
 }
 
 type HydratedWithdrawalDoc = HydratedDocument<WithdrawalDocument>;
-
-async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<Map<string, number>> {
-  if (bankIds.length === 0) return new Map();
-  const [banks, deposits, withdrawals, expenses, liabilities] = await Promise.all([
-    BankModel.find({ _id: { $in: bankIds } })
-      .select({ _id: 1, openingBalance: 1 })
-      .lean(),
-    DepositModel.find({ bankId: { $in: bankIds }, status: "verified" })
-      .select({ bankId: 1, amount: 1 })
-      .lean(),
-    WithdrawalModel.find({ payoutBankId: { $in: bankIds }, status: "approved" })
-      .select({ payoutBankId: 1, amount: 1, payableAmount: 1 })
-      .lean(),
-    ExpenseModel.find({ bankId: { $in: bankIds }, status: "approved" })
-      .select({ bankId: 1, amount: 1 })
-      .lean(),
-    LiabilityEntryModel.find({
-      $or: [
-        { fromAccountType: "bank", fromAccountId: { $in: bankIds } },
-        { toAccountType: "bank", toAccountId: { $in: bankIds } },
-      ],
-    })
-      .select({ fromAccountType: 1, fromAccountId: 1, toAccountType: 1, toAccountId: 1, amount: 1 })
-      .lean(),
-  ]);
-
-  const totals = new Map<string, number>();
-  for (const b of banks) totals.set(String(b._id), Number(b.openingBalance ?? 0));
-  for (const d of deposits) {
-    const id = String(d.bankId);
-    totals.set(id, (totals.get(id) ?? 0) + Number(d.amount ?? 0));
-  }
-  for (const w of withdrawals) {
-    const id = String(w.payoutBankId);
-    totals.set(id, (totals.get(id) ?? 0) - Number(w.payableAmount ?? w.amount ?? 0));
-  }
-  for (const e of expenses) {
-    const id = String(e.bankId);
-    totals.set(id, (totals.get(id) ?? 0) - Number(e.amount ?? 0));
-  }
-  for (const le of liabilities) {
-    const amt = Number(le.amount ?? 0);
-    if (le.fromAccountType === "bank" && le.fromAccountId) {
-      const id = String(le.fromAccountId);
-      totals.set(id, (totals.get(id) ?? 0) - amt);
-    }
-    if (le.toAccountType === "bank" && le.toAccountId) {
-      const id = String(le.toAccountId);
-      totals.set(id, (totals.get(id) ?? 0) + amt);
-    }
-  }
-  return totals;
-}
 
 async function normalizeBankCurrentBalances(bankIds: string[]) {
   const unique = [...new Set(bankIds.filter((id) => Types.ObjectId.isValid(id)))];

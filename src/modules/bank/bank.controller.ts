@@ -1,7 +1,20 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
-import { createBank, exportBanksToBuffer, getBankLedger, listBanks } from "./bank.service";
-import { bankIdParamSchema, bankLedgerQuerySchema, listBankQuerySchema } from "./bank.validation";
+import {
+  createBank,
+  createBankSettlement,
+  exportBanksToBuffer,
+  getBankComputedClosingBalance,
+  getBankLedger,
+  listBankSettlements,
+  listBanks,
+} from "./bank.service";
+import {
+  bankIdParamSchema,
+  bankLedgerQuerySchema,
+  createBankSettlementBodySchema,
+  listBankQuerySchema,
+} from "./bank.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function createBankController(req: Request, res: Response) {
@@ -34,4 +47,32 @@ export async function bankLedgerController(req: Request, res: Response) {
   const timeZone = resolveRequestTimeZone(req);
   const data = await getBankLedger(id, query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function listBankSettlementsController(req: Request, res: Response) {
+  const { id } = bankIdParamSchema.parse(req.params);
+  const data = await listBankSettlements(id);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function getBankComputedClosingController(req: Request, res: Response) {
+  const { id } = bankIdParamSchema.parse(req.params);
+  const data = await getBankComputedClosingBalance(id);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function createBankSettlementController(req: Request, res: Response) {
+  const { id } = bankIdParamSchema.parse(req.params);
+  const body = createBankSettlementBodySchema.parse(req.body);
+  const data = await createBankSettlement(
+    id,
+    {
+      effectiveAt: body.effectiveAt,
+      masterReportedBalance: body.masterReportedBalance,
+      reason: body.reason,
+    },
+    req.user!.userId,
+    req.requestId,
+  );
+  res.status(StatusCodes.CREATED).json({ success: true, data });
 }
