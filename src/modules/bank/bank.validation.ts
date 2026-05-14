@@ -39,7 +39,13 @@ export const listBankQuerySchema = z.object({
 export const bankLedgerQuerySchema = z.object({
   fromDate: z.string().optional(),
   toDate: z.string().optional(),
-  entryType: z.enum(["all", "deposit", "withdrawal", "expense", "liability"]).default("all"),
+  entryType: z.enum(["all", "deposit", "withdrawal", "expense", "liability", "settlement"]).default("all"),
+});
+
+export const createBankSettlementBodySchema = z.object({
+  effectiveAt: z.coerce.date(),
+  masterReportedBalance: z.coerce.number().finite().nonnegative(),
+  reason: z.string().trim().min(3).max(4000),
 });
 
 export const bankIdParamSchema = z.object({

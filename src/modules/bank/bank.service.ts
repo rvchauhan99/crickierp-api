@@ -15,6 +15,8 @@ import {
   ymdToUtcStart,
 } from "../../shared/utils/timezone";
 import { BankModel } from "./bank.model";
+import { BankBalanceSettlementModel } from "./bank-balance-settlement.model";
+import { computeClosingBalanceActualByBankIds } from "./bankClosingBalance";
 import { listBankQuerySchema } from "./bank.validation";
 
 type ListBankQuery = z.infer<typeof listBankQuerySchema>;
@@ -217,73 +219,6 @@ function buildBankListFilter(q: ListBankQuery, timeZone: string): Record<string,
   return { $and: conditions };
 }
 
-type ClosingBalanceByBankId = Map<string, number>;
-
-/**
- * Computes statement-equivalent closing balance snapshot for given banks:
- * openingBalance + verified deposits - approved withdrawals - approved expenses +/- liabilities.
- */
-async function computeClosingBalanceActualByBankIds(bankIds: Types.ObjectId[]): Promise<ClosingBalanceByBankId> {
-  if (bankIds.length === 0) return new Map();
-  const [banks, deposits, withdrawals, expenses, liabilities] = await Promise.all([
-    BankModel.find({ _id: { $in: bankIds } })
-      .select({ _id: 1, openingBalance: 1 })
-      .lean(),
-    DepositModel.find({ bankId: { $in: bankIds }, status: "verified" })
-      .select({ bankId: 1, amount: 1 })
-      .lean(),
-    WithdrawalModel.find({ payoutBankId: { $in: bankIds }, status: "approved" })
-      .select({ payoutBankId: 1, amount: 1, payableAmount: 1 })
-      .lean(),
-    ExpenseModel.find({ bankId: { $in: bankIds }, status: "approved" })
-      .select({ bankId: 1, amount: 1 })
-      .lean(),
-    LiabilityEntryModel.find({
-      $or: [
-        { fromAccountType: "bank", fromAccountId: { $in: bankIds } },
-        { toAccountType: "bank", toAccountId: { $in: bankIds } },
-      ],
-    })
-      .select({ fromAccountType: 1, fromAccountId: 1, toAccountType: 1, toAccountId: 1, amount: 1 })
-      .lean(),
-  ]);
-
-  const totals = new Map<string, number>();
-  for (const b of banks) {
-    totals.set(String(b._id), Number(b.openingBalance ?? 0));
-  }
-
-  for (const d of deposits) {
-    const id = String(d.bankId);
-    const prev = totals.get(id) ?? 0;
-    totals.set(id, prev + Number(d.amount ?? 0));
-  }
-  for (const w of withdrawals) {
-    const id = String(w.payoutBankId);
-    const prev = totals.get(id) ?? 0;
-    totals.set(id, prev - Number(w.payableAmount ?? w.amount ?? 0));
-  }
-  for (const e of expenses) {
-    const id = String(e.bankId);
-    const prev = totals.get(id) ?? 0;
-    totals.set(id, prev - Number(e.amount ?? 0));
-  }
-  for (const le of liabilities) {
-    const amt = Number(le.amount ?? 0);
-    if (le.fromAccountType === "bank" && le.fromAccountId) {
-      const id = String(le.fromAccountId);
-      const prev = totals.get(id) ?? 0;
-      totals.set(id, prev - amt);
-    }
-    if (le.toAccountType === "bank" && le.toAccountId) {
-      const id = String(le.toAccountId);
-      const prev = totals.get(id) ?? 0;
-      totals.set(id, prev + amt);
-    }
-  }
-  return totals;
-}
-
 const EXPORT_MAX_ROWS = 10_000;
 
 function formatCreatedByForExport(createdBy: unknown): string {
@@ -390,8 +325,12 @@ export async function exportBanksToBuffer(
 type LedgerQuery = {
   fromDate?: string;
   toDate?: string;
-  entryType?: "all" | "deposit" | "withdrawal" | "expense" | "liability";
+  entryType?: "all" | "deposit" | "withdrawal" | "expense" | "liability" | "settlement";
 };
+
+function settlementEventTime(s: { effectiveAt: Date }): Date {
+  return new Date(s.effectiveAt);
+}
 
 function depositEventTime(d: { settledAt?: Date; createdAt?: Date }): Date {
   if (d.settledAt) return new Date(d.settledAt);
@@ -437,7 +376,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
   const toD = to ? ymdToUtcEnd(to, timeZone) : null;
   const entryType = query.entryType || "all";
 
-  const [allDeposits, allWithdrawals, allExpenses, allLiabilityEntries] = await Promise.all([
+  const [allDeposits, allWithdrawals, allExpenses, allLiabilityEntries, allSettlements] = await Promise.all([
     DepositModel.find({ bankId: bid, status: "verified" })
       .populate("player", "name")
       .populate("createdBy", "fullName")
@@ -454,6 +393,9 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
       ],
     })
       .populate("createdBy", "fullName")
+      .lean(),
+    BankBalanceSettlementModel.find({ bankId: bid })
+      .populate("createdBy", "fullName username")
       .lean(),
   ]);
 
@@ -496,13 +438,21 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
       if (isBankFrom) priorNet -= le.amount;
       if (isBankTo) priorNet += le.amount;
     }
+    for (const st of allSettlements) {
+      const at = settlementEventTime(st);
+      if (at >= fromD) continue;
+      priorNet += Number(st.signedAmount ?? 0);
+    }
   }
+
+  type SettlementLean = (typeof allSettlements)[number];
 
   type Ev =
     | { kind: "deposit"; t: number; doc: (typeof allDeposits)[0] }
     | { kind: "withdrawal"; t: number; doc: (typeof allWithdrawals)[0] }
     | { kind: "expense"; t: number; doc: (typeof allExpenses)[0] }
-    | { kind: "liability"; t: number; doc: (typeof allLiabilityEntries)[0] };
+    | { kind: "liability"; t: number; doc: (typeof allLiabilityEntries)[0] }
+    | { kind: "settlement"; t: number; doc: SettlementLean };
 
   const events: Ev[] = [];
   for (const d of allDeposits) {
@@ -535,6 +485,14 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
     if (toD && at > toD) continue;
     if (entryType === "all" || entryType === "liability") {
       events.push({ kind: "liability", t: at.getTime(), doc: le });
+    }
+  }
+  for (const st of allSettlements) {
+    const at = settlementEventTime(st);
+    if (fromD && at < fromD) continue;
+    if (toD && at > toD) continue;
+    if (entryType === "all" || entryType === "settlement") {
+      events.push({ kind: "settlement", t: at.getTime(), doc: st });
     }
   }
   events.sort((a, b) => a.t - b.t);
@@ -632,6 +590,36 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
       };
     }
 
+    if (ev.kind === "settlement") {
+      const st = ev.doc;
+      const signed = Number(st.signedAmount ?? 0);
+      const amt = Math.abs(signed);
+      if (signed >= 0) {
+        running += amt;
+        totalCredits += amt;
+      } else {
+        running -= amt;
+        totalDebits += amt;
+      }
+      const createdByObj = st.createdBy as { fullName?: string; username?: string } | undefined;
+      const createdLabel = createdByObj?.fullName?.trim()
+        ? createdByObj.fullName.trim()
+        : createdByObj?.username?.trim() ?? "";
+      return {
+        kind: "settlement" as const,
+        refId: st._id.toString(),
+        at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
+        label: "Master balance settlement",
+        utr: undefined,
+        playerName: st.reason?.trim() ? st.reason.trim().slice(0, 200) : "",
+        createdByName: createdLabel,
+        amount: amt,
+        direction: signed >= 0 ? ("credit" as const) : ("debit" as const),
+        balanceAfter: running,
+        bonusMemo: undefined,
+      };
+    }
+
     // expense
     const e = ev.doc;
     running -= e.amount;
@@ -668,4 +656,100 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
     totalBonusReversed,
     rows,
   };
+}
+
+export type CreateBankSettlementInput = {
+  effectiveAt: Date;
+  masterReportedBalance: number;
+  reason: string;
+};
+
+export async function getBankComputedClosingBalance(bankId: string): Promise<{ systemClosingBalance: number }> {
+  if (!Types.ObjectId.isValid(bankId)) {
+    throw new AppError("validation_error", "Invalid bank id", 400);
+  }
+  const bid = new Types.ObjectId(bankId);
+  const bank = await BankModel.findById(bid).select("_id").lean();
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+  const m = await computeClosingBalanceActualByBankIds([bid]);
+  return { systemClosingBalance: Number(m.get(bankId) ?? 0) };
+}
+
+export async function listBankSettlements(bankId: string) {
+  if (!Types.ObjectId.isValid(bankId)) {
+    throw new AppError("validation_error", "Invalid bank id", 400);
+  }
+  const bid = new Types.ObjectId(bankId);
+  const bank = await BankModel.findById(bid).select("_id").lean();
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+  return BankBalanceSettlementModel.find({ bankId: bid })
+    .sort({ effectiveAt: -1 })
+    .limit(100)
+    .populate("createdBy", "fullName username")
+    .lean();
+}
+
+export async function createBankSettlement(
+  bankId: string,
+  input: CreateBankSettlementInput,
+  actorId: string,
+  requestId?: string,
+) {
+  if (!Types.ObjectId.isValid(bankId)) {
+    throw new AppError("validation_error", "Invalid bank id", 400);
+  }
+  const bid = new Types.ObjectId(bankId);
+  const bank = await BankModel.findById(bid).lean();
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+
+  const master = Number(input.masterReportedBalance);
+  if (!Number.isFinite(master) || master < 0) {
+    throw new AppError("validation_error", "masterReportedBalance must be a non-negative finite number", 400);
+  }
+
+  const closingMap = await computeClosingBalanceActualByBankIds([bid]);
+  const systemBalanceBefore = Number(closingMap.get(bankId) ?? 0);
+  const signedAmount = master - systemBalanceBefore;
+  if (!Number.isFinite(signedAmount) || Math.abs(signedAmount) < 1e-9) {
+    throw new AppError(
+      "business_rule_error",
+      "Nothing to settle: master balance already matches the system-computed balance.",
+      400,
+    );
+  }
+
+  const reason = input.reason.trim();
+  if (reason.length < 3) {
+    throw new AppError("validation_error", "Reason must be at least 3 characters", 400);
+  }
+
+  const doc = await BankBalanceSettlementModel.create({
+    bankId: bid,
+    effectiveAt: input.effectiveAt,
+    masterReportedBalance: master,
+    signedAmount,
+    systemBalanceBefore,
+    reason,
+    createdBy: new Types.ObjectId(actorId),
+  });
+
+  await BankModel.updateOne({ _id: bid }, { $set: { currentBalance: master } });
+
+  await createAuditLog({
+    actorId,
+    action: "bank.settlement.create",
+    entity: "bank",
+    entityId: bankId,
+    newValue: {
+      masterReportedBalance: master,
+      signedAmount,
+      systemBalanceBefore,
+      reason,
+      effectiveAt: input.effectiveAt.toISOString(),
+      settlementId: doc._id.toString(),
+    },
+    requestId,
+  });
+
+  return doc.toObject();
 }
