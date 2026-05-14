@@ -2,6 +2,7 @@ import { Aggregate, PipelineStage, Types } from "mongoose";
 import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { AuditLogModel } from "../audit/audit.model";
+import { BankBalanceSettlementModel } from "../bank/bank-balance-settlement.model";
 import { BankModel } from "../bank/bank.model";
 import { ExchangeModel } from "../exchange/exchange.model";
 import { ExchangeTopupModel } from "../exchange-topup/exchange-topup.model";
@@ -557,6 +558,19 @@ export async function getDashboardSummary(
     toAccountType: "bank",
     ...liabilityDateBeforeExpr(rangeStartUtc),
   };
+
+  const settlementBankBase = selectedBankObjectId ? { bankId: selectedBankObjectId } : {};
+  const settlementBankPriorFilter: Record<string, unknown> = {
+    ...settlementBankBase,
+    ...(rangeStartUtc ? { effectiveAt: { $lt: rangeStartUtc } } : { _id: null }),
+  };
+  const settlementBankRangeFilter: Record<string, unknown> = {
+    ...settlementBankBase,
+    ...(rangeStartUtc && rangeEndUtc
+      ? { effectiveAt: { $gte: rangeStartUtc, $lte: rangeEndUtc } }
+      : { _id: null }),
+  };
+
   const todayRange = resolveTodayRangeForTimeZone(timeZone);
   const periodPlayerFilter = {
     isMigratedOldUser: false,
@@ -599,6 +613,8 @@ export async function getDashboardSummary(
     transferOutByBankBeforeRange,
     transferInByBankInRange,
     transferInByBankBeforeRange,
+    settlementByBankBeforeRange,
+    settlementByBankInRange,
   ] = await Promise.all([
     // Deposit: group by status → totalAmount, count, bonusTotal
     DepositModel.aggregate([
@@ -981,6 +997,27 @@ export async function getDashboardSummary(
         },
       },
     ]),
+
+    BankBalanceSettlementModel.aggregate([
+      { $match: settlementBankPriorFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$signedAmount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    BankBalanceSettlementModel.aggregate([
+      { $match: settlementBankRangeFilter },
+      {
+        $group: {
+          _id: "$bankId",
+          totalAmount: { $sum: "$signedAmount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
   ]);
 
   /* ── Aggregate deposit KPIs ────────────────────────────────────── */
@@ -1229,6 +1266,15 @@ export async function getDashboardSummary(
     transferInByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
   );
   const transferInCountMap = groupToCountMap(transferInByBankInRange as Array<{ _id?: unknown; count?: number }>);
+  const settlementBeforeMap = groupToAmountMap(
+    settlementByBankBeforeRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const settlementInRangeMap = groupToAmountMap(
+    settlementByBankInRange as Array<{ _id?: unknown; totalAmount?: number }>,
+  );
+  const settlementCountMap = groupToCountMap(
+    settlementByBankInRange as Array<{ _id?: unknown; count?: number }>,
+  );
 
   const banksBreakdown = (activeBanks as Array<{ _id: Types.ObjectId; holderName?: string; bankName?: string; openingBalance?: number }>)
     .map((bank) => {
@@ -1240,7 +1286,8 @@ export async function getDashboardSummary(
         asNumber(transferInBeforeMap.get(bankId)) -
         asNumber(withdrawalBeforeMap.get(bankId)) -
         asNumber(expenseBeforeMap.get(bankId)) -
-        asNumber(transferOutBeforeMap.get(bankId));
+        asNumber(transferOutBeforeMap.get(bankId)) +
+        asNumber(settlementBeforeMap.get(bankId));
 
       const deposit = asNumber(depositInRangeMap.get(bankId));
       const withdrawal = asNumber(withdrawalInRangeMap.get(bankId));
@@ -1252,10 +1299,24 @@ export async function getDashboardSummary(
       const expenseCount = asNumber(expenseCountMap.get(bankId));
       const transferOutCount = asNumber(transferOutCountMap.get(bankId));
       const transferInCount = asNumber(transferInCountMap.get(bankId));
+      const settlementInRange = asNumber(settlementInRangeMap.get(bankId));
+      const settlementInRangeCount = asNumber(settlementCountMap.get(bankId));
       // Total txns in period — sum of the five type counts above
       const entries =
-        depositCount + withdrawalCount + expenseCount + transferOutCount + transferInCount;
-      const closingBalance = openingBalance + deposit + transferIn - withdrawal - expenses - transferOut;
+        depositCount +
+        withdrawalCount +
+        expenseCount +
+        transferOutCount +
+        transferInCount +
+        settlementInRangeCount;
+      const closingBalance =
+        openingBalance +
+        deposit +
+        transferIn -
+        withdrawal -
+        expenses -
+        transferOut +
+        settlementInRange;
 
       return {
         bankId,
