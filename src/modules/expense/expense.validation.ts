@@ -30,7 +30,7 @@ export const listExpenseQuerySchema = z.object({
     .enum(["createdAt", "expenseDate", "amount", "status", "bankName"])
     .default("createdAt"),
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
-  status: z.enum(["pending_audit", "approved", "rejected"]).optional(),
+  status: z.enum(["pending_audit", "approved", "rejected", "cancelled"]).optional(),
   expenseTypeId: z.string().length(24).optional(),
   bankId: z.string().length(24).optional(),
   expenseDate_from: z.string().optional(),
@@ -50,6 +50,11 @@ export const approveExpenseBodySchema = z.discriminatedUnion("settlementAccountT
 ]);
 
 export const rejectExpenseBodySchema = z.object({
+  reasonId: z.string().length(24),
+  remark: z.string().max(2000).trim().optional(),
+});
+
+export const cancelExpenseBodySchema = z.object({
   reasonId: z.string().length(24),
   remark: z.string().max(2000).trim().optional(),
 });

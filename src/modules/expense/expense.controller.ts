@@ -8,12 +8,14 @@ import {
   getExpenseById,
   listActiveExpenseTypes,
   listExpenses,
+  cancelApprovedExpense,
   rejectExpense,
   uploadExpenseDocuments,
   updateExpense,
 } from "./expense.service";
 import {
   approveExpenseBodySchema,
+  cancelExpenseBodySchema,
   createExpenseBodySchema,
   listExpenseQuerySchema,
   rejectExpenseBodySchema,
@@ -72,6 +74,17 @@ export async function approveExpenseController(req: Request, res: Response) {
 export async function rejectExpenseController(req: Request, res: Response) {
   const body = rejectExpenseBodySchema.parse(req.body);
   const data = await rejectExpense(
+    String(req.params.id),
+    { reasonId: body.reasonId, remark: body.remark },
+    req.user!.userId,
+    req.requestId,
+  );
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function cancelExpenseController(req: Request, res: Response) {
+  const body = cancelExpenseBodySchema.parse(req.body);
+  const data = await cancelApprovedExpense(
     String(req.params.id),
     { reasonId: body.reasonId, remark: body.remark },
     req.user!.userId,
