@@ -304,4 +304,38 @@ describe("Liability person deposit settlement and withdrawal payout", () => {
     expect(entries[0]?.amount).toBe(220);
     expect(String(entries[0]?.toAccountId)).toBe(liablePersonId);
   });
+
+  it("GET /liability/persons returns platform-side closing on list rows", async () => {
+    const person = await LiabilityPersonModel.findById(liablePersonId).lean();
+    expect(person).toBeTruthy();
+    const opening = Number(person!.openingBalance ?? 0);
+    const debits = Number(person!.totalDebits ?? 0);
+    const credits = Number(person!.totalCredits ?? 0);
+    const platformClosing = opening + debits - credits;
+    const personStoredClosing = Number(person!.closingBalance ?? 0);
+
+    const listRes = await request(app)
+      .get("/api/v1/liability/persons")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .query({ search: "Test Liable Person", page: 1, pageSize: 10 });
+
+    expect(listRes.status).toBe(200);
+    const rows = listRes.body.data as Array<{
+      _id: string;
+      closingBalance: number;
+      closingBalanceAbs: number;
+      closingBalanceSide: string;
+    }>;
+    const row = rows.find((r) => String(r._id) === liablePersonId);
+    expect(row).toBeTruthy();
+    expect(row!.closingBalance).toBe(platformClosing);
+    expect(row!.closingBalanceAbs).toBe(Math.abs(platformClosing));
+    const expectedSide =
+      platformClosing === 0 ? "settled" : platformClosing > 0 ? "receivable" : "payable";
+    expect(row!.closingBalanceSide).toBe(expectedSide);
+
+    if (debits !== credits) {
+      expect(row!.closingBalance).not.toBe(personStoredClosing);
+    }
+  });
 });
