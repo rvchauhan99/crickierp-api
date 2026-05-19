@@ -1585,29 +1585,62 @@ export async function exportExpenseAnalysisToBuffer(
     pageSize: 10000,
   }, { timeZone });
 
-  const exportData = result.rows.map((r: any) => ({
-    Date: formatDateTimeForTimeZone(r.createdAt, timeZone),
-    Category: r.categoryName || "",
-    Merchant: r.merchantName || "",
-    "Bank Account": r.bankAccountName || "",
-    Amount: r.amount,
-    Status: r.status,
-    Description: r.description || "",
-  }));
+  const exportData = result.rows.map((r) => {
+    const et = r.expenseTypeId as { name?: string } | null;
+    const b = r.bankId as { holderName?: string; bankName?: string } | null;
+    const p = r.liabilityPersonId as { name?: string } | null;
+    let settlement = r.bankName ?? "";
+    if (r.settlementAccountType === "person" && p?.name) {
+      settlement = `Person: ${p.name}`;
+    } else if (r.settlementAccountType === "bank" && b) {
+      settlement = `${b.holderName ?? ""} — ${b.bankName ?? ""}`.trim();
+    }
+
+    return {
+      "Expense Date": formatDateForTimeZone(r.expenseDate, timeZone),
+      Category: et?.name ?? "",
+      Amount: r.amount,
+      Status: r.status,
+      Settlement: settlement,
+      Description: r.description ?? "",
+      "Reject Reason": r.rejectReason ?? "",
+      "Cancel Reason": r.cancelReason ?? "",
+      "Created By": formatUserLabelForExport(r.createdBy),
+      "Approved By": formatUserLabelForExport(r.approvedBy),
+      "Cancelled By": formatUserLabelForExport(r.cancelledBy),
+    };
+  });
 
   return generateExcelBuffer(
     exportData,
     [
-      { header: "Date", key: "Date" },
+      { header: "Expense Date", key: "Expense Date" },
       { header: "Category", key: "Category" },
-      { header: "Merchant", key: "Merchant" },
-      { header: "Bank Account", key: "Bank Account" },
       { header: "Amount", key: "Amount" },
       { header: "Status", key: "Status" },
+      { header: "Settlement", key: "Settlement" },
       { header: "Description", key: "Description" },
+      { header: "Reject Reason", key: "Reject Reason" },
+      { header: "Cancel Reason", key: "Cancel Reason" },
+      { header: "Created By", key: "Created By" },
+      { header: "Approved By", key: "Approved By" },
+      { header: "Cancelled By", key: "Cancelled By" },
     ],
     "Expense Analysis",
   );
+}
+
+function formatUserLabelForExport(user: unknown): string {
+  if (user == null) return "";
+  if (typeof user === "object" && user !== null && "fullName" in user) {
+    const u = user as { fullName?: string; username?: string };
+    const fn = u.fullName?.trim();
+    const un = u.username?.trim();
+    if (fn && un) return `${fn} (${un})`;
+    if (fn) return fn;
+    if (un) return un;
+  }
+  return "";
 }
 
 /** Distinct non-auth entity values for transaction history filters. */
@@ -1768,15 +1801,18 @@ export function buildExpenseReportFilter(
         { description: { $regex: esc, $options: "i" } },
         { bankName: { $regex: esc, $options: "i" } },
         { rejectReason: { $regex: esc, $options: "i" } },
+        { cancelReason: { $regex: esc, $options: "i" } },
       ],
     });
   }
 
   const st = trimUndef(q.status);
-  if (st === "pending_audit" || st === "approved" || st === "rejected") {
+  if (st === "pending_audit" || st === "approved" || st === "rejected" || st === "cancelled") {
     conditions.push({ status: st as ExpenseStatus });
   } else {
-    conditions.push({ status: { $in: ["pending_audit", "approved"] as ExpenseStatus[] } });
+    conditions.push({
+      status: { $in: ["pending_audit", "approved", "rejected", "cancelled"] as ExpenseStatus[] },
+    });
   }
 
   const expenseTypeId = trimUndef(q.expenseTypeId);
@@ -1825,59 +1861,139 @@ export function buildExpenseReportFilter(
   return { $and: conditions };
 }
 
+function expenseAnalysisStatusTotals(
+  byStatus: Array<{ status: string; totalAmount: number; count: number }>,
+): {
+  netApprovedTotal: number;
+  netApprovedCount: number;
+  cancelledTotal: number;
+  cancelledCount: number;
+  pendingTotal: number;
+  pendingCount: number;
+  rejectedTotal: number;
+  rejectedCount: number;
+} {
+  const pick = (status: string) =>
+    byStatus.find((r) => r.status === status) ?? { totalAmount: 0, count: 0 };
+  const approved = pick("approved");
+  const cancelled = pick("cancelled");
+  const pending = pick("pending_audit");
+  const rejected = pick("rejected");
+  return {
+    netApprovedTotal: approved.totalAmount,
+    netApprovedCount: approved.count,
+    cancelledTotal: cancelled.totalAmount,
+    cancelledCount: cancelled.count,
+    pendingTotal: pending.totalAmount,
+    pendingCount: pending.count,
+    rejectedTotal: rejected.totalAmount,
+    rejectedCount: rejected.count,
+  };
+}
+
 export async function getExpenseAnalysisSummary(
   query: ExpenseAnalysisFilterQuery,
   options?: { timeZone?: string },
 ) {
   const filter = buildExpenseReportFilter(query, options);
+  const statusFilter = trimUndef(query.status);
 
-  const [summaryAgg, grandAgg] = await Promise.all([
-    ExpenseModel.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: "$expenseTypeId",
-          totalAmount: { $sum: "$amount" },
-          count: { $sum: 1 },
-        },
+  const chartStatus =
+    statusFilter === "pending_audit" ||
+    statusFilter === "approved" ||
+    statusFilter === "rejected" ||
+    statusFilter === "cancelled"
+      ? statusFilter
+      : "approved";
+
+  const [facetAgg] = await ExpenseModel.aggregate([
+    { $match: filter },
+    {
+      $facet: {
+        byStatus: [
+          {
+            $group: {
+              _id: "$status",
+              totalAmount: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              status: "$_id",
+              totalAmount: 1,
+              count: 1,
+            },
+          },
+        ],
+        byExpenseType: [
+          { $match: { status: chartStatus } },
+          {
+            $group: {
+              _id: "$expenseTypeId",
+              totalAmount: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+          {
+            $lookup: {
+              from: "expensetypes",
+              localField: "_id",
+              foreignField: "_id",
+              as: "et",
+            },
+          },
+          {
+            $project: {
+              expenseTypeId: "$_id",
+              name: { $arrayElemAt: ["$et.name", 0] },
+              totalAmount: 1,
+              count: 1,
+            },
+          },
+          { $sort: { name: 1 } },
+        ],
       },
-      {
-        $lookup: {
-          from: "expensetypes",
-          localField: "_id",
-          foreignField: "_id",
-          as: "et",
-        },
-      },
-      {
-        $project: {
-          expenseTypeId: "$_id",
-          name: { $arrayElemAt: ["$et.name", 0] },
-          totalAmount: 1,
-          count: 1,
-        },
-      },
-      { $sort: { name: 1 } },
-    ]),
-    ExpenseModel.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: null,
-          grandTotal: { $sum: "$amount" },
-          totalCount: { $sum: 1 },
-        },
-      },
-    ]),
+    },
   ]);
 
-  const grand = grandAgg[0] ?? { grandTotal: 0, totalCount: 0 };
+  const byStatusRaw = (facetAgg?.byStatus ?? []) as Array<{
+    status: string;
+    totalAmount: number;
+    count: number;
+  }>;
+  const byStatus = byStatusRaw.map((r) => ({
+    status: String(r.status ?? ""),
+    totalAmount: r.totalAmount ?? 0,
+    count: r.count ?? 0,
+  }));
+
+  const statusTotals = expenseAnalysisStatusTotals(byStatus);
+  const totalCount = byStatus.reduce((sum, r) => sum + r.count, 0);
+
+  let grandTotal: number;
+  if (statusFilter === "pending_audit" || statusFilter === "approved" || statusFilter === "rejected" || statusFilter === "cancelled") {
+    grandTotal = byStatus.find((r) => r.status === statusFilter)?.totalAmount ?? 0;
+  } else {
+    grandTotal = statusTotals.netApprovedTotal;
+  }
+
+  const summaryAgg = (facetAgg?.byExpenseType ?? []) as Array<{
+    expenseTypeId?: { toString?: () => string };
+    _id?: unknown;
+    name?: string;
+    totalAmount?: number;
+    count?: number;
+  }>;
 
   return {
-    grandTotal: grand.grandTotal ?? 0,
-    totalCount: grand.totalCount ?? 0,
+    grandTotal,
+    totalCount,
+    ...statusTotals,
+    byStatus,
     byExpenseType: summaryAgg.map((r) => ({
-      expenseTypeId: r.expenseTypeId?.toString?.() ?? String(r._id),
+      expenseTypeId: r.expenseTypeId?.toString?.() ?? String(r._id ?? ""),
       name: r.name ?? "",
       totalAmount: r.totalAmount ?? 0,
       count: r.count ?? 0,
@@ -1899,8 +2015,10 @@ export async function getExpenseAnalysisRecords(
     ExpenseModel.find(filter)
       .populate("expenseTypeId", "name code")
       .populate("bankId", "holderName bankName accountNumber")
+      .populate("liabilityPersonId", "name")
       .populate("createdBy", "fullName username")
       .populate("approvedBy", "fullName username")
+      .populate("cancelledBy", "fullName username")
       .sort({ [query.sortBy]: sortValue })
       .skip(skip)
       .limit(pageSize)
