@@ -87,22 +87,20 @@ function enrichPersonListRow<
   T extends { openingBalance?: number; totalDebits?: number; totalCredits?: number; closingBalance?: number },
 >(row: T) {
   const opening = Number(row.openingBalance ?? 0);
-  const stored = row.closingBalance;
-  const closingBal =
-    stored !== undefined && stored !== null && Number.isFinite(Number(stored))
-      ? Number(stored)
-      : resolveBalanceByViewMode(
-          {
-            openingBalance: row.openingBalance,
-            totalDebits: row.totalDebits,
-            totalCredits: row.totalCredits,
-          },
-          "person",
-        );
+  /** Master list uses platform-side closing (matches default Liability Ledger viewMode). */
+  const closingBal = resolveBalanceByViewMode(
+    {
+      openingBalance: row.openingBalance,
+      totalDebits: row.totalDebits,
+      totalCredits: row.totalCredits,
+    },
+    "platform",
+  );
   return {
     ...row,
     openingBalanceAbs: Math.abs(opening),
     openingBalanceSide: resolveSideFromBalance(opening),
+    closingBalance: closingBal,
     closingBalanceAbs: Math.abs(closingBal),
     closingBalanceSide: resolveSideFromBalance(closingBal),
   };
