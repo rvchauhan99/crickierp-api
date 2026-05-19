@@ -1,6 +1,6 @@
 import { Schema, model, Types } from "mongoose";
 
-export type ExpenseStatus = "pending_audit" | "approved" | "rejected";
+export type ExpenseStatus = "pending_audit" | "approved" | "rejected" | "cancelled";
 
 export interface ExpenseDocumentFile {
   path: string;
@@ -27,6 +27,11 @@ export interface ExpenseDocument {
   rejectReason?: string;
   /** Master Reason reference for rejection. */
   rejectReasonId?: Types.ObjectId;
+  cancelReason?: string;
+  /** Master Reason reference for superadmin cancel of approved expense. */
+  cancelReasonId?: Types.ObjectId;
+  cancelledBy?: Types.ObjectId;
+  cancelledAt?: Date;
   approvedBy?: Types.ObjectId;
   approvedAt?: Date;
   bankBalanceAfter?: number;
@@ -51,11 +56,15 @@ const expenseSchema = new Schema<ExpenseDocument>(
     liabilityEntryId: { type: Schema.Types.ObjectId, ref: "LiabilityEntry" },
     status: {
       type: String,
-      enum: ["pending_audit", "approved", "rejected"],
+      enum: ["pending_audit", "approved", "rejected", "cancelled"],
       default: "pending_audit",
     },
     rejectReason: { type: String, trim: true },
     rejectReasonId: { type: Schema.Types.ObjectId, ref: "Reason" },
+    cancelReason: { type: String, trim: true },
+    cancelReasonId: { type: Schema.Types.ObjectId, ref: "Reason" },
+    cancelledBy: { type: Schema.Types.ObjectId, ref: "User" },
+    cancelledAt: { type: Date },
     approvedBy: { type: Schema.Types.ObjectId, ref: "User" },
     approvedAt: { type: Date },
     bankBalanceAfter: { type: Number, min: 0 },

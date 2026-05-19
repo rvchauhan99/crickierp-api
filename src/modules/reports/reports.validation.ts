@@ -10,7 +10,7 @@ export const expenseAnalysisFilterQuerySchema = z.object({
   search: optionalTrimmed,
   status: z.preprocess(
     (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
-    z.enum(["pending_audit", "approved", "rejected"]).optional(),
+    z.enum(["pending_audit", "approved", "rejected", "cancelled"]).optional(),
   ),
   expenseTypeId: z.preprocess(
     (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),

@@ -8,7 +8,7 @@ import { BankModel } from "../bank/bank.model";
 import { ExpenseTypeModel } from "../masters/expense-type.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
-import { createLiabilityEntry } from "../liability/liability.service";
+import { createLiabilityEntry, deleteLiabilityEntryForReversal } from "../liability/liability.service";
 import {
   DEFAULT_TIMEZONE,
   formatDateForTimeZone,
@@ -18,8 +18,14 @@ import {
   ymdToUtcStart,
 } from "../../shared/utils/timezone";
 import { ExpenseModel, ExpenseStatus } from "./expense.model";
-import { approveExpenseBodySchema, listExpenseQuerySchema } from "./expense.validation";
+import {
+  approveExpenseBodySchema,
+  cancelExpenseBodySchema,
+  listExpenseQuerySchema,
+} from "./expense.validation";
 import { deleteFile, getSignedUrl, uploadFile } from "../../shared/services/bucket.service";
+
+type CancelExpenseInput = z.infer<typeof cancelExpenseBodySchema>;
 
 type ListExpenseQuery = z.infer<typeof listExpenseQuerySchema>;
 type ApproveExpenseInput = z.infer<typeof approveExpenseBodySchema>;
@@ -117,7 +123,7 @@ function buildListFilter(q: ListExpenseQuery, timeZone: string): Record<string, 
   }
 
   const st = trimUndef(q.status);
-  if (st === "pending_audit" || st === "approved" || st === "rejected") {
+  if (st === "pending_audit" || st === "approved" || st === "rejected" || st === "cancelled") {
     conditions.push({ status: st as ExpenseStatus });
   }
 
@@ -491,6 +497,121 @@ export async function rejectExpense(
   return doc;
 }
 
+export async function cancelApprovedExpense(
+  id: string,
+  input: CancelExpenseInput,
+  actorId: string,
+  requestId?: string,
+) {
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.EXPENSE_CANCEL);
+  const cancelText = composeRejectReasonText(resolved.masterText, input.remark);
+
+  const doc = await ExpenseModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Expense not found", 404);
+  if (doc.status !== "approved") {
+    throw new AppError("business_rule_error", "Only approved expenses can be cancelled", 400);
+  }
+
+  const amount = doc.amount;
+  const oldValue = {
+    status: doc.status,
+    amount,
+    settlementAccountType: doc.settlementAccountType,
+    bankId: doc.bankId?.toString(),
+    bankName: doc.bankName,
+    liabilityPersonId: doc.liabilityPersonId?.toString(),
+    liabilityEntryId: doc.liabilityEntryId?.toString(),
+    bankBalanceAfter: doc.bankBalanceAfter,
+  };
+
+  let bankReversalMeta: {
+    bankId?: string;
+    previousBalance?: number;
+    nextBalance?: number;
+    delta?: number;
+  } = {};
+  let rollbackBank: (() => Promise<void>) | null = null;
+  const liabilityEntryIdBefore = doc.liabilityEntryId ? String(doc.liabilityEntryId) : undefined;
+
+  if (doc.settlementAccountType === "bank") {
+    if (!doc.bankId) {
+      throw new AppError("business_rule_error", "Approved bank expense has no bank linked", 400);
+    }
+    const bank = await BankModel.findById(doc.bankId);
+    if (!bank) throw new AppError("not_found", "Bank not found", 404);
+
+    const prevBal = bank.currentBalance ?? bank.openingBalance;
+    const nextBal = prevBal + amount;
+    bank.currentBalance = nextBal;
+    await bank.save();
+
+    bankReversalMeta = {
+      bankId: String(bank._id),
+      previousBalance: prevBal,
+      nextBalance: nextBal,
+      delta: amount,
+    };
+    rollbackBank = async () => {
+      bank.currentBalance = prevBal;
+      await bank.save();
+    };
+  } else if (doc.settlementAccountType === "person") {
+    if (!doc.liabilityEntryId) {
+      throw new AppError(
+        "business_rule_error",
+        "Approved person-settled expense has no liability entry linked",
+        400,
+      );
+    }
+    await deleteLiabilityEntryForReversal(String(doc.liabilityEntryId), actorId, requestId);
+  } else {
+    throw new AppError("business_rule_error", "Approved expense has no settlement type", 400);
+  }
+
+  try {
+    doc.status = "cancelled";
+    doc.cancelReason = cancelText;
+    doc.cancelReasonId = new Types.ObjectId(resolved.id);
+    doc.cancelledBy = new Types.ObjectId(actorId);
+    doc.cancelledAt = new Date();
+    doc.liabilityEntryId = undefined;
+    doc.updatedBy = new Types.ObjectId(actorId);
+    await doc.save();
+  } catch (err) {
+    if (rollbackBank) await rollbackBank();
+    if (doc.settlementAccountType === "person" && liabilityEntryIdBefore) {
+      throw new AppError(
+        "business_rule_error",
+        "Expense cancel failed after liability reversal; contact support",
+        500,
+      );
+    }
+    throw err;
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "expense.cancel",
+    entity: "expense",
+    entityId: doc._id.toString(),
+    oldValue: oldValue as unknown as Record<string, unknown>,
+    newValue: {
+      status: "cancelled",
+      cancelReason: cancelText,
+      cancelReasonId: resolved.id,
+      remark: input.remark?.trim() || undefined,
+      reversal: {
+        settlementAccountType: doc.settlementAccountType,
+        bank: bankReversalMeta,
+        liabilityEntryId: liabilityEntryIdBefore,
+      },
+    },
+    requestId,
+  });
+
+  return doc;
+}
+
 export async function listExpenses(query: ListExpenseQuery, options?: { timeZone?: string }) {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const filter = buildListFilter(query, timeZone);
@@ -507,6 +628,7 @@ export async function listExpenses(query: ListExpenseQuery, options?: { timeZone
       .populate("liabilityEntryId", "entryType amount entryDate sourceType sourceExpenseId")
       .populate("createdBy", "fullName username")
       .populate("approvedBy", "fullName username")
+      .populate("cancelledBy", "fullName username")
       .sort({ [query.sortBy]: sortValue })
       .skip(skip)
       .limit(pageSize)
@@ -553,6 +675,7 @@ export async function exportExpensesToBuffer(
     .populate("liabilityPersonId", "name")
     .populate("createdBy", "fullName username")
     .populate("approvedBy", "fullName username")
+    .populate("cancelledBy", "fullName username")
     .sort({ [query.sortBy]: sortValue })
     .limit(EXPORT_MAX_ROWS)
     .lean();
@@ -577,8 +700,10 @@ export async function exportExpensesToBuffer(
       Status: r.status,
       "Settlement Via": settlement,
       "Reject Reason": r.rejectReason ?? "",
+      "Cancel Reason": r.cancelReason ?? "",
       "Created By": formatUserForExport(r.createdBy),
       "Approved By": formatUserForExport(r.approvedBy),
+      "Cancelled By": formatUserForExport(r.cancelledBy),
       "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
     };
   });
@@ -605,6 +730,7 @@ export async function getExpenseById(id: string) {
     .populate("liabilityEntryId", "entryType amount entryDate sourceType sourceExpenseId")
     .populate("createdBy", "fullName username")
     .populate("approvedBy", "fullName username")
+    .populate("cancelledBy", "fullName username")
     .lean();
   if (!doc) throw new AppError("not_found", "Expense not found", 404);
   return doc;

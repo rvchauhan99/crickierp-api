@@ -122,6 +122,23 @@ export async function bootstrapData() {
       reasonType: REASON_TYPES.EXPENSE_AUDIT_REJECT,
       reason: "Other (add details in remark)",
     },
+    // expense_cancel
+    {
+      reasonType: REASON_TYPES.EXPENSE_CANCEL,
+      reason: "Approved in error",
+    },
+    {
+      reasonType: REASON_TYPES.EXPENSE_CANCEL,
+      reason: "Duplicate booking",
+    },
+    {
+      reasonType: REASON_TYPES.EXPENSE_CANCEL,
+      reason: "Wrong settlement account",
+    },
+    {
+      reasonType: REASON_TYPES.EXPENSE_CANCEL,
+      reason: "Other (add details in remark)",
+    },
     // deposit_final_amend
     {
       reasonType: REASON_TYPES.DEPOSIT_FINAL_AMEND,

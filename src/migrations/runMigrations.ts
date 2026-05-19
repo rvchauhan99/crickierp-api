@@ -4,6 +4,7 @@ import { logger } from "../shared/logger";
 import { migration001DropNotificationCollections } from "./001-drop-notification-collections";
 import { migration002BackfillBusinessDatetimes } from "./002-backfill-business-datetimes";
 import { migration003LiabilityPersonSideClosingBalance } from "./003-liability-person-side-closing-balance";
+import { migration004SeedExpenseCancelReasons } from "./004-seed-expense-cancel-reasons";
 
 export const MIGRATIONS_COLLECTION = "__migrations";
 
@@ -16,6 +17,7 @@ const registry: Migration[] = [
   migration001DropNotificationCollections,
   migration002BackfillBusinessDatetimes,
   migration003LiabilityPersonSideClosingBalance,
+  migration004SeedExpenseCancelReasons,
 ];
 
 export async function runMigrations(): Promise<void> {

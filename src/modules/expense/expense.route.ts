@@ -2,12 +2,14 @@ import { Router } from "express";
 import multer from "multer";
 import { authMiddleware } from "../../shared/middlewares/auth.middleware";
 import { permissionMiddleware } from "../../shared/middlewares/permission.middleware";
+import { requireSuperadminMiddleware } from "../../shared/middlewares/superadmin.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
 import { validate } from "../../shared/middlewares/validate.middleware";
 import { expenseListPermissionMiddleware } from "./expense.list.middleware";
 import { expenseTypesReadMiddleware } from "./expenseTypes.middleware";
 import {
   approveExpenseController,
+  cancelExpenseController,
   createExpenseController,
   expenseDocumentViewUrlController,
   exportExpenseController,
@@ -20,6 +22,7 @@ import {
 } from "./expense.controller";
 import {
   approveExpenseBodySchema,
+  cancelExpenseBodySchema,
   createExpenseBodySchema,
   expenseDocumentViewParamsSchema,
   expenseIdParamSchema,
@@ -91,6 +94,13 @@ expenseRouter.post(
   permissionMiddleware(PERMISSIONS.EXPENSE_AUDIT),
   validate({ params: expenseIdParamSchema, body: rejectExpenseBodySchema }),
   rejectExpenseController,
+);
+
+expenseRouter.post(
+  "/:id/cancel",
+  requireSuperadminMiddleware,
+  validate({ params: expenseIdParamSchema, body: cancelExpenseBodySchema }),
+  cancelExpenseController,
 );
 
 expenseRouter.post(
