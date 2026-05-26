@@ -1,5 +1,6 @@
 import { Types, type HydratedDocument } from "mongoose";
 import type { z } from "zod";
+import xlsx from "xlsx";
 import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
@@ -1473,4 +1474,416 @@ export async function amendVerifiedDeposit(
   });
 
   return doc;
+}
+
+// ---------------------------------------------------------------------------
+// CSV/Excel Import
+// ---------------------------------------------------------------------------
+
+export type DepositImportValidRow = {
+  row: number;
+  utr: string;
+  amount: number;
+  entryAt?: string;
+  settlementAccountType: "bank" | "person";
+  bankId?: string;
+  bankAccountNumber?: string;
+  bankDisplayLabel?: string;
+  liabilityPersonId?: string;
+  liabilityPersonName?: string;
+};
+
+export type DepositImportInvalidRow = {
+  row: number;
+  dateTime: string;
+  settlementType: string;
+  bankAccountNumber: string;
+  liablePersonName: string;
+  utr: string;
+  amount: string;
+  errors: string[];
+};
+
+export type DepositImportValidationResult = {
+  summary: { total: number; valid: number; invalid: number; skipped: number };
+  validRows: DepositImportValidRow[];
+  invalidRows: DepositImportInvalidRow[];
+};
+
+function importNormalizeHeaderKey(raw: string): string {
+  return String(raw).trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function importPickCell(row: Record<string, unknown>, ...aliases: string[]): string {
+  const wanted = new Set(aliases.map((a) => importNormalizeHeaderKey(a)));
+  for (const [key, val] of Object.entries(row)) {
+    if (!wanted.has(importNormalizeHeaderKey(key))) continue;
+    if (val != null && String(val).trim() !== "") return String(val).trim();
+  }
+  return "";
+}
+
+function importReadRows(buffer: Buffer, originalName: string): Record<string, unknown>[] {
+  const lower = originalName.toLowerCase();
+  if (!lower.endsWith(".csv") && !lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
+    throw new AppError("validation_error", "Unsupported file type. Use .csv, .xlsx, or .xls", 400);
+  }
+  const wb = xlsx.read(buffer, { type: "buffer", raw: false });
+  const sheetName = wb.SheetNames[0];
+  if (!sheetName) {
+    throw new AppError("validation_error", "File is empty or has no sheets", 400);
+  }
+  return xlsx.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], { defval: "", raw: false });
+}
+
+function expandTwoDigitYear(yy: string): string {
+  if (yy.length === 4) return yy;
+  const num = parseInt(yy, 10);
+  return String(num < 70 ? 2000 + num : 1900 + num);
+}
+
+function parseFlexibleDateTime(raw: string): Date | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // Excel serial date number (e.g., 46238 or 46238.6)
+  if (/^\d{4,5}(\.\d+)?$/.test(trimmed) && !trimmed.includes("/") && !trimmed.includes("-")) {
+    const serial = parseFloat(trimmed);
+    if (serial > 1000 && serial < 100000) {
+      const excelEpoch = new Date(1899, 11, 30);
+      const d = new Date(excelEpoch.getTime() + serial * 86400000);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+  }
+
+  // DD/MM/YYYY HH:mm or DD/MM/YY HH:mm (also supports . and - separators)
+  const ddmmMatch = trimmed.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  if (ddmmMatch) {
+    const [, dd, mm, yyOrYyyy, hh, min] = ddmmMatch;
+    const yyyy = expandTwoDigitYear(yyOrYyyy!);
+    const iso = `${yyyy}-${mm!.padStart(2, "0")}-${dd!.padStart(2, "0")}T${(hh ?? "00").padStart(2, "0")}:${(min ?? "00").padStart(2, "0")}:00`;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // YYYY-MM-DD HH:mm or YYYY-MM-DD
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s](\d{1,2}):(\d{2}))?/);
+  if (isoMatch) {
+    const [, yyyy, mm, dd, hh, min] = isoMatch;
+    const iso = `${yyyy}-${mm!.padStart(2, "0")}-${dd!.padStart(2, "0")}T${(hh ?? "00").padStart(2, "0")}:${(min ?? "00").padStart(2, "0")}:00`;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // Fallback: try native Date parsing
+  const d = new Date(trimmed);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export async function validateDepositImportRows(
+  buffer: Buffer,
+  originalName: string,
+): Promise<DepositImportValidationResult> {
+  const rows = importReadRows(buffer, originalName);
+  if (rows.length === 0) {
+    throw new AppError("validation_error", "File contains no data rows", 400);
+  }
+  if (rows.length > 500) {
+    throw new AppError("validation_error", "Maximum 500 rows allowed per import", 400);
+  }
+
+  const validRows: DepositImportValidRow[] = [];
+  const invalidRows: DepositImportInvalidRow[] = [];
+  let skipped = 0;
+
+  const allBankIdentifiers: string[] = [];
+  const allPersonNames: string[] = [];
+  const rowDataList: Array<{
+    rowNum: number;
+    dateTimeRaw: string;
+    settlementType: string;
+    bankIdentifier: string;
+    personName: string;
+    utr: string;
+    amountRaw: string;
+  }> = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const rowNum = i + 2;
+    const utr = importPickCell(row, "utr", "UTR", "transaction_id", "transaction id");
+    const amountRaw = importPickCell(row, "amount", "Amount");
+    const dateTimeRaw = importPickCell(row, "date time", "datetime", "date_time", "entry_at", "entryat", "date");
+    const settlementType = importPickCell(row, "settlement type", "settlement_type", "settlementtype", "type");
+    const bankIdentifier = importPickCell(row, "bank", "bank account number", "bank_account_number", "bankaccountnumber", "account_number", "account number", "accountnumber", "holder name", "holdername", "holder_name", "bank holder", "bankholder");
+    const personName = importPickCell(row, "liable person name", "liable_person_name", "liablepersonname", "person_name", "person name", "personname", "liability person", "liabilityperson");
+
+    if (!utr && !amountRaw && !bankIdentifier && !personName) {
+      skipped++;
+      continue;
+    }
+
+    rowDataList.push({ rowNum, dateTimeRaw, settlementType, bankIdentifier, personName, utr, amountRaw });
+    if (bankIdentifier) allBankIdentifiers.push(bankIdentifier.trim().toLowerCase());
+    if (personName) allPersonNames.push(personName.toLowerCase());
+  }
+
+  const bankByAccountMap = new Map<string, { id: string; displayName: string; status: string }>();
+  const bankByHolderMap = new Map<string, { id: string; displayName: string; status: string } | "ambiguous">();
+  if (allBankIdentifiers.length > 0) {
+    const uniqueIdentifiers = [...new Set(allBankIdentifiers)];
+    const regexPatterns = uniqueIdentifiers.map(
+      (n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+    );
+    const banks = await BankModel.find({
+      $or: [
+        { accountNumber: { $in: regexPatterns } },
+        { holderName: { $in: regexPatterns } },
+      ],
+    }).lean();
+    for (const b of banks) {
+      bankByAccountMap.set(b.accountNumber.trim().toLowerCase(), {
+        id: b._id.toString(),
+        displayName: bankDisplayName(b),
+        status: b.status,
+      });
+      const holderKey = b.holderName.trim().toLowerCase();
+      if (bankByHolderMap.has(holderKey)) {
+        bankByHolderMap.set(holderKey, "ambiguous");
+      } else {
+        bankByHolderMap.set(holderKey, {
+          id: b._id.toString(),
+          displayName: bankDisplayName(b),
+          status: b.status,
+        });
+      }
+    }
+  }
+
+  const personMap = new Map<string, { id: string; name: string; isActive: boolean }>();
+  if (allPersonNames.length > 0) {
+    const uniqueNames = [...new Set(allPersonNames)];
+    const regexPatterns = uniqueNames.map((n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"));
+    const persons = await LiabilityPersonModel.find({ name: { $in: regexPatterns } }).lean();
+    for (const p of persons) {
+      personMap.set(p.name.trim().toLowerCase(), { id: p._id.toString(), name: p.name.trim(), isActive: p.isActive });
+    }
+  }
+
+  const seenUtrs = new Set<string>();
+  const existingUtrChecks = rowDataList.map((r) => r.utr).filter(Boolean);
+  const existingUtrConflicts = new Set<string>();
+  if (existingUtrChecks.length > 0) {
+    const normalizedUtrs = [...new Set(existingUtrChecks.map((u) => normalizeUtr(u)))];
+    const [depConflicts, wdConflicts] = await Promise.all([
+      DepositModel.find({
+        utr: { $in: normalizedUtrs.map((u) => new RegExp(`^${escapeUtrRegex(u)}$`, "i")) },
+        status: { $ne: "rejected" },
+      }).select({ utr: 1 }).lean(),
+      WithdrawalModel.find({
+        utr: { $in: normalizedUtrs.map((u) => new RegExp(`^${escapeUtrRegex(u)}$`, "i")) },
+        status: { $ne: "rejected" },
+      }).select({ utr: 1 }).lean(),
+    ]);
+    for (const d of depConflicts) existingUtrConflicts.add(normalizeUtr(d.utr));
+    for (const w of wdConflicts) if (w.utr) existingUtrConflicts.add(normalizeUtr(w.utr));
+  }
+
+  for (const rd of rowDataList) {
+    const rowErrors: string[] = [];
+
+    const mode = rd.settlementType.toLowerCase() === "person" ? "person" : "bank";
+
+    if (!rd.utr) {
+      rowErrors.push("UTR is required");
+    } else if (rd.utr.length < 4) {
+      rowErrors.push("UTR must be at least 4 characters");
+    } else if (rd.utr.length > 120) {
+      rowErrors.push("UTR must not exceed 120 characters");
+    } else {
+      const normalized = normalizeUtr(rd.utr);
+      if (existingUtrConflicts.has(normalized)) {
+        rowErrors.push("UTR already exists in another transaction");
+      } else if (seenUtrs.has(normalized)) {
+        rowErrors.push("Duplicate UTR within this file");
+      } else {
+        seenUtrs.add(normalized);
+      }
+    }
+
+    const amt = Number(rd.amountRaw);
+    if (!rd.amountRaw) {
+      rowErrors.push("Amount is required");
+    } else if (Number.isNaN(amt) || amt < 1) {
+      rowErrors.push("Amount must be a number >= 1");
+    } else if (!Number.isInteger(amt)) {
+      rowErrors.push("Amount must be a whole number (no decimals)");
+    }
+
+    let parsedDate: Date | null = null;
+    if (rd.dateTimeRaw) {
+      parsedDate = parseFlexibleDateTime(rd.dateTimeRaw);
+      if (!parsedDate) {
+        rowErrors.push("Invalid date/time format. Use DD/MM/YYYY HH:mm, DD/MM/YY HH:mm, or YYYY-MM-DD HH:mm");
+      }
+    }
+
+    let resolvedBankId: string | undefined;
+    let resolvedBankDisplay: string | undefined;
+    let resolvedPersonId: string | undefined;
+    let resolvedPersonName: string | undefined;
+
+    if (mode === "bank") {
+      if (!rd.bankIdentifier) {
+        rowErrors.push("Bank (Account No. or Holder Name) is required for Bank settlement");
+      } else {
+        const key = rd.bankIdentifier.trim().toLowerCase();
+        const bankByAcc = bankByAccountMap.get(key);
+        const bankByHolder = bankByHolderMap.get(key);
+        const bankInfo = bankByAcc || (bankByHolder !== "ambiguous" ? bankByHolder : undefined);
+
+        if (bankByHolder === "ambiguous" && !bankByAcc) {
+          rowErrors.push(`Multiple banks found with holder name "${rd.bankIdentifier}". Use account number instead.`);
+        } else if (!bankInfo) {
+          rowErrors.push(`Bank "${rd.bankIdentifier}" not found (tried account number and holder name)`);
+        } else if (bankInfo.status !== "active") {
+          rowErrors.push(`Bank "${bankInfo.displayName}" is not active`);
+        } else {
+          resolvedBankId = bankInfo.id;
+          resolvedBankDisplay = bankInfo.displayName;
+        }
+      }
+    } else {
+      if (!rd.personName) {
+        rowErrors.push("Liable Person Name is required for Person settlement");
+      } else {
+        const personInfo = personMap.get(rd.personName.trim().toLowerCase());
+        if (!personInfo) {
+          rowErrors.push(`Liability person "${rd.personName}" not found`);
+        } else if (!personInfo.isActive) {
+          rowErrors.push(`Liability person "${personInfo.name}" is inactive`);
+        } else {
+          resolvedPersonId = personInfo.id;
+          resolvedPersonName = personInfo.name;
+        }
+      }
+    }
+
+    if (rowErrors.length > 0) {
+      invalidRows.push({
+        row: rd.rowNum,
+        dateTime: rd.dateTimeRaw,
+        settlementType: rd.settlementType || "Bank",
+        bankAccountNumber: rd.bankIdentifier,
+        liablePersonName: rd.personName,
+        utr: rd.utr,
+        amount: rd.amountRaw,
+        errors: rowErrors,
+      });
+    } else {
+      validRows.push({
+        row: rd.rowNum,
+        utr: rd.utr,
+        amount: amt,
+        entryAt: parsedDate ? parsedDate.toISOString() : undefined,
+        settlementAccountType: mode,
+        bankId: resolvedBankId,
+        bankAccountNumber: rd.bankIdentifier || undefined,
+        bankDisplayLabel: resolvedBankDisplay,
+        liabilityPersonId: resolvedPersonId,
+        liabilityPersonName: resolvedPersonName,
+      });
+    }
+  }
+
+  return {
+    summary: {
+      total: rowDataList.length + skipped,
+      valid: validRows.length,
+      invalid: invalidRows.length,
+      skipped,
+    },
+    validRows,
+    invalidRows,
+  };
+}
+
+export async function commitDepositImportRows(
+  rows: Array<{
+    utr: string;
+    amount: number;
+    entryAt?: string;
+    settlementAccountType: "bank" | "person";
+    bankId?: string;
+    liabilityPersonId?: string;
+  }>,
+  actorId: string,
+  requestId?: string,
+): Promise<{ created: number; errors: Array<{ row: number; utr: string; error: string }> }> {
+  let created = 0;
+  const errors: Array<{ row: number; utr: string; error: string }> = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    try {
+      await createDeposit(
+        {
+          utr: row.utr,
+          amount: row.amount,
+          entryAt: row.entryAt,
+          settlementAccountType: row.settlementAccountType,
+          bankId: row.bankId,
+          liabilityPersonId: row.liabilityPersonId,
+        },
+        actorId,
+        requestId,
+      );
+      created++;
+    } catch (err: unknown) {
+      const msg = err instanceof AppError ? err.message : "Unexpected error";
+      errors.push({ row: i + 1, utr: row.utr, error: msg });
+    }
+  }
+
+  return { created, errors };
+}
+
+export function buildDepositImportSampleCsv(): Buffer {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const todayStr = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  const header = "Date Time,Settlement Type,Bank,Liable Person Name,UTR,Amount";
+  const example1 = `${todayStr},Bank,1234567890,,TXN001ABC,5000`;
+  const example2 = ",,Rajesh Kumar,,TXN002DEF,3000";
+  const example3 = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} 10:00,Person,,John Doe,TXN003GHI,2500`;
+  return Buffer.from([header, example1, example2, example3].join("\n"), "utf-8");
+}
+
+export function buildDepositImportErrorCsv(invalidRows: DepositImportInvalidRow[]): Buffer {
+  const header = "Row,Date Time,Settlement Type,Bank,Liable Person Name,UTR,Amount,Error";
+  const lines = [header];
+  for (const r of invalidRows) {
+    lines.push(
+      [
+        String(r.row),
+        quoteCsvVal(r.dateTime),
+        quoteCsvVal(r.settlementType),
+        quoteCsvVal(r.bankAccountNumber),
+        quoteCsvVal(r.liablePersonName),
+        quoteCsvVal(r.utr),
+        quoteCsvVal(r.amount),
+        quoteCsvVal(r.errors.join("; ")),
+      ].join(","),
+    );
+  }
+  return Buffer.from(lines.join("\n"), "utf-8");
+}
+
+function quoteCsvVal(value: string): string {
+  if (!value) return "";
+  if (value.includes(",") || value.includes('"') || value.includes("\n")) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
 }
