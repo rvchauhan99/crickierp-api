@@ -2,6 +2,9 @@ import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
   amendVerifiedDeposit,
+  buildDepositImportErrorCsv,
+  buildDepositImportSampleCsv,
+  commitDepositImportRows,
   createDeposit,
   deleteDepositWithReversal,
   exchangeApproveDeposit,
@@ -10,10 +13,12 @@ import {
   exportDepositsToBuffer,
   listDeposits,
   updateDepositByBanker,
+  validateDepositImportRows,
 } from "./deposit.service";
 import {
   approvalQueueEventsQuerySchema,
   amendDepositBodySchema,
+  commitDepositImportBodySchema,
   createDepositBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
@@ -100,4 +105,39 @@ export async function exchangeActionController(req: Request, res: Response) {
 export async function streamDepositApprovalQueueEventsController(req: Request, res: Response) {
   const query = approvalQueueEventsQuerySchema.parse(req.query);
   subscribeApprovalQueueEvents("deposit", query.view, res);
+}
+
+export async function sampleDepositCsvController(_req: Request, res: Response) {
+  const buffer = buildDepositImportSampleCsv();
+  res.setHeader("Content-Disposition", 'attachment; filename="deposit-import-sample.csv"');
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function validateDepositImportController(req: Request, res: Response) {
+  const file = req.file;
+  if (!file?.buffer) {
+    res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: "File is required (field name: file)" });
+    return;
+  }
+  const result = await validateDepositImportRows(file.buffer, file.originalname);
+  res.status(StatusCodes.OK).json({ success: true, data: result });
+}
+
+export async function commitDepositImportController(req: Request, res: Response) {
+  const body = commitDepositImportBodySchema.parse(req.body);
+  const result = await commitDepositImportRows(body.rows, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data: result });
+}
+
+export async function downloadDepositImportErrorCsvController(req: Request, res: Response) {
+  const { invalidRows } = req.body;
+  if (!Array.isArray(invalidRows) || invalidRows.length === 0) {
+    res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: "No invalid rows provided" });
+    return;
+  }
+  const buffer = buildDepositImportErrorCsv(invalidRows);
+  res.setHeader("Content-Disposition", 'attachment; filename="deposit-import-errors.csv"');
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.status(StatusCodes.OK).send(buffer);
 }
