@@ -43,7 +43,10 @@ function consumeRateLimit(
 
 export async function loginUser(username: string, password: string) {
   consumeRateLimit(loginRate, username.toLowerCase(), MAX_LOGIN_ATTEMPTS, LOGIN_RATE_MS);
-  const user = await UserModel.findOne({ username, status: "active" });
+  const user = await UserModel.findOne({
+    username: { $regex: new RegExp(`^${username}$`, "i") },
+    status: "active",
+  });
   if (!user) {
     throw new AppError("auth_error", "Invalid credentials", 401);
   }
