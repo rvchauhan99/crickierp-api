@@ -34,6 +34,7 @@ type EnvConfig = {
   enableMongoSlowQueryLog: boolean;
   enablePerformanceMetrics: boolean;
   apiP95WarnMs: number;
+  apiJsonLimit: string;
 
   // Cache / queue
   redisUrl?: string;
@@ -101,5 +102,6 @@ export const env: EnvConfig = {
   enableMongoSlowQueryLog: (process.env.ENABLE_MONGO_SLOW_QUERY_LOG ?? "true") === "true",
   enablePerformanceMetrics: (process.env.ENABLE_PERFORMANCE_METRICS ?? "true") === "true",
   apiP95WarnMs: Number(process.env.API_P95_WARN_MS ?? 500),
+  apiJsonLimit: process.env.API_JSON_LIMIT ?? "10mb",
   redisUrl: process.env.REDIS_URL,
 };
