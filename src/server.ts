@@ -6,6 +6,7 @@ import { bootstrapData } from "./shared/db/bootstrap";
 import { runMigrations } from "./migrations";
 import { logger } from "./shared/logger";
 import { startPlayerImportWorker, stopPlayerImportWorker } from "./modules/player/player-import-job.service";
+import { startDepositImportWorker, stopDepositImportWorker } from "./modules/deposit/deposit-import-job.service";
 import { startQueueWorkers, stopQueueWorkers } from "./shared/queue/queue";
 
 async function start() {
@@ -15,6 +16,7 @@ async function start() {
 
   const app = createApp();
   startPlayerImportWorker();
+  startDepositImportWorker();
   startQueueWorkers();
   app.listen(env.port, () => {
     logger.info(`API server running on port ${env.port}`);
@@ -24,6 +26,7 @@ async function start() {
 start().catch((error) => {
   logger.error(error);
   stopPlayerImportWorker();
+  void stopDepositImportWorker();
   void stopQueueWorkers();
   process.exit(1);
 });
