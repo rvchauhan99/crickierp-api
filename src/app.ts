@@ -22,7 +22,8 @@ export function createApp() {
       credentials: true,
     }),
   );
-  app.use(express.json());
+  app.use(express.json({ limit: env.apiJsonLimit }));
+  app.use(express.urlencoded({ extended: true, limit: env.apiJsonLimit }));
   app.use(compression());
   app.use(cookieParser());
   app.use(requestIdMiddleware);

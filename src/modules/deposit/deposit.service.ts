@@ -1589,8 +1589,8 @@ export async function validateDepositImportRows(
   if (rows.length === 0) {
     throw new AppError("validation_error", "File contains no data rows", 400);
   }
-  if (rows.length > 500) {
-    throw new AppError("validation_error", "Maximum 500 rows allowed per import", 400);
+  if (rows.length > 10000) {
+    throw new AppError("validation_error", "Maximum 10000 rows allowed per import", 400);
   }
 
   const validRows: DepositImportValidRow[] = [];
@@ -1820,9 +1820,13 @@ export async function commitDepositImportRows(
   }>,
   actorId: string,
   requestId?: string,
+  options?: {
+    onProgress?: (progress: DepositImportCommitProgress) => Promise<void> | void;
+  },
 ): Promise<{ created: number; errors: Array<{ row: number; utr: string; error: string }> }> {
   let created = 0;
   const errors: Array<{ row: number; utr: string; error: string }> = [];
+  const totalRows = rows.length;
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
@@ -1844,10 +1848,25 @@ export async function commitDepositImportRows(
       const msg = err instanceof AppError ? err.message : "Unexpected error";
       errors.push({ row: i + 1, utr: row.utr, error: msg });
     }
+    if (options?.onProgress) {
+      await options.onProgress({
+        totalRows,
+        processedRows: i + 1,
+        created,
+        errors,
+      });
+    }
   }
 
   return { created, errors };
 }
+
+export type DepositImportCommitProgress = {
+  totalRows: number;
+  processedRows: number;
+  created: number;
+  errors: Array<{ row: number; utr: string; error: string }>;
+};
 
 export function buildDepositImportSampleCsv(): Buffer {
   const now = new Date();

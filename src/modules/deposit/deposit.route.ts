@@ -9,11 +9,15 @@ import {
   amendDepositController,
   commitDepositImportController,
   createDepositController,
+  createDepositImportJobController,
   deleteDepositController,
+  downloadDepositImportJobErrorCsvController,
   exchangeActionController,
   exportDepositController,
+  getDepositImportJobController,
   listDepositController,
   sampleDepositCsvController,
+  streamDepositImportJobEventsController,
   streamDepositApprovalQueueEventsController,
   updateDepositController,
   validateDepositImportController,
@@ -23,6 +27,7 @@ import {
   approvalQueueEventsQuerySchema,
   amendDepositBodySchema,
   commitDepositImportBodySchema,
+  createDepositImportJobBodySchema,
   createDepositBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
@@ -64,6 +69,31 @@ depositRouter.post(
   permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
   validate({ body: commitDepositImportBodySchema }),
   commitDepositImportController,
+);
+
+depositRouter.post(
+  "/import/jobs",
+  permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
+  validate({ body: createDepositImportJobBodySchema }),
+  createDepositImportJobController,
+);
+
+depositRouter.get(
+  "/import/jobs/:jobId",
+  permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
+  getDepositImportJobController,
+);
+
+depositRouter.get(
+  "/import/jobs/:jobId/events",
+  permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
+  streamDepositImportJobEventsController,
+);
+
+depositRouter.get(
+  "/import/jobs/:jobId/errors.csv",
+  permissionMiddleware(PERMISSIONS.DEPOSIT_BANKER),
+  downloadDepositImportJobErrorCsvController,
 );
 
 depositRouter.post(

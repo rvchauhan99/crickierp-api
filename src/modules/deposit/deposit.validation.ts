@@ -129,3 +129,19 @@ export const commitDepositImportBodySchema = z.object({
     .min(1)
     .max(500),
 });
+
+export const createDepositImportJobBodySchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        utr: z.string().min(4).max(120),
+        amount: z.number().int().min(1),
+        entryAt: z.string().optional(),
+        settlementAccountType: z.enum(["bank", "person"]).default("bank"),
+        bankId: z.string().length(24).optional(),
+        liabilityPersonId: z.string().length(24).optional(),
+      }),
+    )
+    .min(1)
+    .max(10000),
+});
