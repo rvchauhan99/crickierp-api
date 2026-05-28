@@ -46,6 +46,9 @@ import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/utr";
 import { createLiabilityEntry, deleteLiabilityEntryForReversal } from "../liability/liability.service";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
+import { chunkArray } from "../../shared/utils/chunkArray";
+
+export const DEPOSIT_IMPORT_CHUNK_SIZE = 100;
 
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
 type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
@@ -833,11 +836,25 @@ async function isFirstDepositForPlayer(playerId: Types.ObjectId, currentDepositI
   return prior == null;
 }
 
+export type ExchangeApproveOptions = {
+  deferSideEffects?: boolean;
+  bulkContext?: {
+    exchangeIds: Set<string>;
+    personSettlementSeen: boolean;
+  };
+};
+
+export type BulkExchangeApproveResult = {
+  approved: number;
+  failed: Array<{ depositId: string; error: string }>;
+};
+
 export async function exchangeApproveDeposit(
   id: string,
   input: { playerId: string; bonusAmount: number },
   actorId: string,
   requestId?: string,
+  options?: ExchangeApproveOptions,
 ) {
   const startedAtMs = Date.now();
   const requestedBonus = Number(input.bonusAmount);
@@ -1003,6 +1020,11 @@ export async function exchangeApproveDeposit(
     }
   };
 
+  if (options?.bulkContext) {
+    options.bulkContext.exchangeIds.add(String(playerDoc.exchange));
+    if (isPersonSettlement) options.bulkContext.personSettlementSeen = true;
+  }
+
   await runSideEffect("audit_log", async () => {
     await createAuditLog({
       actorId,
@@ -1026,16 +1048,18 @@ export async function exchangeApproveDeposit(
       requestId,
     });
   });
-  await runSideEffect("enqueue_exchange_recompute", async () => {
-    await enqueueExchangeRecompute(String(playerDoc.exchange));
-  });
-  await runSideEffect("invalidate_cache_domains", async () => {
-    await invalidateCacheDomains(
-      isPersonSettlement
-        ? ["deposit", "exchange", "referral", "player", "liability"]
-        : ["deposit", "exchange", "referral", "player"],
-    );
-  });
+  if (!options?.deferSideEffects) {
+    await runSideEffect("enqueue_exchange_recompute", async () => {
+      await enqueueExchangeRecompute(String(playerDoc.exchange));
+    });
+    await runSideEffect("invalidate_cache_domains", async () => {
+      await invalidateCacheDomains(
+        isPersonSettlement
+          ? ["deposit", "exchange", "referral", "player", "liability"]
+          : ["deposit", "exchange", "referral", "player"],
+      );
+    });
+  }
   await runSideEffect("sync_referral_accrual", async () => {
     await syncReferralAccrualForDeposit(doc._id);
   });
@@ -1048,6 +1072,103 @@ export async function exchangeApproveDeposit(
   );
 
   return doc;
+}
+
+function exchangeApproveErrorMessage(err: unknown): string {
+  if (err instanceof AppError) return err.message;
+  if (err instanceof Error) return err.message;
+  return "Approve failed";
+}
+
+export async function bulkExchangeApproveDeposits(
+  depositIds: string[],
+  actorId: string,
+  requestId?: string,
+): Promise<BulkExchangeApproveResult> {
+  const uniqueIds = Array.from(new Set(depositIds.filter((id) => Types.ObjectId.isValid(id))));
+  if (uniqueIds.length === 0) {
+    throw new AppError("validation_error", "At least one valid deposit id is required", 400);
+  }
+
+  const bulkContext = {
+    exchangeIds: new Set<string>(),
+    personSettlementSeen: false,
+  };
+  const failed: BulkExchangeApproveResult["failed"] = [];
+  let approved = 0;
+
+  for (const depositId of uniqueIds) {
+    try {
+      const doc = await DepositModel.findById(depositId).select("status player bonusAmount").lean();
+      if (!doc) {
+        failed.push({ depositId, error: "Deposit not found" });
+        continue;
+      }
+      if (doc.status !== "pending") {
+        failed.push({ depositId, error: "Only pending deposits with import player/bonus can be bulk approved" });
+        continue;
+      }
+      if (!doc.player) {
+        failed.push({ depositId, error: "Deposit has no player linked" });
+        continue;
+      }
+      if (doc.bonusAmount == null || !Number.isFinite(Number(doc.bonusAmount))) {
+        failed.push({ depositId, error: "Deposit has no bonus amount" });
+        continue;
+      }
+
+      await exchangeApproveDeposit(
+        depositId,
+        { playerId: String(doc.player), bonusAmount: Number(doc.bonusAmount) },
+        actorId,
+        requestId,
+        { deferSideEffects: true, bulkContext },
+      );
+      approved += 1;
+    } catch (err) {
+      failed.push({ depositId, error: exchangeApproveErrorMessage(err) });
+    }
+  }
+
+  if (approved > 0) {
+    emitApprovalQueueEvent("deposit", "exchange");
+    for (const exchangeId of bulkContext.exchangeIds) {
+      try {
+        await enqueueExchangeRecompute(exchangeId);
+      } catch (err) {
+        logger.error({ err, exchangeId, requestId }, "Bulk exchange approve recompute failed");
+      }
+    }
+    try {
+      await invalidateCacheDomains(
+        bulkContext.personSettlementSeen
+          ? ["deposit", "exchange", "referral", "player", "liability"]
+          : ["deposit", "exchange", "referral", "player"],
+      );
+    } catch (err) {
+      logger.error({ err, requestId }, "Bulk exchange approve cache invalidation failed");
+    }
+
+    setImmediate(() => {
+      void createAuditLog({
+        actorId,
+        action: "deposit.bulk_exchange_approve",
+        entity: "deposit",
+        entityId: "bulk",
+        newValue: {
+          requestedCount: uniqueIds.length,
+          approved,
+          failedCount: failed.length,
+          failedSample: failed.slice(0, 20),
+        },
+        requestId,
+      }).catch((err) => {
+        logger.error({ err, requestId }, "Bulk exchange approve summary audit failed");
+      });
+    });
+  }
+
+  return { approved, failed };
 }
 
 export async function exchangeMarkNotSettled(id: string, actorId: string, requestId?: string) {
@@ -1857,55 +1978,243 @@ export async function validateDepositImportRows(
   };
 }
 
-export async function commitDepositImportRows(
-  rows: Array<{
-    utr: string;
-    amount: number;
-    entryAt?: string;
-    settlementAccountType: "bank" | "person";
-    bankId?: string;
-    liabilityPersonId?: string;
-    playerMongoId?: string;
-    bonusAmount?: number;
-    totalAmount?: number;
-  }>,
+export type DepositImportCommitRow = {
+  utr: string;
+  amount: number;
+  entryAt?: string;
+  settlementAccountType: "bank" | "person";
+  bankId?: string;
+  liabilityPersonId?: string;
+  playerMongoId?: string;
+  bonusAmount?: number;
+  totalAmount?: number;
+};
+
+type DepositImportCommitError = { row: number; utr: string; error: string };
+
+type IndexedDepositImportRow = { index: number; row: DepositImportCommitRow };
+
+type BankImportLean = {
+  _id: Types.ObjectId;
+  holderName: string;
+  bankName: string;
+  accountNumber: string;
+  status: string;
+};
+
+type PersonImportLean = {
+  _id: Types.ObjectId;
+  name: string;
+  isActive: boolean;
+};
+
+async function loadDepositImportLookups(rows: DepositImportCommitRow[]) {
+  const bankIdSet = new Set<string>();
+  const personIdSet = new Set<string>();
+  for (const row of rows) {
+    if (row.bankId && Types.ObjectId.isValid(row.bankId)) bankIdSet.add(row.bankId);
+    if (row.liabilityPersonId && Types.ObjectId.isValid(row.liabilityPersonId)) {
+      personIdSet.add(row.liabilityPersonId);
+    }
+  }
+  const [banks, persons] = await Promise.all([
+    bankIdSet.size > 0
+      ? BankModel.find({ _id: { $in: [...bankIdSet].map((id) => new Types.ObjectId(id)) } })
+          .select("holderName bankName accountNumber status")
+          .lean()
+      : [],
+    personIdSet.size > 0
+      ? LiabilityPersonModel.find({ _id: { $in: [...personIdSet].map((id) => new Types.ObjectId(id)) } })
+          .select("name isActive")
+          .lean()
+      : [],
+  ]);
+  return {
+    bankById: new Map(banks.map((b) => [String(b._id), b as BankImportLean])),
+    personById: new Map(persons.map((p) => [String(p._id), p as PersonImportLean])),
+  };
+}
+
+async function findConflictingUtrsInDb(utrs: string[]): Promise<Set<string>> {
+  const normalized = [...new Set(utrs.map((u) => normalizeUtr(u)).filter(Boolean))];
+  if (normalized.length === 0) return new Set();
+  const utrMatchers = normalized.map((u) => new RegExp(`^${escapeUtrRegex(u)}$`, "i"));
+  const [depConflicts, wdConflicts] = await Promise.all([
+    DepositModel.find({ utr: { $in: utrMatchers }, status: { $ne: "rejected" } })
+      .select({ utr: 1 })
+      .lean(),
+    WithdrawalModel.find({ utr: { $in: utrMatchers }, status: { $ne: "rejected" } })
+      .select({ utr: 1 })
+      .lean(),
+  ]);
+  const conflicts = new Set<string>();
+  for (const d of depConflicts) conflicts.add(normalizeUtr(d.utr));
+  for (const w of wdConflicts) if (w.utr) conflicts.add(normalizeUtr(w.utr));
+  return conflicts;
+}
+
+function buildDepositImportInsertDoc(
+  row: DepositImportCommitRow,
+  actorOid: Types.ObjectId,
+  bankById: Map<string, BankImportLean>,
+  personById: Map<string, PersonImportLean>,
+): Record<string, unknown> | { error: string; ok?: false } {
+  const mode = row.settlementAccountType ?? "bank";
+  const base: Record<string, unknown> = {
+    utr: normalizeUtr(row.utr),
+    amount: row.amount,
+    status: "pending",
+    entryAt: row.entryAt ? parseBusinessDateTime(row.entryAt, "entryAt") : new Date(),
+    createdBy: actorOid,
+    settlementAccountType: mode,
+    amendmentCount: 0,
+    amendmentHistory: [],
+  };
+
+  if (row.playerMongoId?.trim()) {
+    if (!Types.ObjectId.isValid(row.playerMongoId)) {
+      return { error: "Invalid player reference" };
+    }
+    const bonus = Math.round(Number(row.bonusAmount ?? 0));
+    const totalAmount =
+      row.totalAmount != null ? Math.round(row.totalAmount) : Math.round(row.amount + bonus);
+    base.player = new Types.ObjectId(row.playerMongoId);
+    base.bonusAmount = bonus;
+    base.totalAmount = totalAmount;
+  }
+
+  if (mode === "bank") {
+    const bankIdStr = row.bankId?.trim();
+    if (!bankIdStr) return { error: "Bank is required" };
+    const bank = bankById.get(bankIdStr);
+    if (!bank) return { error: "Bank not found" };
+    if (bank.status !== "active") return { error: "Bank is not active" };
+    return {
+      ...base,
+      bankId: new Types.ObjectId(bankIdStr),
+      bankName: bankDisplayName(bank),
+      bankImpact: true,
+    };
+  }
+
+  const personIdStr = row.liabilityPersonId?.trim();
+  if (!personIdStr) return { error: "Liability person is required" };
+  const person = personById.get(personIdStr);
+  if (!person) return { error: "Liability person not found" };
+  if (!person.isActive) return { error: "Liability person is inactive" };
+  return {
+    ...base,
+    liabilityPersonId: new Types.ObjectId(personIdStr),
+    liabilityPersonName: person.name.trim(),
+    bankImpact: false,
+    bankName: "",
+  };
+}
+
+function isMongooseBulkWriteError(err: unknown): err is {
+  insertedDocs?: unknown[];
+  result?: { insertedCount?: number };
+  writeErrors?: Array<{ index: number; errmsg?: string; code?: number }>;
+} {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    ("writeErrors" in err || "insertedDocs" in err || "result" in err)
+  );
+}
+
+function bulkWriteErrorMessage(writeError: { errmsg?: string; code?: number }): string {
+  if (writeError.code === 11000) return "UTR already exists in another transaction";
+  return writeError.errmsg || "Insert failed";
+}
+
+export async function applyDepositImportRows(
+  rows: DepositImportCommitRow[],
   actorId: string,
-  requestId?: string,
   options?: {
+    chunkSize?: number;
     onProgress?: (progress: DepositImportCommitProgress) => Promise<void> | void;
   },
-): Promise<{ created: number; errors: Array<{ row: number; utr: string; error: string }> }> {
-  let created = 0;
-  const errors: Array<{ row: number; utr: string; error: string }> = [];
+): Promise<{ created: number; errors: DepositImportCommitError[] }> {
+  const actorOid = new Types.ObjectId(actorId);
+  const chunkSize = options?.chunkSize ?? DEPOSIT_IMPORT_CHUNK_SIZE;
   const totalRows = rows.length;
+  let created = 0;
+  const errors: DepositImportCommitError[] = [];
+  const jobUtrSet = new Set<string>();
 
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    try {
-      await createDeposit(
-        {
-          utr: row.utr,
-          amount: row.amount,
-          entryAt: row.entryAt,
-          settlementAccountType: row.settlementAccountType,
-          bankId: row.bankId,
-          liabilityPersonId: row.liabilityPersonId,
-          playerMongoId: row.playerMongoId,
-          bonusAmount: row.bonusAmount,
-          totalAmount: row.totalAmount,
-        },
-        actorId,
-        requestId,
-      );
-      created++;
-    } catch (err: unknown) {
-      const msg = err instanceof AppError ? err.message : "Unexpected error";
-      errors.push({ row: i + 1, utr: row.utr, error: msg });
+  const indexedRows: IndexedDepositImportRow[] = rows.map((row, index) => ({ index, row }));
+  const { bankById, personById } = await loadDepositImportLookups(rows);
+  const chunks = chunkArray(indexedRows, chunkSize);
+  let processedRows = 0;
+
+  for (const chunk of chunks) {
+    const chunkUtrs = chunk.map((c) => c.row.utr).filter(Boolean);
+    const dbConflicts = await findConflictingUtrsInDb(chunkUtrs);
+
+    const pendingInserts: Array<{ doc: Record<string, unknown>; item: IndexedDepositImportRow }> = [];
+
+    for (const item of chunk) {
+      const normalizedUtr = normalizeUtr(item.row.utr);
+      if (dbConflicts.has(normalizedUtr) || jobUtrSet.has(normalizedUtr)) {
+        errors.push({
+          row: item.index + 1,
+          utr: item.row.utr,
+          error: "UTR already exists in another transaction",
+        });
+        continue;
+      }
+
+      const built = buildDepositImportInsertDoc(item.row, actorOid, bankById, personById);
+      if ("error" in built && typeof built.error === "string") {
+        errors.push({ row: item.index + 1, utr: item.row.utr, error: built.error });
+        continue;
+      }
+
+      jobUtrSet.add(normalizedUtr);
+      pendingInserts.push({ doc: built, item });
     }
+
+    if (pendingInserts.length > 0) {
+      try {
+        const inserted = await DepositModel.insertMany(
+          pendingInserts.map((p) => p.doc),
+          { ordered: false },
+        );
+        created += inserted.length;
+      } catch (err: unknown) {
+        if (isMongooseBulkWriteError(err)) {
+          const insertedCount =
+            err.insertedDocs?.length ?? err.result?.insertedCount ?? 0;
+          created += insertedCount;
+          for (const we of err.writeErrors ?? []) {
+            const pending = pendingInserts[we.index];
+            if (!pending) continue;
+            jobUtrSet.delete(normalizeUtr(pending.item.row.utr));
+            errors.push({
+              row: pending.item.index + 1,
+              utr: pending.item.row.utr,
+              error: bulkWriteErrorMessage(we),
+            });
+          }
+        } else {
+          for (const pending of pendingInserts) {
+            jobUtrSet.delete(normalizeUtr(pending.item.row.utr));
+            errors.push({
+              row: pending.item.index + 1,
+              utr: pending.item.row.utr,
+              error: err instanceof Error ? err.message : "Unexpected error",
+            });
+          }
+        }
+      }
+    }
+
+    processedRows += chunk.length;
     if (options?.onProgress) {
       await options.onProgress({
         totalRows,
-        processedRows: i + 1,
+        processedRows,
         created,
         errors,
       });
@@ -1913,6 +2222,62 @@ export async function commitDepositImportRows(
   }
 
   return { created, errors };
+}
+
+function scheduleDepositImportSummaryAudit(
+  payload: {
+    actorId: string;
+    requestId?: string;
+    created: number;
+    failed: number;
+    totalRows: number;
+  },
+): void {
+  setImmediate(() => {
+    void createAuditLog({
+      actorId: payload.actorId,
+      action: "deposit.import",
+      entity: "deposit",
+      entityId: "bulk",
+      newValue: {
+        created: payload.created,
+        failed: payload.failed,
+        totalRows: payload.totalRows,
+      },
+      requestId: payload.requestId,
+    }).catch((err) => {
+      logger.warn({ err }, "deposit import summary audit failed");
+    });
+  });
+}
+
+export async function commitDepositImportRows(
+  rows: DepositImportCommitRow[],
+  actorId: string,
+  requestId?: string,
+  options?: {
+    chunkSize?: number;
+    onProgress?: (progress: DepositImportCommitProgress) => Promise<void> | void;
+  },
+): Promise<{ created: number; errors: DepositImportCommitError[] }> {
+  const result = await applyDepositImportRows(rows, actorId, {
+    chunkSize: options?.chunkSize ?? DEPOSIT_IMPORT_CHUNK_SIZE,
+    onProgress: options?.onProgress,
+  });
+
+  if (result.created > 0) {
+    emitApprovalQueueEvent("deposit", "exchange");
+  }
+
+  scheduleDepositImportSummaryAudit({
+    actorId,
+    requestId,
+    created: result.created,
+    failed: result.errors.length,
+    totalRows: rows.length,
+  });
+
+  return result;
 }
 
 export type DepositImportCommitProgress = {

@@ -8,6 +8,7 @@ import { createAuditLog } from "../audit/audit.service";
 import {
   buildDepositImportErrorCsv,
   commitDepositImportRows,
+  DEPOSIT_IMPORT_CHUNK_SIZE,
   type DepositImportCommitProgress,
 } from "./deposit.service";
 import { closeDepositImportEventStream, emitDepositImportEvent } from "./deposit-import-events";
@@ -22,7 +23,6 @@ const WORKER_ID = `pid-${process.pid}`;
 const LOCK_STALE_MS = 60_000;
 const POLL_INTERVAL_MS = 2_000;
 const MAX_ERROR_SAMPLE = 200;
-const PROGRESS_EVERY_ROWS = 25;
 
 let fallbackWorkerStarted = false;
 let fallbackTimer: NodeJS.Timeout | null = null;
@@ -275,10 +275,8 @@ async function processSingleJob(jobId: string) {
     await emitCurrentProgress(jobId);
 
     const result = await commitDepositImportRows(job.rows, job.createdBy.toString(), undefined, {
+      chunkSize: DEPOSIT_IMPORT_CHUNK_SIZE,
       onProgress: async (progress: DepositImportCommitProgress) => {
-        if (progress.processedRows % PROGRESS_EVERY_ROWS !== 0 && progress.processedRows !== progress.totalRows) {
-          return;
-        }
         await DepositImportJobModel.updateOne(
           { _id: job._id },
           {

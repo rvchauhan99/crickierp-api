@@ -12,6 +12,7 @@ import {
   createDepositImportJobController,
   deleteDepositController,
   downloadDepositImportJobErrorCsvController,
+  bulkExchangeApproveController,
   exchangeActionController,
   exportDepositController,
   getDepositImportJobController,
@@ -29,6 +30,7 @@ import {
   commitDepositImportBodySchema,
   createDepositImportJobBodySchema,
   createDepositBodySchema,
+  bulkExchangeApproveBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
   updateDepositBodySchema,
@@ -129,6 +131,13 @@ depositRouter.get(
   depositListPermissionMiddleware,
   validate({ query: listDepositQuerySchema }),
   listDepositController,
+);
+
+depositRouter.post(
+  "/bulk-exchange-approve",
+  permissionMiddleware(PERMISSIONS.DEPOSIT_EXCHANGE),
+  validate({ body: bulkExchangeApproveBodySchema }),
+  bulkExchangeApproveController,
 );
 
 depositRouter.post(

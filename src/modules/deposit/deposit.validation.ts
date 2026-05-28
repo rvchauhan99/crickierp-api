@@ -86,6 +86,14 @@ export const approvalQueueEventsQuerySchema = z.object({
   view: z.enum(["banker", "exchange"]),
 });
 
+export const bulkExchangeApproveBodySchema = z.object({
+  depositIds: z
+    .array(z.string().length(24))
+    .min(1)
+    .max(200)
+    .refine((ids) => new Set(ids).size === ids.length, { message: "Duplicate deposit ids are not allowed" }),
+});
+
 export const exchangeActionBodySchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("mark_not_settled"),
@@ -106,7 +114,7 @@ export const exchangeActionBodySchema = z.discriminatedUnion("action", [
 export const amendDepositBodySchema = z.object({
   bankId: z.string().length(24).optional(),
   utr: z.string().min(4).max(120).trim(),
-  amount: z.number().int().min(1),
+  amount: z.number().int().min(0),
   playerId: z.string().length(24),
   bonusAmount: z.number().int().min(0),
   entryAt: optionalDateTime,

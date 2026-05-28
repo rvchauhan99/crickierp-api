@@ -97,7 +97,7 @@ export const updateWithdrawalStatusBodySchema = z.discriminatedUnion("status", [
 ]);
 
 export const amendWithdrawalBodySchema = z.object({
-  amount: z.number().int().min(1),
+  amount: z.number().int().min(0),
   reverseBonus: z.number().int().min(0),
   payoutBankId: z.string().length(24).optional(),
   utr: z.string().min(4).max(120).trim(),
