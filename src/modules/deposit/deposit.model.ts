@@ -99,7 +99,7 @@ const depositSchema = new Schema<DepositDocument>(
     liabilityPersonName: { type: String, trim: true, default: "" },
     liabilityEntryId: { type: Schema.Types.ObjectId, ref: "LiabilityEntry" },
     utr: { type: String, required: true, trim: true },
-    amount: { type: Number, required: true, min: 1 },
+    amount: { type: Number, required: true, min: 0 },
     status: {
       type: String,
       enum: ["pending", "not_settled", "verified", "rejected", "finalized"],

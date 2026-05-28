@@ -315,6 +315,102 @@ describe("Backdated entry datetime integration", () => {
     expect(historyAtMs).toBeLessThanOrEqual(after + 1000);
   });
 
+  it("amends approved withdrawal to amount zero (bank refund scenario)", async () => {
+    const createRes = await request(app)
+      .post("/api/v1/withdrawal")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        playerId,
+        accountNumber: "808080808080",
+        accountHolderName: "Zero Amend Withdrawal Holder",
+        bankName: "Zero Amend Withdrawal Bank",
+        ifsc: "BKID0000888",
+        amount: 1000,
+        reverseBonus: 0,
+      });
+    expect(createRes.status).toBe(201);
+    const withdrawalId = String(createRes.body.data._id);
+
+    const approveRes = await request(app)
+      .patch(`/api/v1/withdrawal/${withdrawalId}/banker-payout`)
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        bankId,
+        utr: "BD-WDR-AMEND-ZERO-001",
+      });
+    expect(approveRes.status).toBe(200);
+
+    const bankAfterApprove = await BankModel.findById(bankId).lean();
+    const balanceAfterApprove = Number(bankAfterApprove?.currentBalance ?? 0);
+
+    const amendRes = await request(app)
+      .post(`/api/v1/withdrawal/${withdrawalId}/amend`)
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        amount: 0,
+        reverseBonus: 0,
+        payoutBankId: bankId,
+        utr: "BD-WDR-AMEND-ZERO-002",
+        reasonId: withdrawalAmendReasonId,
+        remark: "bank transaction refunded",
+      });
+    expect(amendRes.status).toBe(200);
+
+    const saved = await WithdrawalModel.findById(withdrawalId).lean();
+    expect(saved?.amount).toBe(0);
+    expect(saved?.payableAmount).toBe(0);
+
+    const bankAfterAmend = await BankModel.findById(bankId).lean();
+    expect(Number(bankAfterAmend?.currentBalance ?? 0)).toBe(balanceAfterApprove + 1000);
+  });
+
+  it("amends verified deposit to amount zero (bank refund scenario)", async () => {
+    const createRes = await request(app)
+      .post("/api/v1/deposit")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        bankId,
+        utr: "BD-DEP-AMEND-ZERO-001",
+        amount: 1000,
+      });
+    expect(createRes.status).toBe(201);
+    const depositId = String(createRes.body.data._id);
+
+    const verifyRes = await request(app)
+      .post(`/api/v1/deposit/${depositId}/exchange-action`)
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        action: "approve",
+        playerId,
+        bonusAmount: 0,
+      });
+    expect(verifyRes.status).toBe(200);
+
+    const bankAfterVerify = await BankModel.findById(bankId).lean();
+    const balanceAfterVerify = Number(bankAfterVerify?.currentBalance ?? 0);
+
+    const amendRes = await request(app)
+      .post(`/api/v1/deposit/${depositId}/amend`)
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        bankId,
+        utr: "BD-DEP-AMEND-ZERO-002",
+        amount: 0,
+        playerId,
+        bonusAmount: 0,
+        reasonId: depositAmendReasonId,
+        remark: "bank transaction refunded",
+      });
+    expect(amendRes.status).toBe(200);
+
+    const saved = await DepositModel.findById(depositId).lean();
+    expect(saved?.amount).toBe(0);
+    expect(saved?.totalAmount).toBe(0);
+
+    const bankAfterAmend = await BankModel.findById(bankId).lean();
+    expect(Number(bankAfterAmend?.currentBalance ?? 0)).toBe(balanceAfterVerify - 1000);
+  });
+
   it("rejects invalid amendment datetime for deposit and withdrawal", async () => {
     const depositCreateRes = await request(app)
       .post("/api/v1/deposit")

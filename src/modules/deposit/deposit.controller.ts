@@ -8,6 +8,7 @@ import {
   commitDepositImportRows,
   createDeposit,
   deleteDepositWithReversal,
+  bulkExchangeApproveDeposits,
   exchangeApproveDeposit,
   exchangeMarkNotSettled,
   exchangeRejectDeposit,
@@ -27,6 +28,7 @@ import {
   commitDepositImportBodySchema,
   createDepositImportJobBodySchema,
   createDepositBodySchema,
+  bulkExchangeApproveBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
   updateDepositBodySchema,
@@ -107,6 +109,12 @@ export async function exchangeActionController(req: Request, res: Response) {
     req.user!.userId,
     req.requestId,
   );
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function bulkExchangeApproveController(req: Request, res: Response) {
+  const body = bulkExchangeApproveBodySchema.parse(req.body);
+  const data = await bulkExchangeApproveDeposits(body.depositIds, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
