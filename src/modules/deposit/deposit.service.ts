@@ -10,9 +10,11 @@ import {
 } from "../../shared/utils/importDateTime";
 import {
   buildBankResolutionCache,
+  buildExchangePlayerResolutionCache,
   buildPersonResolutionCache,
   loadBanksForImportIdentifiers,
   loadLiabilityPersonsForImportNames,
+  loadPlayersForImportPlayerIds,
 } from "./deposit-import-resolve";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
@@ -48,6 +50,12 @@ import { LiabilityPersonModel } from "../liability/liability-person.model";
 type ListDepositQuery = z.infer<typeof listDepositQuerySchema>;
 type AmendDepositInput = z.infer<typeof amendDepositBodySchema>;
 type BankerDepositCreateInput = z.infer<typeof createDepositBodySchema>;
+
+type CreateDepositInput = BankerDepositCreateInput & {
+  playerMongoId?: string;
+  bonusAmount?: number;
+  totalAmount?: number;
+};
 type DuplicateTransactionContext = {
   type: "deposit" | "withdrawal";
   id: string;
@@ -356,9 +364,38 @@ async function ensureGlobalUtrUniqueForDeposit(utr: string, excludeDepositId?: T
   }
 }
 
-export async function createDeposit(input: BankerDepositCreateInput, actorId: string, requestId?: string) {
+async function resolveImportPlayerFields(input: CreateDepositInput): Promise<{
+  player?: Types.ObjectId;
+  bonusAmount?: number;
+  totalAmount?: number;
+}> {
+  if (!input.playerMongoId?.trim()) return {};
+  if (!Types.ObjectId.isValid(input.playerMongoId)) {
+    throw new AppError("validation_error", "Invalid player reference", 400);
+  }
+  const player = await PlayerModel.findById(input.playerMongoId).select("_id").lean();
+  if (!player) throw new AppError("not_found", "Player not found", 404);
+
+  const bonus = Math.round(Number(input.bonusAmount ?? 0));
+  if (!Number.isFinite(bonus) || bonus < 0) {
+    throw new AppError("validation_error", "Invalid bonus amount", 400);
+  }
+  const totalAmount =
+    input.totalAmount != null
+      ? Math.round(input.totalAmount)
+      : Math.round(input.amount + bonus);
+
+  return {
+    player: new Types.ObjectId(input.playerMongoId),
+    bonusAmount: bonus,
+    totalAmount,
+  };
+}
+
+export async function createDeposit(input: CreateDepositInput, actorId: string, requestId?: string) {
   await ensureGlobalUtrUniqueForDeposit(input.utr);
   const mode = input.settlementAccountType ?? "bank";
+  const playerFields = await resolveImportPlayerFields(input);
 
   const base = {
     utr: normalizeUtr(input.utr),
@@ -367,6 +404,7 @@ export async function createDeposit(input: BankerDepositCreateInput, actorId: st
     entryAt: parseBusinessDateTime(input.entryAt, "entryAt"),
     createdBy: new Types.ObjectId(actorId),
     settlementAccountType: mode as "bank" | "person",
+    ...playerFields,
   };
 
   if (mode === "bank") {
@@ -1503,6 +1541,10 @@ export type DepositImportValidRow = {
   bankDisplayLabel?: string;
   liabilityPersonId?: string;
   liabilityPersonName?: string;
+  playerMongoId?: string;
+  playerIdLabel?: string;
+  bonusAmount?: number;
+  totalAmount?: number;
 };
 
 export type DepositImportInvalidRow = {
@@ -1511,6 +1553,8 @@ export type DepositImportInvalidRow = {
   settlementType: string;
   bankAccountNumber: string;
   liablePersonName: string;
+  playerId: string;
+  bonusAmount: string;
   utr: string;
   amount: string;
   errors: string[];
@@ -1540,7 +1584,7 @@ function importReadRows(buffer: Buffer, originalName: string): Record<string, un
   if (!lower.endsWith(".csv") && !lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
     throw new AppError("validation_error", "Unsupported file type. Use .csv, .xlsx, or .xls", 400);
   }
-  const wb = xlsx.read(buffer, { type: "buffer", cellDates: true });
+  const wb = xlsx.read(buffer, { type: "buffer", cellDates: false });
   const sheetName = wb.SheetNames[0];
   if (!sheetName) {
     throw new AppError("validation_error", "File is empty or has no sheets", 400);
@@ -1554,7 +1598,9 @@ const DEPOSIT_IMPORT_INVALID_DATE_MESSAGE =
 export async function validateDepositImportRows(
   buffer: Buffer,
   originalName: string,
+  options?: { timeZone?: string },
 ): Promise<DepositImportValidationResult> {
+  const importTimeZone = options?.timeZone ?? DEFAULT_TIMEZONE;
   const rows = importReadRows(buffer, originalName);
   if (rows.length === 0) {
     throw new AppError("validation_error", "File contains no data rows", 400);
@@ -1569,12 +1615,15 @@ export async function validateDepositImportRows(
 
   const allBankIdentifiers: string[] = [];
   const allPersonNames: string[] = [];
+  const allPlayerIds: string[] = [];
   const rowDataList: Array<{
     rowNum: number;
     dateTimeValue: unknown;
     settlementType: string;
     bankIdentifier: string;
     personName: string;
+    playerIdRaw: string;
+    bonusAmountRaw: string;
     utr: string;
     amountRaw: string;
   }> = [];
@@ -1588,25 +1637,41 @@ export async function validateDepositImportRows(
     const settlementType = importPickCell(row, "settlement type", "settlement_type", "settlementtype", "type");
     const bankIdentifier = importPickCell(row, "bank", "bank account number", "bank_account_number", "bankaccountnumber", "account_number", "account number", "accountnumber", "holder name", "holdername", "holder_name", "bank holder", "bankholder");
     const personName = importPickCell(row, "liable person name", "liable_person_name", "liablepersonname", "person_name", "person name", "personname", "liability person", "liabilityperson");
+    const playerIdRaw = importPickCell(row, "player id", "playerid", "player_id", "player");
+    const bonusAmountRaw = importPickCell(row, "bonus amount", "bonusamount", "bonus");
 
-    if (!utr && !amountRaw && !bankIdentifier && !personName) {
+    if (!utr && !amountRaw && !bankIdentifier && !personName && !playerIdRaw && !bonusAmountRaw) {
       skipped++;
       continue;
     }
 
-    rowDataList.push({ rowNum, dateTimeValue, settlementType, bankIdentifier, personName, utr, amountRaw });
+    rowDataList.push({
+      rowNum,
+      dateTimeValue,
+      settlementType,
+      bankIdentifier,
+      personName,
+      playerIdRaw,
+      bonusAmountRaw,
+      utr,
+      amountRaw,
+    });
     if (bankIdentifier) allBankIdentifiers.push(bankIdentifier.trim().toLowerCase());
     if (personName) allPersonNames.push(personName.toLowerCase());
+    if (playerIdRaw) allPlayerIds.push(playerIdRaw.trim().toLowerCase());
   }
 
   const uniqueBankIdentifiers = [...new Set(allBankIdentifiers)];
   const uniquePersonNames = [...new Set(allPersonNames)];
+  const uniquePlayerIds = [...new Set(allPlayerIds)];
 
   const bankMaps = await loadBanksForImportIdentifiers(uniqueBankIdentifiers);
   const personMap = await loadLiabilityPersonsForImportNames(uniquePersonNames);
+  const exchangePlayerMap = await loadPlayersForImportPlayerIds(uniquePlayerIds);
 
   const bankResolutionCache = buildBankResolutionCache(uniqueBankIdentifiers, bankMaps);
   const personResolutionCache = buildPersonResolutionCache(uniquePersonNames, personMap);
+  const exchangePlayerResolutionCache = buildExchangePlayerResolutionCache(uniquePlayerIds, exchangePlayerMap);
 
   const seenUtrs = new Set<string>();
   const existingUtrChecks = rowDataList.map((r) => r.utr).filter(Boolean);
@@ -1660,7 +1725,7 @@ export async function validateDepositImportRows(
 
     let parsedDate: Date | null = null;
     if (isImportDateTimePresent(rd.dateTimeValue)) {
-      parsedDate = parseImportDateTime(rd.dateTimeValue);
+      parsedDate = parseImportDateTime(rd.dateTimeValue, importTimeZone);
       if (!parsedDate) {
         rowErrors.push(DEPOSIT_IMPORT_INVALID_DATE_MESSAGE);
       }
@@ -1670,6 +1735,44 @@ export async function validateDepositImportRows(
     let resolvedBankDisplay: string | undefined;
     let resolvedPersonId: string | undefined;
     let resolvedPersonName: string | undefined;
+    let resolvedPlayerMongoId: string | undefined;
+    let resolvedPlayerIdLabel: string | undefined;
+    let resolvedBonusAmount: number | undefined;
+    let resolvedTotalAmount: number | undefined;
+
+    const hasBonusRaw = rd.bonusAmountRaw.trim() !== "";
+    const hasPlayerIdRaw = rd.playerIdRaw.trim() !== "";
+
+    if (hasBonusRaw && !hasPlayerIdRaw) {
+      rowErrors.push("Bonus Amount requires a Player Id");
+    }
+
+    if (hasPlayerIdRaw) {
+      const playerKey = rd.playerIdRaw.trim().toLowerCase();
+      const playerResult = exchangePlayerResolutionCache.get(playerKey);
+      if (playerResult?.status === "ambiguous") {
+        rowErrors.push(
+          `Multiple players found with Player Id "${rd.playerIdRaw}". Player Id must be unique across exchanges in this file.`,
+        );
+      } else if (!playerResult || playerResult.status === "not_found") {
+        rowErrors.push(`Player "${rd.playerIdRaw}" not found`);
+      } else {
+        resolvedPlayerMongoId = playerResult.id;
+        resolvedPlayerIdLabel = playerResult.playerIdLabel;
+        if (hasBonusRaw) {
+          const bonus = Number(rd.bonusAmountRaw);
+          if (Number.isNaN(bonus) || bonus < 0) {
+            rowErrors.push("Bonus Amount must be a whole number >= 0");
+          } else if (!Number.isInteger(bonus)) {
+            rowErrors.push("Bonus Amount must be a whole number (no decimals)");
+          } else {
+            resolvedBonusAmount = bonus;
+          }
+        } else {
+          resolvedBonusAmount = 0;
+        }
+      }
+    }
 
     if (mode === "bank") {
       if (!rd.bankIdentifier) {
@@ -1705,6 +1808,10 @@ export async function validateDepositImportRows(
       }
     }
 
+    if (resolvedPlayerMongoId != null && resolvedBonusAmount != null && rowErrors.length === 0) {
+      resolvedTotalAmount = Math.round(amt + resolvedBonusAmount);
+    }
+
     if (rowErrors.length > 0) {
       invalidRows.push({
         row: rd.rowNum,
@@ -1712,6 +1819,8 @@ export async function validateDepositImportRows(
         settlementType: rd.settlementType || "Bank",
         bankAccountNumber: rd.bankIdentifier,
         liablePersonName: rd.personName,
+        playerId: rd.playerIdRaw,
+        bonusAmount: rd.bonusAmountRaw,
         utr: rd.utr,
         amount: rd.amountRaw,
         errors: rowErrors,
@@ -1728,6 +1837,10 @@ export async function validateDepositImportRows(
         bankDisplayLabel: resolvedBankDisplay,
         liabilityPersonId: resolvedPersonId,
         liabilityPersonName: resolvedPersonName,
+        playerMongoId: resolvedPlayerMongoId,
+        playerIdLabel: resolvedPlayerIdLabel,
+        bonusAmount: resolvedBonusAmount,
+        totalAmount: resolvedTotalAmount,
       });
     }
   }
@@ -1752,6 +1865,9 @@ export async function commitDepositImportRows(
     settlementAccountType: "bank" | "person";
     bankId?: string;
     liabilityPersonId?: string;
+    playerMongoId?: string;
+    bonusAmount?: number;
+    totalAmount?: number;
   }>,
   actorId: string,
   requestId?: string,
@@ -1774,6 +1890,9 @@ export async function commitDepositImportRows(
           settlementAccountType: row.settlementAccountType,
           bankId: row.bankId,
           liabilityPersonId: row.liabilityPersonId,
+          playerMongoId: row.playerMongoId,
+          bonusAmount: row.bonusAmount,
+          totalAmount: row.totalAmount,
         },
         actorId,
         requestId,
@@ -1808,6 +1927,8 @@ const DEPOSIT_IMPORT_SAMPLE_COLUMNS = [
   "Settlement Type",
   "Bank",
   "Liable Person Name",
+  "Player Id",
+  "Bonus Amount",
   "UTR",
   "Amount",
 ] as const;
@@ -1823,6 +1944,8 @@ export function getDepositImportSampleRows(): Array<Record<string, string>> {
       "Settlement Type": "Bank",
       Bank: "1234567890",
       "Liable Person Name": "",
+      "Player Id": "PLAYER001",
+      "Bonus Amount": "500",
       UTR: "TXN001ABC",
       Amount: "5000",
     },
@@ -1831,6 +1954,8 @@ export function getDepositImportSampleRows(): Array<Record<string, string>> {
       "Settlement Type": "",
       Bank: "Rajesh Kumar",
       "Liable Person Name": "",
+      "Player Id": "",
+      "Bonus Amount": "",
       UTR: "TXN002DEF",
       Amount: "3000",
     },
@@ -1839,6 +1964,8 @@ export function getDepositImportSampleRows(): Array<Record<string, string>> {
       "Settlement Type": "Person",
       Bank: "",
       "Liable Person Name": "John Doe",
+      "Player Id": "",
+      "Bonus Amount": "",
       UTR: "TXN003GHI",
       Amount: "2500",
     },
@@ -1874,7 +2001,8 @@ export function buildDepositImportSampleXlsx(): Buffer {
 }
 
 export function buildDepositImportErrorCsv(invalidRows: DepositImportInvalidRow[]): Buffer {
-  const header = "Row,Date Time,Settlement Type,Bank,Liable Person Name,UTR,Amount,Error";
+  const header =
+    "Row,Date Time,Settlement Type,Bank,Liable Person Name,Player Id,Bonus Amount,UTR,Amount,Error";
   const lines = [header];
   for (const r of invalidRows) {
     lines.push(
@@ -1884,6 +2012,8 @@ export function buildDepositImportErrorCsv(invalidRows: DepositImportInvalidRow[
         quoteCsvVal(r.settlementType),
         quoteCsvVal(r.bankAccountNumber),
         quoteCsvVal(r.liablePersonName),
+        quoteCsvVal(r.playerId),
+        quoteCsvVal(r.bonusAmount),
         quoteCsvVal(r.utr),
         quoteCsvVal(r.amount),
         quoteCsvVal(r.errors.join("; ")),

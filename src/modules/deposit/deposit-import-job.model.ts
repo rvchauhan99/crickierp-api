@@ -9,6 +9,9 @@ export interface DepositImportJobInputRow {
   settlementAccountType: "bank" | "person";
   bankId?: string;
   liabilityPersonId?: string;
+  playerMongoId?: string;
+  bonusAmount?: number;
+  totalAmount?: number;
 }
 
 export interface DepositImportJobErrorItem {
@@ -53,6 +56,9 @@ const rowSchema = new Schema<DepositImportJobInputRow>(
     settlementAccountType: { type: String, enum: ["bank", "person"], required: true, default: "bank" },
     bankId: { type: String, required: false },
     liabilityPersonId: { type: String, required: false },
+    playerMongoId: { type: String, required: false },
+    bonusAmount: { type: Number, required: false, min: 0 },
+    totalAmount: { type: Number, required: false, min: 1 },
   },
   { _id: false },
 );

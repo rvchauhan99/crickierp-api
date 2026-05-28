@@ -1,10 +1,13 @@
 import {
   buildBankResolutionCache,
+  buildExchangePlayerResolutionCache,
   buildPersonResolutionCache,
   resolveBankImportKey,
+  resolveExchangePlayerImportKey,
   resolvePersonImportKey,
   type BankImportMaps,
   type BankImportRecord,
+  type ExchangePlayerImportMap,
 } from "../src/modules/deposit/deposit-import-resolve";
 
 describe("deposit-import-resolve", () => {
@@ -103,6 +106,29 @@ describe("deposit-import-resolve", () => {
     });
   });
 
+  describe("resolveExchangePlayerImportKey", () => {
+    const playerMap: ExchangePlayerImportMap = new Map([
+      ["player001", { id: "mongo-1", playerIdLabel: "PLAYER001" }],
+    ]);
+
+    it("resolves exchange player id", () => {
+      expect(resolveExchangePlayerImportKey("player001", playerMap)).toEqual({
+        status: "ok",
+        id: "mongo-1",
+        playerIdLabel: "PLAYER001",
+      });
+    });
+
+    it("returns not_found for unknown player id", () => {
+      expect(resolveExchangePlayerImportKey("unknown", playerMap)).toEqual({ status: "not_found" });
+    });
+
+    it("returns ambiguous when multiple players share playerId", () => {
+      const ambiguousMap: ExchangePlayerImportMap = new Map([["player001", "ambiguous"]]);
+      expect(resolveExchangePlayerImportKey("player001", ambiguousMap)).toEqual({ status: "ambiguous" });
+    });
+  });
+
   describe("resolution caches", () => {
     it("buildBankResolutionCache resolves each unique key once", () => {
       const maps: BankImportMaps = {
@@ -120,6 +146,19 @@ describe("deposit-import-resolve", () => {
       const cache = buildPersonResolutionCache(["john doe", "unknown"], personMap);
       expect(cache.get("john doe")).toEqual({ status: "ok", id: "person-1", name: "John Doe" });
       expect(cache.get("unknown")).toEqual({ status: "not_found" });
+    });
+
+    it("buildExchangePlayerResolutionCache resolves each unique player id once", () => {
+      const playerMap: ExchangePlayerImportMap = new Map([
+        ["player001", { id: "mongo-1", playerIdLabel: "PLAYER001" }],
+      ]);
+      const cache = buildExchangePlayerResolutionCache(["player001", "missing"], playerMap);
+      expect(cache.get("player001")).toEqual({
+        status: "ok",
+        id: "mongo-1",
+        playerIdLabel: "PLAYER001",
+      });
+      expect(cache.get("missing")).toEqual({ status: "not_found" });
     });
   });
 });
