@@ -70,6 +70,9 @@ type CreateDepositImportJobInput = {
     settlementAccountType: "bank" | "person";
     bankId?: string;
     liabilityPersonId?: string;
+    playerMongoId?: string;
+    bonusAmount?: number;
+    totalAmount?: number;
   }>;
   actorId: string;
   requestId?: string;
@@ -129,6 +132,9 @@ export async function createDepositImportJob(input: CreateDepositImportJobInput)
     settlementAccountType: row.settlementAccountType,
     bankId: row.bankId,
     liabilityPersonId: row.liabilityPersonId,
+    playerMongoId: row.playerMongoId,
+    bonusAmount: row.bonusAmount,
+    totalAmount: row.totalAmount,
   }));
   const job = await DepositImportJobModel.create({
     status: "queued",

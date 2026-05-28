@@ -146,7 +146,8 @@ export async function validateDepositImportController(req: Request, res: Respons
     res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: "File is required (field name: file)" });
     return;
   }
-  const result = await validateDepositImportRows(file.buffer, file.originalname);
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await validateDepositImportRows(file.buffer, file.originalname, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result });
 }
 

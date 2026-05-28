@@ -114,34 +114,22 @@ export const amendDepositBodySchema = z.object({
   remark: z.string().max(2000).trim().optional(),
 });
 
+const depositImportRowSchema = z.object({
+  utr: z.string().min(4).max(120),
+  amount: z.number().int().min(1),
+  entryAt: z.string().optional(),
+  settlementAccountType: z.enum(["bank", "person"]).default("bank"),
+  bankId: z.string().length(24).optional(),
+  liabilityPersonId: z.string().length(24).optional(),
+  playerMongoId: z.string().length(24).optional(),
+  bonusAmount: z.number().int().min(0).optional(),
+  totalAmount: z.number().int().min(1).optional(),
+});
+
 export const commitDepositImportBodySchema = z.object({
-  rows: z
-    .array(
-      z.object({
-        utr: z.string().min(4).max(120),
-        amount: z.number().int().min(1),
-        entryAt: z.string().optional(),
-        settlementAccountType: z.enum(["bank", "person"]).default("bank"),
-        bankId: z.string().length(24).optional(),
-        liabilityPersonId: z.string().length(24).optional(),
-      }),
-    )
-    .min(1)
-    .max(500),
+  rows: z.array(depositImportRowSchema).min(1).max(500),
 });
 
 export const createDepositImportJobBodySchema = z.object({
-  rows: z
-    .array(
-      z.object({
-        utr: z.string().min(4).max(120),
-        amount: z.number().int().min(1),
-        entryAt: z.string().optional(),
-        settlementAccountType: z.enum(["bank", "person"]).default("bank"),
-        bankId: z.string().length(24).optional(),
-        liabilityPersonId: z.string().length(24).optional(),
-      }),
-    )
-    .min(1)
-    .max(10000),
+  rows: z.array(depositImportRowSchema).min(1).max(10000),
 });

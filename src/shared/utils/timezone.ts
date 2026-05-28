@@ -80,6 +80,19 @@ function zonedDateTimeToUtc(
   return new Date(guessMs);
 }
 
+/** Wall-clock components in an IANA timezone → UTC instant (for import / business entry). */
+export function wallClockToUtc(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  timeZone: string,
+): Date {
+  return zonedDateTimeToUtc(year, month, day, hour, minute, second, 0, normalizeTimeZone(timeZone));
+}
+
 export function isValidIanaTimeZone(timeZone: string | undefined | null): boolean {
   if (!timeZone || !String(timeZone).trim()) return false;
   try {
