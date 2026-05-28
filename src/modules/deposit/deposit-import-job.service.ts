@@ -210,6 +210,8 @@ export async function getDepositImportJobErrorCsv(jobId: string, actorId: string
         settlementType: "",
         bankAccountNumber: "",
         liablePersonName: "",
+        playerId: "",
+        bonusAmount: "",
         utr: item.utr,
         amount: "",
         errors: [item.error],
