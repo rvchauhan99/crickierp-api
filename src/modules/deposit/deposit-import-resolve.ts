@@ -1,5 +1,6 @@
 import { BankModel } from "../bank/bank.model";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
+import { PlayerModel } from "../player/player.model";
 
 export type BankImportRecord = { id: string; displayName: string; status: string };
 
@@ -20,6 +21,15 @@ export type PersonImportResolution =
   | { status: "ok"; id: string; name: string }
   | { status: "not_found" }
   | { status: "inactive"; name: string };
+
+export type ExchangePlayerImportRecord = { id: string; playerIdLabel: string };
+
+export type ExchangePlayerImportMap = Map<string, ExchangePlayerImportRecord | "ambiguous">;
+
+export type ExchangePlayerImportResolution =
+  | { status: "ok"; id: string; playerIdLabel: string }
+  | { status: "not_found" }
+  | { status: "ambiguous" };
 
 function bankDisplayName(b: { holderName: string; bankName: string; accountNumber: string }): string {
   const last4 = b.accountNumber.length >= 4 ? b.accountNumber.slice(-4) : b.accountNumber;
@@ -135,6 +145,55 @@ export function buildPersonResolutionCache(
   const cache = new Map<string, PersonImportResolution>();
   for (const key of uniqueKeys) {
     cache.set(key, resolvePersonImportKey(key, personMap));
+  }
+  return cache;
+}
+
+export async function loadPlayersForImportPlayerIds(uniqueKeys: string[]): Promise<ExchangePlayerImportMap> {
+  const playerMap: ExchangePlayerImportMap = new Map();
+  if (uniqueKeys.length === 0) return playerMap;
+
+  const regexPatterns = uniqueKeys.map((n) => new RegExp(`^${escapeRegex(n)}$`, "i"));
+  const players = await PlayerModel.find({ playerId: { $in: regexPatterns } })
+    .select({ playerId: 1 })
+    .lean();
+
+  for (const p of players) {
+    const key = p.playerId.trim().toLowerCase();
+    const record: ExchangePlayerImportRecord = {
+      id: p._id.toString(),
+      playerIdLabel: p.playerId.trim(),
+    };
+    if (playerMap.has(key)) {
+      playerMap.set(key, "ambiguous");
+    } else {
+      playerMap.set(key, record);
+    }
+  }
+  return playerMap;
+}
+
+export function resolveExchangePlayerImportKey(
+  key: string,
+  playerMap: ExchangePlayerImportMap,
+): ExchangePlayerImportResolution {
+  const entry = playerMap.get(key);
+  if (entry === "ambiguous") {
+    return { status: "ambiguous" };
+  }
+  if (!entry) {
+    return { status: "not_found" };
+  }
+  return { status: "ok", id: entry.id, playerIdLabel: entry.playerIdLabel };
+}
+
+export function buildExchangePlayerResolutionCache(
+  uniqueKeys: string[],
+  playerMap: ExchangePlayerImportMap,
+): Map<string, ExchangePlayerImportResolution> {
+  const cache = new Map<string, ExchangePlayerImportResolution>();
+  for (const key of uniqueKeys) {
+    cache.set(key, resolveExchangePlayerImportKey(key, playerMap));
   }
   return cache;
 }

@@ -1,3 +1,6 @@
+import xlsx from "xlsx";
+import { normalizeTimeZone, wallClockToUtc } from "./timezone";
+
 function normalizeHeaderKey(raw: string): string {
   return String(raw).trim().toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -8,13 +11,6 @@ function expandTwoDigitYear(yy: string): string {
   return String(num < 70 ? 2000 + num : 1900 + num);
 }
 
-function parseExcelSerial(serial: number): Date | null {
-  if (serial <= 1000 || serial >= 100000) return null;
-  const excelEpoch = new Date(1899, 11, 30);
-  const d = new Date(excelEpoch.getTime() + serial * 86400000);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
 function apply12Hour(hour: number, ampm?: string): number {
   if (!ampm) return hour;
   const upper = ampm.toUpperCase();
@@ -23,11 +19,34 @@ function apply12Hour(hour: number, ampm?: string): number {
   return hour;
 }
 
-function parseDateTimeString(trimmed: string): Date | null {
+function hasAbsoluteTimezone(trimmed: string): boolean {
+  return /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed) || /[T\s]\d{2}:\d{2}.*[+-]\d/.test(trimmed);
+}
+
+function parseExcelSerialInTimeZone(serial: number, timeZone: string): Date | null {
+  if (serial <= 1000 || serial >= 100000) return null;
+  const parts = xlsx.SSF.parse_date_code(serial);
+  if (!parts || parts.y == null || parts.m == null || parts.d == null) return null;
+  return wallClockToUtc(
+    parts.y,
+    parts.m,
+    parts.d,
+    parts.H ?? 0,
+    parts.M ?? 0,
+    parts.S ?? 0,
+    timeZone,
+  );
+}
+
+function parseWallClockDateTimeString(trimmed: string, timeZone: string): Date | null {
   if (/^\d{4,5}(\.\d+)?$/.test(trimmed) && !trimmed.includes("/") && !trimmed.includes("-")) {
     const serial = parseFloat(trimmed);
-    const fromSerial = parseExcelSerial(serial);
-    if (fromSerial) return fromSerial;
+    return parseExcelSerialInTimeZone(serial, timeZone);
+  }
+
+  if (hasAbsoluteTimezone(trimmed)) {
+    const d = new Date(trimmed);
+    return Number.isNaN(d.getTime()) ? null : d;
   }
 
   const ddmmMatch = trimmed.match(
@@ -35,11 +54,17 @@ function parseDateTimeString(trimmed: string): Date | null {
   );
   if (ddmmMatch) {
     const [, dd, mm, yyOrYyyy, hh, min, sec, ampm] = ddmmMatch;
-    const yyyy = expandTwoDigitYear(yyOrYyyy!);
+    const yyyy = Number(expandTwoDigitYear(yyOrYyyy!));
     const hour = apply12Hour(parseInt(hh ?? "0", 10), ampm);
-    const iso = `${yyyy}-${mm!.padStart(2, "0")}-${dd!.padStart(2, "0")}T${String(hour).padStart(2, "0")}:${(min ?? "00").padStart(2, "0")}:${(sec ?? "00").padStart(2, "0")}`;
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d;
+    return wallClockToUtc(
+      yyyy,
+      Number(mm),
+      Number(dd),
+      hour,
+      parseInt(min ?? "0", 10),
+      parseInt(sec ?? "0", 10),
+      timeZone,
+    );
   }
 
   const isoMatch = trimmed.match(
@@ -48,9 +73,15 @@ function parseDateTimeString(trimmed: string): Date | null {
   if (isoMatch) {
     const [, yyyy, mm, dd, hh, min, sec, ampm] = isoMatch;
     const hour = apply12Hour(parseInt(hh ?? "0", 10), ampm);
-    const iso = `${yyyy}-${mm!.padStart(2, "0")}-${dd!.padStart(2, "0")}T${String(hour).padStart(2, "0")}:${(min ?? "00").padStart(2, "0")}:${(sec ?? "00").padStart(2, "0")}`;
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d;
+    return wallClockToUtc(
+      Number(yyyy),
+      Number(mm),
+      Number(dd),
+      hour,
+      parseInt(min ?? "0", 10),
+      parseInt(sec ?? "0", 10),
+      timeZone,
+    );
   }
 
   const d = new Date(trimmed);
@@ -88,15 +119,16 @@ export function formatImportDateTimeForDisplay(value: unknown): string {
   return String(value).trim();
 }
 
-export function parseImportDateTime(value: unknown): Date | null {
+export function parseImportDateTime(value: unknown, timeZone: string): Date | null {
+  const tz = normalizeTimeZone(timeZone);
   if (value == null) return null;
   if (value instanceof Date) {
     return Number.isNaN(value.getTime()) ? null : value;
   }
   if (typeof value === "number") {
-    return parseExcelSerial(value);
+    return parseExcelSerialInTimeZone(value, tz);
   }
   const trimmed = String(value).trim();
   if (!trimmed) return null;
-  return parseDateTimeString(trimmed);
+  return parseWallClockDateTimeString(trimmed, tz);
 }
