@@ -2,6 +2,18 @@ import { Types, type HydratedDocument } from "mongoose";
 import type { z } from "zod";
 import xlsx from "xlsx";
 import { generateExcelBuffer } from "../../shared/services/excel.service";
+import {
+  formatImportDateTimeForDisplay,
+  importPickRaw,
+  isImportDateTimePresent,
+  parseImportDateTime,
+} from "../../shared/utils/importDateTime";
+import {
+  buildBankResolutionCache,
+  buildPersonResolutionCache,
+  loadBanksForImportIdentifiers,
+  loadLiabilityPersonsForImportNames,
+} from "./deposit-import-resolve";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { BankModel } from "../bank/bank.model";
@@ -1528,7 +1540,7 @@ function importReadRows(buffer: Buffer, originalName: string): Record<string, un
   if (!lower.endsWith(".csv") && !lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
     throw new AppError("validation_error", "Unsupported file type. Use .csv, .xlsx, or .xls", 400);
   }
-  const wb = xlsx.read(buffer, { type: "buffer", raw: false });
+  const wb = xlsx.read(buffer, { type: "buffer", cellDates: true });
   const sheetName = wb.SheetNames[0];
   if (!sheetName) {
     throw new AppError("validation_error", "File is empty or has no sheets", 400);
@@ -1536,50 +1548,8 @@ function importReadRows(buffer: Buffer, originalName: string): Record<string, un
   return xlsx.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], { defval: "", raw: false });
 }
 
-function expandTwoDigitYear(yy: string): string {
-  if (yy.length === 4) return yy;
-  const num = parseInt(yy, 10);
-  return String(num < 70 ? 2000 + num : 1900 + num);
-}
-
-function parseFlexibleDateTime(raw: string): Date | null {
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-
-  // Excel serial date number (e.g., 46238 or 46238.6)
-  if (/^\d{4,5}(\.\d+)?$/.test(trimmed) && !trimmed.includes("/") && !trimmed.includes("-")) {
-    const serial = parseFloat(trimmed);
-    if (serial > 1000 && serial < 100000) {
-      const excelEpoch = new Date(1899, 11, 30);
-      const d = new Date(excelEpoch.getTime() + serial * 86400000);
-      return Number.isNaN(d.getTime()) ? null : d;
-    }
-  }
-
-  // DD/MM/YYYY HH:mm or DD/MM/YY HH:mm (also supports . and - separators)
-  const ddmmMatch = trimmed.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?$/);
-  if (ddmmMatch) {
-    const [, dd, mm, yyOrYyyy, hh, min] = ddmmMatch;
-    const yyyy = expandTwoDigitYear(yyOrYyyy!);
-    const iso = `${yyyy}-${mm!.padStart(2, "0")}-${dd!.padStart(2, "0")}T${(hh ?? "00").padStart(2, "0")}:${(min ?? "00").padStart(2, "0")}:00`;
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d;
-  }
-
-  // YYYY-MM-DD HH:mm or YYYY-MM-DD
-  const isoMatch = trimmed.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s](\d{1,2}):(\d{2}))?/);
-  if (isoMatch) {
-    const [, yyyy, mm, dd, hh, min] = isoMatch;
-    const iso = `${yyyy}-${mm!.padStart(2, "0")}-${dd!.padStart(2, "0")}T${(hh ?? "00").padStart(2, "0")}:${(min ?? "00").padStart(2, "0")}:00`;
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d;
-  }
-
-  // Fallback: try native Date parsing
-  const d = new Date(trimmed);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
+const DEPOSIT_IMPORT_INVALID_DATE_MESSAGE =
+  "Invalid date/time. Use DD/MM/YYYY HH:mm (or upload as-is from Excel); seconds and AM/PM are accepted.";
 
 export async function validateDepositImportRows(
   buffer: Buffer,
@@ -1601,7 +1571,7 @@ export async function validateDepositImportRows(
   const allPersonNames: string[] = [];
   const rowDataList: Array<{
     rowNum: number;
-    dateTimeRaw: string;
+    dateTimeValue: unknown;
     settlementType: string;
     bankIdentifier: string;
     personName: string;
@@ -1614,7 +1584,7 @@ export async function validateDepositImportRows(
     const rowNum = i + 2;
     const utr = importPickCell(row, "utr", "UTR", "transaction_id", "transaction id");
     const amountRaw = importPickCell(row, "amount", "Amount");
-    const dateTimeRaw = importPickCell(row, "date time", "datetime", "date_time", "entry_at", "entryat", "date");
+    const dateTimeValue = importPickRaw(row, "date time", "datetime", "date_time", "entry_at", "entryat", "date");
     const settlementType = importPickCell(row, "settlement type", "settlement_type", "settlementtype", "type");
     const bankIdentifier = importPickCell(row, "bank", "bank account number", "bank_account_number", "bankaccountnumber", "account_number", "account number", "accountnumber", "holder name", "holdername", "holder_name", "bank holder", "bankholder");
     const personName = importPickCell(row, "liable person name", "liable_person_name", "liablepersonname", "person_name", "person name", "personname", "liability person", "liabilityperson");
@@ -1624,52 +1594,19 @@ export async function validateDepositImportRows(
       continue;
     }
 
-    rowDataList.push({ rowNum, dateTimeRaw, settlementType, bankIdentifier, personName, utr, amountRaw });
+    rowDataList.push({ rowNum, dateTimeValue, settlementType, bankIdentifier, personName, utr, amountRaw });
     if (bankIdentifier) allBankIdentifiers.push(bankIdentifier.trim().toLowerCase());
     if (personName) allPersonNames.push(personName.toLowerCase());
   }
 
-  const bankByAccountMap = new Map<string, { id: string; displayName: string; status: string }>();
-  const bankByHolderMap = new Map<string, { id: string; displayName: string; status: string } | "ambiguous">();
-  if (allBankIdentifiers.length > 0) {
-    const uniqueIdentifiers = [...new Set(allBankIdentifiers)];
-    const regexPatterns = uniqueIdentifiers.map(
-      (n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-    );
-    const banks = await BankModel.find({
-      $or: [
-        { accountNumber: { $in: regexPatterns } },
-        { holderName: { $in: regexPatterns } },
-      ],
-    }).lean();
-    for (const b of banks) {
-      bankByAccountMap.set(b.accountNumber.trim().toLowerCase(), {
-        id: b._id.toString(),
-        displayName: bankDisplayName(b),
-        status: b.status,
-      });
-      const holderKey = b.holderName.trim().toLowerCase();
-      if (bankByHolderMap.has(holderKey)) {
-        bankByHolderMap.set(holderKey, "ambiguous");
-      } else {
-        bankByHolderMap.set(holderKey, {
-          id: b._id.toString(),
-          displayName: bankDisplayName(b),
-          status: b.status,
-        });
-      }
-    }
-  }
+  const uniqueBankIdentifiers = [...new Set(allBankIdentifiers)];
+  const uniquePersonNames = [...new Set(allPersonNames)];
 
-  const personMap = new Map<string, { id: string; name: string; isActive: boolean }>();
-  if (allPersonNames.length > 0) {
-    const uniqueNames = [...new Set(allPersonNames)];
-    const regexPatterns = uniqueNames.map((n) => new RegExp(`^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"));
-    const persons = await LiabilityPersonModel.find({ name: { $in: regexPatterns } }).lean();
-    for (const p of persons) {
-      personMap.set(p.name.trim().toLowerCase(), { id: p._id.toString(), name: p.name.trim(), isActive: p.isActive });
-    }
-  }
+  const bankMaps = await loadBanksForImportIdentifiers(uniqueBankIdentifiers);
+  const personMap = await loadLiabilityPersonsForImportNames(uniquePersonNames);
+
+  const bankResolutionCache = buildBankResolutionCache(uniqueBankIdentifiers, bankMaps);
+  const personResolutionCache = buildPersonResolutionCache(uniquePersonNames, personMap);
 
   const seenUtrs = new Set<string>();
   const existingUtrChecks = rowDataList.map((r) => r.utr).filter(Boolean);
@@ -1722,10 +1659,10 @@ export async function validateDepositImportRows(
     }
 
     let parsedDate: Date | null = null;
-    if (rd.dateTimeRaw) {
-      parsedDate = parseFlexibleDateTime(rd.dateTimeRaw);
+    if (isImportDateTimePresent(rd.dateTimeValue)) {
+      parsedDate = parseImportDateTime(rd.dateTimeValue);
       if (!parsedDate) {
-        rowErrors.push("Invalid date/time format. Use DD/MM/YYYY HH:mm, DD/MM/YY HH:mm, or YYYY-MM-DD HH:mm");
+        rowErrors.push(DEPOSIT_IMPORT_INVALID_DATE_MESSAGE);
       }
     }
 
@@ -1739,33 +1676,31 @@ export async function validateDepositImportRows(
         rowErrors.push("Bank (Account No. or Holder Name) is required for Bank settlement");
       } else {
         const key = rd.bankIdentifier.trim().toLowerCase();
-        const bankByAcc = bankByAccountMap.get(key);
-        const bankByHolder = bankByHolderMap.get(key);
-        const bankInfo = bankByAcc || (bankByHolder !== "ambiguous" ? bankByHolder : undefined);
-
-        if (bankByHolder === "ambiguous" && !bankByAcc) {
+        const bankResult = bankResolutionCache.get(key);
+        if (bankResult?.status === "ambiguous") {
           rowErrors.push(`Multiple banks found with holder name "${rd.bankIdentifier}". Use account number instead.`);
-        } else if (!bankInfo) {
+        } else if (!bankResult || bankResult.status === "not_found") {
           rowErrors.push(`Bank "${rd.bankIdentifier}" not found (tried account number and holder name)`);
-        } else if (bankInfo.status !== "active") {
-          rowErrors.push(`Bank "${bankInfo.displayName}" is not active`);
+        } else if (bankResult.status === "inactive") {
+          rowErrors.push(`Bank "${bankResult.displayName}" is not active`);
         } else {
-          resolvedBankId = bankInfo.id;
-          resolvedBankDisplay = bankInfo.displayName;
+          resolvedBankId = bankResult.id;
+          resolvedBankDisplay = bankResult.displayName;
         }
       }
     } else {
       if (!rd.personName) {
         rowErrors.push("Liable Person Name is required for Person settlement");
       } else {
-        const personInfo = personMap.get(rd.personName.trim().toLowerCase());
-        if (!personInfo) {
+        const key = rd.personName.trim().toLowerCase();
+        const personResult = personResolutionCache.get(key);
+        if (!personResult || personResult.status === "not_found") {
           rowErrors.push(`Liability person "${rd.personName}" not found`);
-        } else if (!personInfo.isActive) {
-          rowErrors.push(`Liability person "${personInfo.name}" is inactive`);
+        } else if (personResult.status === "inactive") {
+          rowErrors.push(`Liability person "${personResult.name}" is inactive`);
         } else {
-          resolvedPersonId = personInfo.id;
-          resolvedPersonName = personInfo.name;
+          resolvedPersonId = personResult.id;
+          resolvedPersonName = personResult.name;
         }
       }
     }
@@ -1773,7 +1708,7 @@ export async function validateDepositImportRows(
     if (rowErrors.length > 0) {
       invalidRows.push({
         row: rd.rowNum,
-        dateTime: rd.dateTimeRaw,
+        dateTime: formatImportDateTimeForDisplay(rd.dateTimeValue),
         settlementType: rd.settlementType || "Bank",
         bankAccountNumber: rd.bankIdentifier,
         liablePersonName: rd.personName,
@@ -1868,15 +1803,74 @@ export type DepositImportCommitProgress = {
   errors: Array<{ row: number; utr: string; error: string }>;
 };
 
-export function buildDepositImportSampleCsv(): Buffer {
+const DEPOSIT_IMPORT_SAMPLE_COLUMNS = [
+  "Date Time",
+  "Settlement Type",
+  "Bank",
+  "Liable Person Name",
+  "UTR",
+  "Amount",
+] as const;
+
+export function getDepositImportSampleRows(): Array<Record<string, string>> {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
   const todayStr = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  const header = "Date Time,Settlement Type,Bank,Liable Person Name,UTR,Amount";
-  const example1 = `${todayStr},Bank,1234567890,,TXN001ABC,5000`;
-  const example2 = ",,Rajesh Kumar,,TXN002DEF,3000";
-  const example3 = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} 10:00,Person,,John Doe,TXN003GHI,2500`;
-  return Buffer.from([header, example1, example2, example3].join("\n"), "utf-8");
+  const dateAtTen = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} 10:00`;
+  return [
+    {
+      "Date Time": todayStr,
+      "Settlement Type": "Bank",
+      Bank: "1234567890",
+      "Liable Person Name": "",
+      UTR: "TXN001ABC",
+      Amount: "5000",
+    },
+    {
+      "Date Time": "",
+      "Settlement Type": "",
+      Bank: "Rajesh Kumar",
+      "Liable Person Name": "",
+      UTR: "TXN002DEF",
+      Amount: "3000",
+    },
+    {
+      "Date Time": dateAtTen,
+      "Settlement Type": "Person",
+      Bank: "",
+      "Liable Person Name": "John Doe",
+      UTR: "TXN003GHI",
+      Amount: "2500",
+    },
+  ];
+}
+
+export function buildDepositImportSampleCsv(): Buffer {
+  const rows = getDepositImportSampleRows();
+  const header = DEPOSIT_IMPORT_SAMPLE_COLUMNS.join(",");
+  const lines = rows.map((row) =>
+    DEPOSIT_IMPORT_SAMPLE_COLUMNS.map((col) => row[col] ?? "").join(","),
+  );
+  return Buffer.from([header, ...lines].join("\n"), "utf-8");
+}
+
+export function buildDepositImportSampleXlsx(): Buffer {
+  const rows = getDepositImportSampleRows();
+  const worksheet = xlsx.utils.json_to_sheet(rows);
+  const ref = worksheet["!ref"];
+  if (ref) {
+    const { e } = xlsx.utils.decode_range(ref);
+    for (let rowIndex = 1; rowIndex <= e.r; rowIndex++) {
+      const cellRef = xlsx.utils.encode_cell({ r: rowIndex, c: 0 });
+      const cell = worksheet[cellRef];
+      if (!cell) continue;
+      const text = cell.v != null ? String(cell.v) : "";
+      worksheet[cellRef] = { t: "s", v: text, w: text, z: "@" };
+    }
+  }
+  const workbook = xlsx.utils.book_new();
+  xlsx.utils.book_append_sheet(workbook, worksheet, "Import");
+  return xlsx.write(workbook, { type: "buffer", bookType: "xlsx" }) as Buffer;
 }
 
 export function buildDepositImportErrorCsv(invalidRows: DepositImportInvalidRow[]): Buffer {
