@@ -1,64 +1,64 @@
-// import "dotenv/config";
-// import mongoose from "mongoose";
-// import IORedis from "ioredis";
-// import { ExpenseTypeModel } from "../modules/masters/expense-type.model";
-// import { UserModel } from "../modules/users/user.model";
-// import { connectDb } from "../shared/db/connect";
-// import { bootstrapData } from "../shared/db/bootstrap";
-// import { logger } from "../shared/logger";
+import "dotenv/config";
+import mongoose from "mongoose";
+import IORedis from "ioredis";
+import { ExpenseTypeModel } from "../modules/masters/expense-type.model";
+import { UserModel } from "../modules/users/user.model";
+import { connectDb } from "../shared/db/connect";
+import { bootstrapData } from "../shared/db/bootstrap";
+import { logger } from "../shared/logger";
 
-// async function flushRedisIfConfigured(): Promise<void> {
-//     const url = process.env.REDIS_URL?.trim();
-//     if (!url) {
-//         logger.info("REDIS_URL not set; skipping Redis flush");
-//         return;
-//     }
+async function flushRedisIfConfigured(): Promise<void> {
+    const url = process.env.REDIS_URL?.trim();
+    if (!url) {
+        logger.info("REDIS_URL not set; skipping Redis flush");
+        return;
+    }
 
-//     const redis = new IORedis(url, {
-//         maxRetriesPerRequest: 2,
-//         enableReadyCheck: true,
-//     });
+    const redis = new IORedis(url, {
+        maxRetriesPerRequest: 2,
+        enableReadyCheck: true,
+    });
 
-//     try {
-//         await redis.flushdb();
-//         logger.info("Redis FLUSHDB completed for the database index in REDIS_URL");
-//     } finally {
-//         await redis.quit();
-//     }
-// }
+    try {
+        await redis.flushdb();
+        logger.info("Redis FLUSHDB completed for the database index in REDIS_URL");
+    } finally {
+        await redis.quit();
+    }
+}
 
-// async function main() {
-//     if (process.env.NODE_ENV === "production") {
-//         throw new Error("Database reset is refused when NODE_ENV=production");
-//     }
+async function main() {
+    if (process.env.NODE_ENV === "production") {
+        throw new Error("Database reset is refused when NODE_ENV=production");
+    }
 
-//     await connectDb();
-//     const db = mongoose.connection.db;
-//     if (!db) {
-//         throw new Error("Database connection has no db handle");
-//     }
+    await connectDb();
+    const db = mongoose.connection.db;
+    if (!db) {
+        throw new Error("Database connection has no db handle");
+    }
 
-//     const preserve = new Set([
-//         UserModel.collection.name,
-//         ExpenseTypeModel.collection.name,
-//     ]);
+    const preserve = new Set([
+        UserModel.collection.name,
+        ExpenseTypeModel.collection.name,
+    ]);
 
-//     const dbName = db.databaseName;
-//     const collections = await db.listCollections().toArray();
-//     for (const { name } of collections) {
-//         if (preserve.has(name)) continue;
-//         await db.dropCollection(name);
-//     }
-//     logger.info({ dbName, preserved: [...preserve] }, "Dropped collections (users and expense types kept)");
-//     await bootstrapData();
-//     logger.info(
-//         "Seeded permissions and superadmin — username: superadmin, password: SuperAdmin@123",
-//     );
-//     await flushRedisIfConfigured();
-//     await mongoose.disconnect();
-// }
+    const dbName = db.databaseName;
+    const collections = await db.listCollections().toArray();
+    for (const { name } of collections) {
+        if (preserve.has(name)) continue;
+        await db.dropCollection(name);
+    }
+    logger.info({ dbName, preserved: [...preserve] }, "Dropped collections (users and expense types kept)");
+    await bootstrapData();
+    logger.info(
+        "Seeded permissions and superadmin — username: superadmin, password: SuperAdmin@123",
+    );
+    await flushRedisIfConfigured();
+    await mongoose.disconnect();
+}
 
-// main().catch((error) => {
-//     logger.error(error);
-//     process.exit(1);
-// });
+main().catch((error) => {
+    logger.error(error);
+    process.exit(1);
+});

@@ -4,6 +4,7 @@ import {
   amendVerifiedDeposit,
   buildDepositImportErrorCsv,
   buildDepositImportSampleCsv,
+  buildDepositImportSampleXlsx,
   commitDepositImportRows,
   createDeposit,
   deleteDepositWithReversal,
@@ -114,7 +115,25 @@ export async function streamDepositApprovalQueueEventsController(req: Request, r
   subscribeApprovalQueueEvents("deposit", query.view, res);
 }
 
-export async function sampleDepositCsvController(_req: Request, res: Response) {
+export async function sampleDepositCsvController(req: Request, res: Response) {
+  const format = String(req.query.format ?? "csv").toLowerCase();
+  if (format === "xlsx") {
+    const buffer = buildDepositImportSampleXlsx();
+    res.setHeader("Content-Disposition", 'attachment; filename="deposit-import-sample.xlsx"');
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.status(StatusCodes.OK).send(buffer);
+    return;
+  }
+  if (format !== "csv") {
+    res.status(StatusCodes.BAD_REQUEST).json({
+      success: false,
+      message: 'Invalid format. Use "csv" or "xlsx".',
+    });
+    return;
+  }
   const buffer = buildDepositImportSampleCsv();
   res.setHeader("Content-Disposition", 'attachment; filename="deposit-import-sample.csv"');
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
