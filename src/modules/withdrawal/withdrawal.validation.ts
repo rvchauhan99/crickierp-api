@@ -105,3 +105,34 @@ export const amendWithdrawalBodySchema = z.object({
   reasonId: z.string().length(24),
   remark: z.string().max(2000).trim().optional(),
 });
+
+const withdrawalImportRowSchema = z.object({
+  playerMongoId: z.string().length(24),
+  accountNumber: z.string().min(1).max(40),
+  accountHolderName: z.string().min(1).max(120),
+  bankName: z.string().min(1).max(120),
+  ifsc: z.string().min(4).max(20),
+  amount: z.number().int().min(1),
+  reverseBonus: z.number().int().min(0).optional().default(0),
+  requestedAt: z.string().optional(),
+  payoutUtr: z.string().min(4).max(120).optional(),
+  payoutSettlementType: z.enum(["bank", "person"]).optional().default("bank"),
+  payoutBankId: z.string().length(24).optional(),
+  payoutLiabilityPersonId: z.string().length(24).optional(),
+});
+
+export const commitWithdrawalImportBodySchema = z.object({
+  rows: z.array(withdrawalImportRowSchema).min(1).max(500),
+});
+
+export const createWithdrawalImportJobBodySchema = z.object({
+  rows: z.array(withdrawalImportRowSchema).min(1).max(10000),
+});
+
+export const bulkBankerApproveBodySchema = z.object({
+  withdrawalIds: z
+    .array(z.string().length(24))
+    .min(1)
+    .max(200)
+    .refine((ids) => new Set(ids).size === ids.length, { message: "Duplicate withdrawal ids are not allowed" }),
+});

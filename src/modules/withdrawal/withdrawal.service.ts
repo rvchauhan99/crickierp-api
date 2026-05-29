@@ -452,20 +452,35 @@ export async function updateWithdrawalByExchange(
   return doc;
 }
 
-export async function updateWithdrawalByBanker(id: string, input: BankerPayoutInput, actorId: string, requestId?: string) {
+export type BankerPayoutOptions = {
+  deferSideEffects?: boolean;
+  bulkContext?: {
+    exchangeIds: Set<string>;
+    personSettlementSeen: boolean;
+  };
+};
+
+export async function updateWithdrawalByBanker(
+  id: string,
+  input: BankerPayoutInput,
+  actorId: string,
+  requestId?: string,
+  options?: BankerPayoutOptions,
+) {
   const startedAtMs = Date.now();
   const doc = await WithdrawalModel.findById(id);
   if (!doc) throw new AppError("not_found", "Withdrawal not found", 404);
   if (doc.status !== "requested") {
     throw new AppError("business_rule_error", "Only pending banker withdrawals can be updated", 400);
   }
-  const utrTrim = normalizeUtr(input.utr);
-  if (doc.utr && doc.utr.trim() !== "") {
-    throw new AppError("business_rule_error", "UTR already recorded for this withdrawal", 400);
-  }
-  await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
 
-  const mode = input.payoutSettlementType ?? "bank";
+  const mode = input.payoutSettlementType ?? doc.payoutSettlementType ?? "bank";
+  const utrRaw = input.utr?.trim() || doc.utr?.trim() || "";
+  if (!utrRaw || utrRaw.length < 4) {
+    throw new AppError("validation_error", "Payout UTR is required", 400);
+  }
+  const utrTrim = normalizeUtr(utrRaw);
+  await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
 
   const prev = {
     payoutSettlementType: doc.payoutSettlementType,
@@ -478,8 +493,14 @@ export async function updateWithdrawalByBanker(id: string, input: BankerPayoutIn
     status: doc.status,
   };
 
+  const bankIdStr = mode === "bank" ? input.bankId?.trim() || doc.payoutBankId?.toString() : undefined;
+  const personId =
+    mode === "person" ? input.liabilityPersonId?.trim() || doc.payoutLiabilityPersonId?.toString() : undefined;
+
   if (mode === "bank") {
-    const bankIdStr = input.bankId as string;
+    if (!bankIdStr) {
+      throw new AppError("validation_error", "Payout bank is required.", 400);
+    }
     const bank = await BankModel.findById(bankIdStr);
     if (!bank) throw new AppError("not_found", "Bank not found", 404);
     if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
@@ -494,7 +515,9 @@ export async function updateWithdrawalByBanker(id: string, input: BankerPayoutIn
     doc.status = "approved";
     await doc.save();
   } else {
-    const personId = input.liabilityPersonId as string;
+    if (!personId) {
+      throw new AppError("validation_error", "Liability person is required.", 400);
+    }
     const person = await LiabilityPersonModel.findById(personId).lean();
     if (!person) throw new AppError("not_found", "Liability person not found", 404);
     if (!person.isActive) throw new AppError("business_rule_error", "Liability person is inactive", 400);
@@ -580,38 +603,48 @@ export async function updateWithdrawalByBanker(id: string, input: BankerPayoutIn
     }
   };
 
-  await runSideEffect("audit_log", async () => {
-    await createAuditLog({
-      actorId,
-      action: "withdrawal.banker_payout",
-      entity: "withdrawal",
-      entityId: doc._id.toString(),
-      oldValue: prev as unknown as Record<string, unknown>,
-      newValue:
-        mode === "bank"
-          ? ({
-              payoutSettlementType: "bank",
-              bankId: input.bankId,
-              utr: utrTrim,
-              status: "approved",
-            } as Record<string, unknown>)
-          : ({
-              payoutSettlementType: "person",
-              liabilityPersonId: input.liabilityPersonId,
-              liabilityEntryId: doc.payoutLiabilityEntryId?.toString(),
-              utr: utrTrim,
-              status: "approved",
-            } as Record<string, unknown>),
-      requestId,
+  if (options?.bulkContext && doc.player && Types.ObjectId.isValid(String(doc.player))) {
+    const player = await PlayerModel.findById(doc.player).select("exchange").lean();
+    if (player?.exchange) {
+      options.bulkContext.exchangeIds.add(String(player.exchange));
+    }
+    if (mode === "person") options.bulkContext.personSettlementSeen = true;
+  }
+
+  if (!options?.deferSideEffects) {
+    await runSideEffect("audit_log", async () => {
+      await createAuditLog({
+        actorId,
+        action: "withdrawal.banker_payout",
+        entity: "withdrawal",
+        entityId: doc._id.toString(),
+        oldValue: prev as unknown as Record<string, unknown>,
+        newValue:
+          mode === "bank"
+            ? ({
+                payoutSettlementType: "bank",
+                bankId: bankIdStr,
+                utr: utrTrim,
+                status: "approved",
+              } as Record<string, unknown>)
+            : ({
+                payoutSettlementType: "person",
+                liabilityPersonId: personId,
+                liabilityEntryId: doc.payoutLiabilityEntryId?.toString(),
+                utr: utrTrim,
+                status: "approved",
+              } as Record<string, unknown>),
+        requestId,
+      });
     });
-  });
-  await runSideEffect("emit_withdrawal_exchange_queue_event", () => {
-    emitApprovalQueueEvent("withdrawal", "exchange");
-  });
-  if (mode === "person") {
-    await runSideEffect("invalidate_cache", async () => {
-      await invalidateCacheDomains(["withdrawal", "exchange", "player", "liability"]);
+    await runSideEffect("emit_withdrawal_exchange_queue_event", () => {
+      emitApprovalQueueEvent("withdrawal", "exchange");
     });
+    if (mode === "person") {
+      await runSideEffect("invalidate_cache", async () => {
+        await invalidateCacheDomains(["withdrawal", "exchange", "player", "liability"]);
+      });
+    }
   }
 
   logger.info(
@@ -1316,4 +1349,134 @@ export async function amendWithdrawal(
   }
 
   return doc;
+}
+
+// Re-export withdrawal import helpers
+export {
+  WITHDRAWAL_IMPORT_CHUNK_SIZE,
+  validateWithdrawalImportRows,
+  applyWithdrawalImportRows,
+  commitWithdrawalImportRows,
+  buildWithdrawalImportSampleCsv,
+  buildWithdrawalImportSampleXlsx,
+  buildWithdrawalImportErrorCsv,
+} from "./withdrawal-import.service";
+export type {
+  WithdrawalImportValidRow,
+  WithdrawalImportInvalidRow,
+  WithdrawalImportValidationResult,
+  WithdrawalImportCommitRow,
+  WithdrawalImportCommitProgress,
+} from "./withdrawal-import.service";
+
+export type BulkBankerApproveResult = {
+  approved: number;
+  failed: Array<{ withdrawalId: string; error: string }>;
+};
+
+function bankerApproveErrorMessage(err: unknown): string {
+  if (err instanceof AppError) return err.message;
+  if (err instanceof Error) return err.message;
+  return "Approve failed";
+}
+
+export async function bulkBankerApproveWithdrawals(
+  withdrawalIds: string[],
+  actorId: string,
+  requestId?: string,
+): Promise<BulkBankerApproveResult> {
+  const uniqueIds = Array.from(new Set(withdrawalIds.filter((id) => Types.ObjectId.isValid(id))));
+  if (uniqueIds.length === 0) {
+    throw new AppError("validation_error", "At least one valid withdrawal id is required", 400);
+  }
+
+  const bulkContext = {
+    exchangeIds: new Set<string>(),
+    personSettlementSeen: false,
+  };
+  const failed: BulkBankerApproveResult["failed"] = [];
+  let approved = 0;
+
+  for (const withdrawalId of uniqueIds) {
+    try {
+      const doc = await WithdrawalModel.findById(withdrawalId)
+        .select("status utr payoutSettlementType payoutBankId payoutLiabilityPersonId")
+        .lean();
+      if (!doc) {
+        failed.push({ withdrawalId, error: "Withdrawal not found" });
+        continue;
+      }
+      if (doc.status !== "requested") {
+        failed.push({
+          withdrawalId,
+          error: "Only pending withdrawals with import payout can be bulk approved",
+        });
+        continue;
+      }
+      if (!doc.utr?.trim()) {
+        failed.push({ withdrawalId, error: "Withdrawal has no payout UTR" });
+        continue;
+      }
+      const mode = doc.payoutSettlementType === "person" ? "person" : "bank";
+      if (mode === "bank" && !doc.payoutBankId) {
+        failed.push({ withdrawalId, error: "Withdrawal has no payout bank" });
+        continue;
+      }
+      if (mode === "person" && !doc.payoutLiabilityPersonId) {
+        failed.push({ withdrawalId, error: "Withdrawal has no payout liability person" });
+        continue;
+      }
+
+      await updateWithdrawalByBanker(
+        withdrawalId,
+        {
+          payoutSettlementType: mode,
+          utr: doc.utr.trim(),
+          bankId: mode === "bank" ? String(doc.payoutBankId) : undefined,
+          liabilityPersonId: mode === "person" ? String(doc.payoutLiabilityPersonId) : undefined,
+        },
+        actorId,
+        requestId,
+        { deferSideEffects: true, bulkContext },
+      );
+      approved += 1;
+    } catch (err) {
+      failed.push({ withdrawalId, error: bankerApproveErrorMessage(err) });
+    }
+  }
+
+  if (approved > 0) {
+    emitApprovalQueueEvent("withdrawal", "exchange");
+    for (const exchangeId of bulkContext.exchangeIds) {
+      try {
+        await enqueueExchangeRecompute(exchangeId);
+      } catch (err) {
+        logger.error({ err, exchangeId, requestId }, "Bulk banker approve recompute failed");
+      }
+    }
+    try {
+      await invalidateCacheDomains(
+        bulkContext.personSettlementSeen
+          ? ["withdrawal", "exchange", "player", "liability"]
+          : ["withdrawal", "exchange", "player"],
+      );
+    } catch (err) {
+      logger.error({ err, requestId }, "Bulk banker approve cache invalidation failed");
+    }
+
+    setImmediate(() => {
+      void createAuditLog({
+        actorId,
+        action: "withdrawal.bulk_banker_approve",
+        entity: "withdrawal",
+        entityId: "bulk",
+        newValue: { approved, failed: failed.length, withdrawalIds: uniqueIds },
+        requestId,
+      }).catch((err) => {
+        logger.warn({ err }, "bulk banker approve audit failed");
+      });
+    });
+  }
+
+  return { approved, failed };
 }
