@@ -2,6 +2,9 @@ import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
   amendWithdrawal,
+  bulkBankerApproveWithdrawals,
+  buildWithdrawalImportSampleCsv,
+  buildWithdrawalImportSampleXlsx,
   createWithdrawal,
   deleteWithdrawalWithReversal,
   listSavedAccountsForPlayer,
@@ -10,11 +13,19 @@ import {
   updateWithdrawalByBanker,
   updateWithdrawalStatus,
   exportWithdrawalsToBuffer,
+  validateWithdrawalImportRows,
 } from "./withdrawal.service";
+import {
+  createWithdrawalImportJob,
+  getWithdrawalImportJobErrorCsv,
+  getWithdrawalImportJobStatus,
+} from "./withdrawal-import-job.service";
 import {
   approvalQueueEventsQuerySchema,
   amendWithdrawalBodySchema,
+  bulkBankerApproveBodySchema,
   createWithdrawalBodySchema,
+  createWithdrawalImportJobBodySchema,
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
@@ -22,6 +33,7 @@ import {
 } from "./withdrawal.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
+import { subscribeWithdrawalImportEvents } from "./withdrawal-import-events";
 
 export async function createWithdrawalController(req: Request, res: Response) {
   const body = createWithdrawalBodySchema.parse(req.body);
@@ -91,4 +103,90 @@ export async function listSavedAccountsController(req: Request, res: Response) {
 export async function streamWithdrawalApprovalQueueEventsController(req: Request, res: Response) {
   const query = approvalQueueEventsQuerySchema.parse(req.query);
   subscribeApprovalQueueEvents("withdrawal", query.view, res);
+}
+
+export async function bulkBankerApproveController(req: Request, res: Response) {
+  const body = bulkBankerApproveBodySchema.parse(req.body);
+  const data = await bulkBankerApproveWithdrawals(body.withdrawalIds, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function sampleWithdrawalCsvController(req: Request, res: Response) {
+  const format = String(req.query.format ?? "csv").toLowerCase();
+  if (format === "xlsx") {
+    const buffer = buildWithdrawalImportSampleXlsx();
+    res.setHeader("Content-Disposition", 'attachment; filename="withdrawal-import-sample.xlsx"');
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.status(StatusCodes.OK).send(buffer);
+    return;
+  }
+  if (format !== "csv") {
+    res.status(StatusCodes.BAD_REQUEST).json({
+      success: false,
+      message: 'Invalid format. Use "csv" or "xlsx".',
+    });
+    return;
+  }
+  const buffer = buildWithdrawalImportSampleCsv();
+  res.setHeader("Content-Disposition", 'attachment; filename="withdrawal-import-sample.csv"');
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function validateWithdrawalImportController(req: Request, res: Response) {
+  const file = req.file;
+  if (!file?.buffer) {
+    res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: "File is required (field name: file)" });
+    return;
+  }
+  const timeZone = resolveRequestTimeZone(req);
+  const result = await validateWithdrawalImportRows(file.buffer, file.originalname, { timeZone });
+  res.status(StatusCodes.OK).json({ success: true, data: result });
+}
+
+export async function createWithdrawalImportJobController(req: Request, res: Response) {
+  const body = createWithdrawalImportJobBodySchema.parse(req.body);
+  const mappedRows = body.rows.map((row) => ({
+    playerMongoId: row.playerMongoId,
+    accountNumber: row.accountNumber,
+    accountHolderName: row.accountHolderName,
+    bankName: row.bankName,
+    ifsc: row.ifsc,
+    amount: row.amount,
+    reverseBonus: row.reverseBonus ?? 0,
+    requestedAt: row.requestedAt,
+    payoutUtr: row.payoutUtr,
+    payoutSettlementType: row.payoutSettlementType,
+    payoutBankId: row.payoutBankId,
+    payoutLiabilityPersonId: row.payoutLiabilityPersonId,
+  }));
+  const result = await createWithdrawalImportJob({
+    rows: mappedRows,
+    actorId: req.user!.userId,
+    requestId: req.requestId,
+  });
+  res.status(StatusCodes.ACCEPTED).json({ success: true, data: result });
+}
+
+export async function getWithdrawalImportJobController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  const result = await getWithdrawalImportJobStatus(jobId, req.user!.userId);
+  res.status(StatusCodes.OK).json({ success: true, data: result });
+}
+
+export async function streamWithdrawalImportJobEventsController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  await getWithdrawalImportJobStatus(jobId, req.user!.userId);
+  subscribeWithdrawalImportEvents(jobId, res);
+}
+
+export async function downloadWithdrawalImportJobErrorCsvController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  const { fileName, buffer } = await getWithdrawalImportJobErrorCsv(jobId, req.user!.userId);
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.status(StatusCodes.OK).send(buffer);
 }
