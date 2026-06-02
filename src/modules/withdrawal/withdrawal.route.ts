@@ -8,15 +8,18 @@ import { validate } from "../../shared/middlewares/validate.middleware";
 import {
   amendWithdrawalController,
   bulkBankerApproveController,
+  createBulkBankerApproveJobController,
   createWithdrawalController,
   createWithdrawalImportJobController,
   deleteWithdrawalController,
   downloadWithdrawalImportJobErrorCsvController,
+  getBulkBankerApproveJobController,
   getWithdrawalImportJobController,
   listSavedAccountsController,
   listWithdrawalController,
   sampleWithdrawalCsvController,
   streamWithdrawalApprovalQueueEventsController,
+  streamBulkBankerApproveJobEventsController,
   streamWithdrawalImportJobEventsController,
   updateWithdrawalExchangeController,
   updateWithdrawalBankerController,
@@ -30,6 +33,7 @@ import {
   approvalQueueEventsQuerySchema,
   amendWithdrawalBodySchema,
   bulkBankerApproveBodySchema,
+  createBulkBankerApproveJobBodySchema,
   createWithdrawalBodySchema,
   createWithdrawalImportJobBodySchema,
   listWithdrawalQuerySchema,
@@ -98,6 +102,25 @@ withdrawalRouter.post(
   permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
   validate({ body: bulkBankerApproveBodySchema }),
   bulkBankerApproveController,
+);
+
+withdrawalRouter.post(
+  "/bulk-banker-approve/jobs",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  validate({ body: createBulkBankerApproveJobBodySchema }),
+  createBulkBankerApproveJobController,
+);
+
+withdrawalRouter.get(
+  "/bulk-banker-approve/jobs/:jobId",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  getBulkBankerApproveJobController,
+);
+
+withdrawalRouter.get(
+  "/bulk-banker-approve/jobs/:jobId/events",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  streamBulkBankerApproveJobEventsController,
 );
 
 withdrawalRouter.post(

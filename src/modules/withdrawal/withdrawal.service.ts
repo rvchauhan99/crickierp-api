@@ -195,10 +195,7 @@ function bankDisplayName(b: { holderName: string; bankName: string; accountNumbe
 function viewBaseCondition(view: ListWithdrawalQuery["view"]): Record<string, unknown> {
   switch (view) {
     case "banker":
-      return {
-        status: "requested",
-        $or: [{ utr: { $exists: false } }, { utr: null }, { utr: "" }],
-      };
+      return { status: "requested" };
     case "exchange":
       return { status: { $in: ["requested", "approved", "rejected"] as const } };
     case "final":
@@ -1374,6 +1371,13 @@ export type BulkBankerApproveResult = {
   failed: Array<{ withdrawalId: string; error: string }>;
 };
 
+export type BulkBankerApproveProgress = {
+  totalRows: number;
+  processedRows: number;
+  successRows: number;
+  failedRows: number;
+};
+
 function bankerApproveErrorMessage(err: unknown): string {
   if (err instanceof AppError) return err.message;
   if (err instanceof Error) return err.message;
@@ -1384,6 +1388,9 @@ export async function bulkBankerApproveWithdrawals(
   withdrawalIds: string[],
   actorId: string,
   requestId?: string,
+  options?: {
+    onProgress?: (progress: BulkBankerApproveProgress) => Promise<void> | void;
+  },
 ): Promise<BulkBankerApproveResult> {
   const uniqueIds = Array.from(new Set(withdrawalIds.filter((id) => Types.ObjectId.isValid(id))));
   if (uniqueIds.length === 0) {
@@ -1396,6 +1403,7 @@ export async function bulkBankerApproveWithdrawals(
   };
   const failed: BulkBankerApproveResult["failed"] = [];
   let approved = 0;
+  let processedRows = 0;
 
   for (const withdrawalId of uniqueIds) {
     try {
@@ -1442,6 +1450,16 @@ export async function bulkBankerApproveWithdrawals(
       approved += 1;
     } catch (err) {
       failed.push({ withdrawalId, error: bankerApproveErrorMessage(err) });
+    } finally {
+      processedRows += 1;
+      if (options?.onProgress) {
+        await options.onProgress({
+          totalRows: uniqueIds.length,
+          processedRows,
+          successRows: approved,
+          failedRows: failed.length,
+        });
+      }
     }
   }
 

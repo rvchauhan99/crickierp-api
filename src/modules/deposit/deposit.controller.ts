@@ -23,12 +23,17 @@ import {
   getDepositImportJobStatus,
 } from "./deposit-import-job.service";
 import {
+  createDepositBulkExchangeApproveJob,
+  getDepositBulkExchangeApproveJobStatus,
+} from "./deposit-bulk-exchange-approve-job.service";
+import {
   approvalQueueEventsQuerySchema,
   amendDepositBodySchema,
   commitDepositImportBodySchema,
   createDepositImportJobBodySchema,
   createDepositBodySchema,
   bulkExchangeApproveBodySchema,
+  createBulkExchangeApproveJobBodySchema,
   exchangeActionBodySchema,
   listDepositQuerySchema,
   updateDepositBodySchema,
@@ -36,6 +41,7 @@ import {
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
 import { subscribeDepositImportEvents } from "./deposit-import-events";
+import { subscribeDepositBulkExchangeApproveEvents } from "./deposit-bulk-exchange-approve-events";
 
 export async function createDepositController(req: Request, res: Response) {
   const body = createDepositBodySchema.parse(req.body);
@@ -116,6 +122,28 @@ export async function bulkExchangeApproveController(req: Request, res: Response)
   const body = bulkExchangeApproveBodySchema.parse(req.body);
   const data = await bulkExchangeApproveDeposits(body.depositIds, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function createBulkExchangeApproveJobController(req: Request, res: Response) {
+  const body = createBulkExchangeApproveJobBodySchema.parse(req.body);
+  const data = await createDepositBulkExchangeApproveJob({
+    depositIds: body.depositIds,
+    actorId: req.user!.userId,
+    requestId: req.requestId,
+  });
+  res.status(StatusCodes.ACCEPTED).json({ success: true, data });
+}
+
+export async function getBulkExchangeApproveJobController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  const data = await getDepositBulkExchangeApproveJobStatus(jobId, req.user!.userId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function streamBulkExchangeApproveJobEventsController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  await getDepositBulkExchangeApproveJobStatus(jobId, req.user!.userId);
+  subscribeDepositBulkExchangeApproveEvents(jobId, res);
 }
 
 export async function streamDepositApprovalQueueEventsController(req: Request, res: Response) {

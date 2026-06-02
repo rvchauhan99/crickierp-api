@@ -131,5 +131,15 @@ withdrawalSchema.index({ status: 1, requestedAt: -1, _id: -1 });
 withdrawalSchema.index({ status: 1, createdAt: -1, _id: -1 });
 withdrawalSchema.index({ player: 1, updatedAt: -1, _id: -1 });
 withdrawalSchema.index({ payoutBankId: 1, createdAt: -1, _id: -1 });
+withdrawalSchema.index(
+  { utr: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      status: { $ne: "rejected" },
+      utr: { $exists: true, $type: "string", $ne: "" },
+    },
+  },
+);
 
 export const WithdrawalModel = model<WithdrawalDocument>("Withdrawal", withdrawalSchema);
