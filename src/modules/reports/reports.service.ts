@@ -98,6 +98,7 @@ type DashboardFilterContext = {
   dateFilter: Record<string, unknown>;
   depositDateFilter: Record<string, unknown>;
   withdrawalDateFilter: Record<string, unknown>;
+  expenseDateFilter: Record<string, unknown>;
   appliedRange: { fromDate: string; toDate: string };
   exchangeObjectId: Types.ObjectId | null;
   scopedPlayerIds: Types.ObjectId[] | null;
@@ -188,6 +189,12 @@ async function buildDashboardFilterContext(
   };
   const depositDateFilter = businessDateRangeExpr("entryAt", rangeStartUtc, rangeEndUtc);
   const withdrawalDateFilter = businessDateRangeExpr("requestedAt", rangeStartUtc, rangeEndUtc);
+  const expenseDateFilter = {
+    expenseDate: {
+      $gte: rangeStartUtc,
+      $lte: rangeEndUtc,
+    },
+  };
 
   const exchangeObjectId =
     query.exchangeId && Types.ObjectId.isValid(query.exchangeId) ? new Types.ObjectId(query.exchangeId) : null;
@@ -278,7 +285,7 @@ async function buildDashboardFilterContext(
 
   const expenseFilter = isExpenseAllowed
     ? {
-        ...dateFilter,
+        ...expenseDateFilter,
         ...amountFilter,
         ...(bankObjectId ? { bankId: bankObjectId } : {}),
         ...statusFilterForExpense(status),
@@ -292,6 +299,7 @@ async function buildDashboardFilterContext(
     dateFilter,
     depositDateFilter,
     withdrawalDateFilter,
+    expenseDateFilter,
     appliedRange,
     exchangeObjectId,
     scopedPlayerIds,
@@ -494,7 +502,7 @@ export async function getDashboardSummary(
 
   const { $expr: _depositDateExpr, ...depositFilterNoDate } = depositFilter as Record<string, unknown>;
   const { $expr: _withdrawalDateExpr, ...withdrawalFilterNoDate } = withdrawalFilter as Record<string, unknown>;
-  const { createdAt: _expenseDateRange, ...expenseFilterNoDate } = expenseFilter as Record<string, unknown>;
+  const { expenseDate: _expenseDateRange, ...expenseFilterNoDate } = expenseFilter as Record<string, unknown>;
 
   const depositBalanceStatusFilter =
     status === "all" || !status ? { status: { $in: ["verified", "finalized"] } } : {};
@@ -525,7 +533,7 @@ export async function getDashboardSummary(
   };
   const expenseBankRangeFilter = {
     ...expenseFilterNoDate,
-    createdAt: {
+    expenseDate: {
       ...(rangeStartUtc ? { $gte: rangeStartUtc } : {}),
       ...(rangeEndUtc ? { $lte: rangeEndUtc } : {}),
     },
@@ -533,7 +541,7 @@ export async function getDashboardSummary(
   };
   const expenseBankPriorFilter = {
     ...expenseFilterNoDate,
-    createdAt: {
+    expenseDate: {
       ...(rangeStartUtc ? { $lt: rangeStartUtc } : {}),
     },
     ...expenseBalanceStatusFilter,
