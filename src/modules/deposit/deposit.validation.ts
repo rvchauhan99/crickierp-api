@@ -94,6 +94,8 @@ export const bulkExchangeApproveBodySchema = z.object({
     .refine((ids) => new Set(ids).size === ids.length, { message: "Duplicate deposit ids are not allowed" }),
 });
 
+export const createBulkExchangeApproveJobBodySchema = bulkExchangeApproveBodySchema;
+
 export const exchangeActionBodySchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("mark_not_settled"),

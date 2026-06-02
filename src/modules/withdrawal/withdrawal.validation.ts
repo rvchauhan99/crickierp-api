@@ -136,3 +136,5 @@ export const bulkBankerApproveBodySchema = z.object({
     .max(200)
     .refine((ids) => new Set(ids).size === ids.length, { message: "Duplicate withdrawal ids are not allowed" }),
 });
+
+export const createBulkBankerApproveJobBodySchema = bulkBankerApproveBodySchema;

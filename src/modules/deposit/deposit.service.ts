@@ -849,6 +849,13 @@ export type BulkExchangeApproveResult = {
   failed: Array<{ depositId: string; error: string }>;
 };
 
+export type BulkExchangeApproveProgress = {
+  totalRows: number;
+  processedRows: number;
+  successRows: number;
+  failedRows: number;
+};
+
 export async function exchangeApproveDeposit(
   id: string,
   input: { playerId: string; bonusAmount: number },
@@ -1084,6 +1091,9 @@ export async function bulkExchangeApproveDeposits(
   depositIds: string[],
   actorId: string,
   requestId?: string,
+  options?: {
+    onProgress?: (progress: BulkExchangeApproveProgress) => Promise<void> | void;
+  },
 ): Promise<BulkExchangeApproveResult> {
   const uniqueIds = Array.from(new Set(depositIds.filter((id) => Types.ObjectId.isValid(id))));
   if (uniqueIds.length === 0) {
@@ -1096,6 +1106,7 @@ export async function bulkExchangeApproveDeposits(
   };
   const failed: BulkExchangeApproveResult["failed"] = [];
   let approved = 0;
+  let processedRows = 0;
 
   for (const depositId of uniqueIds) {
     try {
@@ -1127,6 +1138,16 @@ export async function bulkExchangeApproveDeposits(
       approved += 1;
     } catch (err) {
       failed.push({ depositId, error: exchangeApproveErrorMessage(err) });
+    } finally {
+      processedRows += 1;
+      if (options?.onProgress) {
+        await options.onProgress({
+          totalRows: uniqueIds.length,
+          processedRows,
+          successRows: approved,
+          failedRows: failed.length,
+        });
+      }
     }
   }
 

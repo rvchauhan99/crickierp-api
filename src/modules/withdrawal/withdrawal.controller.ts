@@ -21,9 +21,14 @@ import {
   getWithdrawalImportJobStatus,
 } from "./withdrawal-import-job.service";
 import {
+  createWithdrawalBulkApproveJob,
+  getWithdrawalBulkApproveJobStatus,
+} from "./withdrawal-bulk-approve-job.service";
+import {
   approvalQueueEventsQuerySchema,
   amendWithdrawalBodySchema,
   bulkBankerApproveBodySchema,
+  createBulkBankerApproveJobBodySchema,
   createWithdrawalBodySchema,
   createWithdrawalImportJobBodySchema,
   listWithdrawalQuerySchema,
@@ -34,6 +39,7 @@ import {
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
 import { subscribeWithdrawalImportEvents } from "./withdrawal-import-events";
+import { subscribeWithdrawalBulkApproveEvents } from "./withdrawal-bulk-approve-events";
 
 export async function createWithdrawalController(req: Request, res: Response) {
   const body = createWithdrawalBodySchema.parse(req.body);
@@ -109,6 +115,28 @@ export async function bulkBankerApproveController(req: Request, res: Response) {
   const body = bulkBankerApproveBodySchema.parse(req.body);
   const data = await bulkBankerApproveWithdrawals(body.withdrawalIds, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function createBulkBankerApproveJobController(req: Request, res: Response) {
+  const body = createBulkBankerApproveJobBodySchema.parse(req.body);
+  const data = await createWithdrawalBulkApproveJob({
+    withdrawalIds: body.withdrawalIds,
+    actorId: req.user!.userId,
+    requestId: req.requestId,
+  });
+  res.status(StatusCodes.ACCEPTED).json({ success: true, data });
+}
+
+export async function getBulkBankerApproveJobController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  const data = await getWithdrawalBulkApproveJobStatus(jobId, req.user!.userId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function streamBulkBankerApproveJobEventsController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  await getWithdrawalBulkApproveJobStatus(jobId, req.user!.userId);
+  subscribeWithdrawalBulkApproveEvents(jobId, res);
 }
 
 export async function sampleWithdrawalCsvController(req: Request, res: Response) {

@@ -24,7 +24,7 @@ import {
 } from "../../shared/utils/importDateTime";
 import { DEFAULT_TIMEZONE } from "../../shared/utils/timezone";
 import { logger } from "../../shared/logger";
-import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/utr";
+import { normalizeUtr } from "../../shared/utils/utr";
 import { WithdrawalModel } from "./withdrawal.model";
 
 export const WITHDRAWAL_IMPORT_CHUNK_SIZE = 100;
@@ -126,7 +126,10 @@ function withdrawalImportPickCell(row: Record<string, unknown>, ...aliases: stri
   return "";
 }
 
-function withdrawalImportReadRows(buffer: Buffer, originalName: string): Record<string, unknown>[] {
+function withdrawalImportReadRows(
+  buffer: Buffer,
+  originalName: string,
+): { rawRows: Record<string, unknown>[]; textRows: Record<string, unknown>[] } {
   const lower = originalName.toLowerCase();
   if (!lower.endsWith(".csv") && !lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
     throw new AppError("validation_error", "Unsupported file type. Use .csv, .xlsx, or .xls", 400);
@@ -136,11 +139,55 @@ function withdrawalImportReadRows(buffer: Buffer, originalName: string): Record<
   if (!sheetName) {
     throw new AppError("validation_error", "File is empty or has no sheets", 400);
   }
-  return xlsx.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], { defval: "", raw: false });
+  const sheet = wb.Sheets[sheetName];
+  const rawRows = xlsx.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "", raw: true });
+  const textRows = xlsx.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "", raw: false });
+  return { rawRows, textRows };
 }
 
 const WITHDRAWAL_IMPORT_INVALID_DATE_MESSAGE =
   "Invalid date/time. Use DD/MM/YYYY HH:mm (or upload as-is from Excel); seconds and AM/PM are accepted.";
+
+const IMPORT_SCI_NOTATION_REGEX = /^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$/;
+
+function normalizeImportAccountLikeValue(value: string, fieldName: string): {
+  value: string;
+  notationError?: string;
+} {
+  const trimmed = value.trim();
+  if (!trimmed) return { value: "" };
+  if (IMPORT_SCI_NOTATION_REGEX.test(trimmed)) {
+    return {
+      value: trimmed,
+      notationError: `${fieldName} must be provided as full digits, not scientific notation (E+).`,
+    };
+  }
+  return { value: trimmed };
+}
+
+function debugImportLog(payload: {
+  runId: string;
+  hypothesisId: string;
+  location: string;
+  message: string;
+  data: Record<string, unknown>;
+}) {
+  // #region agent log
+  fetch("http://127.0.0.1:7851/ingest/493287c9-0e60-4d99-b939-fc9c5e98db8e", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "146f82" },
+    body: JSON.stringify({
+      sessionId: "146f82",
+      runId: payload.runId,
+      hypothesisId: payload.hypothesisId,
+      location: payload.location,
+      message: payload.message,
+      data: payload.data,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+}
 
 function withdrawalQuoteCsvVal(value: string): string {
   if (!value) return "";
@@ -156,11 +203,11 @@ export async function validateWithdrawalImportRows(
   options?: { timeZone?: string },
 ): Promise<WithdrawalImportValidationResult> {
   const importTimeZone = options?.timeZone ?? DEFAULT_TIMEZONE;
-  const rows = withdrawalImportReadRows(buffer, originalName);
-  if (rows.length === 0) {
+  const { rawRows, textRows } = withdrawalImportReadRows(buffer, originalName);
+  if (rawRows.length === 0) {
     throw new AppError("validation_error", "File contains no data rows", 400);
   }
-  if (rows.length > 10000) {
+  if (rawRows.length > 10000) {
     throw new AppError("validation_error", "Maximum 10000 rows allowed per import", 400);
   }
 
@@ -175,7 +222,9 @@ export async function validateWithdrawalImportRows(
     rowNum: number;
     dateTimeValue: unknown;
     playerIdRaw: string;
+    accountNumberRaw: string;
     accountNumber: string;
+    accountNumberNotationError?: string;
     accountHolderName: string;
     bankName: string;
     ifsc: string;
@@ -183,15 +232,78 @@ export async function validateWithdrawalImportRows(
     reverseBonusRaw: string;
     payoutUtr: string;
     payoutSettlementType: string;
+    payoutBankIdentifierRaw: string;
     payoutBankIdentifier: string;
+    payoutBankNotationError?: string;
     payoutPersonName: string;
   }> = [];
 
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
+  for (let i = 0; i < rawRows.length; i++) {
+    const row = rawRows[i];
+    const textRow = textRows[i] ?? {};
     const rowNum = i + 2;
+    const runId = "withdrawalSciNotation";
+    const rowPayoutUtrRaw = withdrawalImportPickCell(row, "payout utr", "payoututr", "payout_utr", "utr");
+    const rowUtrKey = rowPayoutUtrRaw || `row-${rowNum}`;
+    const accountRawDirect = importPickRaw(
+      row,
+      "account number",
+      "accountnumber",
+      "account_number",
+      "acc no",
+      "accno",
+    );
+    if (i < 8) {
+      debugImportLog({
+        runId,
+        hypothesisId: "H1",
+        location: "withdrawal-import.service.ts:row-extract",
+        message: "Raw account cell read",
+        data: {
+          rowNum,
+          rowUtrKey,
+          rawType: accountRawDirect == null ? "nullish" : typeof accountRawDirect,
+          rawString: accountRawDirect == null ? "" : String(accountRawDirect),
+        },
+      });
+    }
     const playerIdRaw = withdrawalImportPickCell(row, "player id", "playerid", "player_id", "player");
-    const accountNumber = withdrawalImportPickCell(row, "account number", "accountnumber", "account_number", "acc no", "accno");
+    const accountNumberRaw = withdrawalImportPickCell(
+      row,
+      "account number",
+      "accountnumber",
+      "account_number",
+      "acc no",
+      "accno",
+    );
+    const normalizedAccountNumber = normalizeImportAccountLikeValue(accountNumberRaw, "Account Number");
+    const accountNumberTextValue = withdrawalImportPickCell(
+      textRow,
+      "account number",
+      "accountnumber",
+      "account_number",
+      "acc no",
+      "accno",
+    );
+    const accountDisplayScientific = IMPORT_SCI_NOTATION_REGEX.test(accountNumberTextValue.trim());
+    if (i < 8) {
+      debugImportLog({
+        runId,
+        hypothesisId: "H2",
+        location: "withdrawal-import.service.ts:account-normalize",
+        message: "Account normalization output",
+        data: {
+          rowNum,
+          rowUtrKey,
+          accountNumberRaw,
+          normalizedValue: normalizedAccountNumber.value,
+          notationError: normalizedAccountNumber.notationError ?? "",
+          wasScientificToken: IMPORT_SCI_NOTATION_REGEX.test(accountNumberRaw.trim()),
+          accountTextValue: accountNumberTextValue,
+          accountDisplayScientific,
+        },
+      });
+    }
     const accountHolderName = withdrawalImportPickCell(
       row,
       "account holder name",
@@ -205,7 +317,7 @@ export async function validateWithdrawalImportRows(
     const amountRaw = withdrawalImportPickCell(row, "amount", "Amount");
     const reverseBonusRaw = withdrawalImportPickCell(row, "reverse bonus", "reversebonus", "reverse_bonus");
     const dateTimeValue = importPickRaw(row, "date time", "datetime", "date_time", "requested_at", "requestedat", "date");
-    const payoutUtr = withdrawalImportPickCell(row, "payout utr", "payoututr", "payout_utr", "utr");
+    const payoutUtr = rowPayoutUtrRaw;
     const payoutSettlementType = withdrawalImportPickCell(
       row,
       "payout settlement type",
@@ -213,7 +325,7 @@ export async function validateWithdrawalImportRows(
       "payout_settlement_type",
       "payout type",
     );
-    const payoutBankIdentifier = withdrawalImportPickCell(
+    const payoutBankIdentifierRaw = withdrawalImportPickCell(
       row,
       "payout bank",
       "payoutbank",
@@ -221,6 +333,19 @@ export async function validateWithdrawalImportRows(
       "company bank",
       "companybank",
     );
+    const normalizedPayoutBankIdentifier = normalizeImportAccountLikeValue(
+      payoutBankIdentifierRaw,
+      "Payout Bank",
+    );
+    const payoutBankTextValue = withdrawalImportPickCell(
+      textRow,
+      "payout bank",
+      "payoutbank",
+      "payout_bank",
+      "company bank",
+      "companybank",
+    );
+    const payoutBankDisplayScientific = IMPORT_SCI_NOTATION_REGEX.test(payoutBankTextValue.trim());
     const payoutPersonName = withdrawalImportPickCell(
       row,
       "payout liable person name",
@@ -233,7 +358,7 @@ export async function validateWithdrawalImportRows(
 
     if (
       !playerIdRaw &&
-      !accountNumber &&
+      !accountNumberRaw &&
       !accountHolderName &&
       !bankName &&
       !ifsc &&
@@ -248,7 +373,13 @@ export async function validateWithdrawalImportRows(
       rowNum,
       dateTimeValue,
       playerIdRaw,
-      accountNumber,
+      accountNumberRaw,
+      accountNumber: normalizedAccountNumber.value,
+      accountNumberNotationError:
+        normalizedAccountNumber.notationError ||
+        (accountDisplayScientific
+          ? "Account Number must be provided as full digits, not scientific notation (E+)."
+          : undefined),
       accountHolderName,
       bankName,
       ifsc,
@@ -256,11 +387,19 @@ export async function validateWithdrawalImportRows(
       reverseBonusRaw,
       payoutUtr,
       payoutSettlementType,
-      payoutBankIdentifier,
+      payoutBankIdentifierRaw,
+      payoutBankIdentifier: normalizedPayoutBankIdentifier.value,
+      payoutBankNotationError:
+        normalizedPayoutBankIdentifier.notationError ||
+        (payoutBankDisplayScientific
+          ? "Payout Bank must be provided as full digits/account label, not scientific notation (E+)."
+          : undefined),
       payoutPersonName,
     });
     if (playerIdRaw) allPlayerIds.push(playerIdRaw.trim().toLowerCase());
-    if (payoutBankIdentifier) allPayoutBankIdentifiers.push(payoutBankIdentifier.trim().toLowerCase());
+    if (normalizedPayoutBankIdentifier.value) {
+      allPayoutBankIdentifiers.push(normalizedPayoutBankIdentifier.value.trim().toLowerCase());
+    }
     if (payoutPersonName) allPayoutPersonNames.push(payoutPersonName.trim().toLowerCase());
   }
 
@@ -283,13 +422,13 @@ export async function validateWithdrawalImportRows(
     const normalizedUtrs = [...new Set(payoutUtrChecks.map((u) => normalizeUtr(u)))];
     const [depConflicts, wdConflicts] = await Promise.all([
       DepositModel.find({
-        utr: { $in: normalizedUtrs.map((u) => new RegExp(`^${escapeUtrRegex(u)}$`, "i")) },
+        utr: { $in: normalizedUtrs },
         status: { $ne: "rejected" },
       })
         .select({ utr: 1 })
         .lean(),
       WithdrawalModel.find({
-        utr: { $in: normalizedUtrs.map((u) => new RegExp(`^${escapeUtrRegex(u)}$`, "i")) },
+        utr: { $in: normalizedUtrs },
         status: { $ne: "rejected" },
       })
         .select({ utr: 1 })
@@ -303,6 +442,7 @@ export async function validateWithdrawalImportRows(
     const rowErrors: string[] = [];
 
     if (!rd.playerIdRaw) rowErrors.push("Player Id is required");
+    if (rd.accountNumberNotationError) rowErrors.push(rd.accountNumberNotationError);
     if (!rd.accountNumber) rowErrors.push("Account Number is required");
     else if (rd.accountNumber.length > 40) rowErrors.push("Account Number must not exceed 40 characters");
     if (!rd.accountHolderName) rowErrors.push("Account Holder Name is required");
@@ -378,6 +518,7 @@ export async function validateWithdrawalImportRows(
       }
 
       if (payoutMode === "bank") {
+        if (rd.payoutBankNotationError) rowErrors.push(rd.payoutBankNotationError);
         if (!hasPayoutBank) rowErrors.push("Payout Bank is required for Bank payout settlement");
         else {
           const key = rd.payoutBankIdentifier.trim().toLowerCase();
@@ -412,11 +553,25 @@ export async function validateWithdrawalImportRows(
     }
 
     if (rowErrors.length > 0) {
+      if (rd.accountNumberNotationError && (rd.payoutUtr || rd.rowNum <= 8)) {
+        debugImportLog({
+          runId: "withdrawalSciNotation",
+          hypothesisId: "H3",
+          location: "withdrawal-import.service.ts:row-invalid",
+          message: "Row rejected due to account scientific notation",
+          data: {
+            rowNum: rd.rowNum,
+            payoutUtr: rd.payoutUtr,
+            accountNumberRaw: rd.accountNumberRaw,
+            notationError: rd.accountNumberNotationError,
+          },
+        });
+      }
       invalidRows.push({
         row: rd.rowNum,
         dateTime: formatImportDateTimeForDisplay(rd.dateTimeValue),
         playerId: rd.playerIdRaw,
-        accountNumber: rd.accountNumber,
+        accountNumber: rd.accountNumberRaw,
         accountHolderName: rd.accountHolderName,
         bankName: rd.bankName,
         ifsc: rd.ifsc,
@@ -424,11 +579,24 @@ export async function validateWithdrawalImportRows(
         reverseBonus: rd.reverseBonusRaw,
         payoutUtr: rd.payoutUtr,
         payoutSettlementType: rd.payoutSettlementType || "Bank",
-        payoutBank: rd.payoutBankIdentifier,
+        payoutBank: rd.payoutBankIdentifierRaw,
         payoutLiablePersonName: rd.payoutPersonName,
         errors: rowErrors,
       });
     } else {
+      if (rd.payoutUtr || rd.rowNum <= 8) {
+        debugImportLog({
+          runId: "withdrawalSciNotation",
+          hypothesisId: "H4",
+          location: "withdrawal-import.service.ts:row-valid",
+          message: "Row accepted with account number",
+          data: {
+            rowNum: rd.rowNum,
+            payoutUtr: rd.payoutUtr,
+            accountNumberStored: rd.accountNumber,
+          },
+        });
+      }
       validRows.push({
         row: rd.rowNum,
         playerMongoId: resolvedPlayerMongoId!,
@@ -523,12 +691,11 @@ async function loadWithdrawalImportLookups(rows: WithdrawalImportCommitRow[]) {
 async function findConflictingPayoutUtrsInDb(utrs: string[]): Promise<Set<string>> {
   const normalized = [...new Set(utrs.map((u) => normalizeUtr(u)).filter(Boolean))];
   if (normalized.length === 0) return new Set();
-  const utrMatchers = normalized.map((u) => new RegExp(`^${escapeUtrRegex(u)}$`, "i"));
   const [depConflicts, wdConflicts] = await Promise.all([
-    DepositModel.find({ utr: { $in: utrMatchers }, status: { $ne: "rejected" } })
+    DepositModel.find({ utr: { $in: normalized }, status: { $ne: "rejected" } })
       .select({ utr: 1 })
       .lean(),
-    WithdrawalModel.find({ utr: { $in: utrMatchers }, status: { $ne: "rejected" } })
+    WithdrawalModel.find({ utr: { $in: normalized }, status: { $ne: "rejected" } })
       .select({ utr: 1 })
       .lean(),
   ]);
@@ -564,6 +731,7 @@ function buildWithdrawalImportInsertDoc(
     reverseBonus,
     payableAmount,
     requestedAt: row.requestedAt ? parseBusinessDateTime(row.requestedAt, "requestedAt") : new Date(),
+    // Imported rows must remain in requested stage for banker confirmation flow.
     status: "requested",
     createdBy: actorOid,
     amendmentCount: 0,
