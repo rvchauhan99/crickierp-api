@@ -437,4 +437,58 @@ describe("Exchange API integration", () => {
     expect(body).toContain("phone is required");
     expect(body).toContain("PLAYER-2");
   });
+
+  it("lists computed current balance after verified deposit without persisted recompute", async () => {
+    const actor = await UserModel.findOne({ username: "superadmin" }).select("_id").lean();
+    expect(actor?._id).toBeDefined();
+    const actorId = actor!._id;
+
+    const exchange = await ExchangeModel.create({
+      name: "E2E List Balance",
+      provider: "Provider LB",
+      openingBalance: 800,
+      currentBalance: 800,
+      bonus: 0,
+      status: "active",
+      createdBy: actorId,
+      updatedBy: actorId,
+    });
+
+    const player = await PlayerModel.create({
+      exchange: exchange._id,
+      playerId: "PL-LB",
+      phone: "9000000099",
+      regularBonusPercentage: 0,
+      firstDepositBonusPercentage: 0,
+      createdBy: actorId,
+      updatedBy: actorId,
+    });
+
+    await DepositModel.create({
+      bankName: "Bank LB",
+      utr: "UTR-LB-001",
+      amount: 140,
+      totalAmount: 150,
+      bonusAmount: 10,
+      status: "verified",
+      createdBy: actorId,
+      player: player._id,
+      settledAt: new Date("2026-04-15T10:00:00.000Z"),
+    });
+
+    const listRes = await request(app)
+      .get("/api/v1/exchange?page=1&pageSize=50&name=E2E%20List%20Balance&name_op=equals")
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(listRes.status).toBe(200);
+    const row = listRes.body.data.find(
+      (item: { name?: string }) => item.name === "E2E List Balance",
+    );
+    expect(row).toBeDefined();
+    expect(row.currentBalance).toBe(650);
+    expect(row.openingBalance).toBe(800);
+
+    const stored = await ExchangeModel.findById(exchange._id).lean();
+    expect(stored?.currentBalance).toBe(800);
+  });
 });
