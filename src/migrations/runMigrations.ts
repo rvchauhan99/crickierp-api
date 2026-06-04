@@ -5,6 +5,7 @@ import { migration001DropNotificationCollections } from "./001-drop-notification
 import { migration002BackfillBusinessDatetimes } from "./002-backfill-business-datetimes";
 import { migration003LiabilityPersonSideClosingBalance } from "./003-liability-person-side-closing-balance";
 import { migration004SeedExpenseCancelReasons } from "./004-seed-expense-cancel-reasons";
+import { migration005RecomputeExchangeCurrentBalances } from "./005-recompute-exchange-current-balances";
 
 export const MIGRATIONS_COLLECTION = "__migrations";
 
@@ -18,6 +19,7 @@ const registry: Migration[] = [
   migration002BackfillBusinessDatetimes,
   migration003LiabilityPersonSideClosingBalance,
   migration004SeedExpenseCancelReasons,
+  migration005RecomputeExchangeCurrentBalances,
 ];
 
 export async function runMigrations(): Promise<void> {
