@@ -11,6 +11,8 @@
     "test": "jest --runInBand",
     "reset:database": "tsx src/scripts/reset-database.ts",
     "reconcile:bank-balances": "tsx src/scripts/reconcile-bank-balances.ts",
+    "recompute:exchange-balances:dry-run": "tsx src/scripts/recompute-all-exchange-balances.ts",
+    "recompute:exchange-balances": "tsx src/scripts/recompute-all-exchange-balances.ts --apply",
     "backfill:business-datetimes:dry-run": "tsx src/scripts/backfill-business-datetimes.ts --dry-run",
     "backfill:business-datetimes": "tsx src/scripts/backfill-business-datetimes.ts"
   },

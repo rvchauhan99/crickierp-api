@@ -1,3 +1,4 @@
+import { computeAllTimeExchangeBalances } from "../../shared/services/exchange-balance.service";
 import { generateExcelBuffer } from "../../shared/services/excel.service";
 import { Types } from "mongoose";
 import type { z } from "zod";
@@ -260,6 +261,24 @@ export async function createExchange(
   return doc;
 }
 
+type ExchangeRowWithBalance = {
+  _id: Types.ObjectId;
+  openingBalance?: number;
+  currentBalance?: number;
+};
+
+async function overlayComputedCurrentBalances<T extends ExchangeRowWithBalance>(
+  rows: T[],
+): Promise<T[]> {
+  if (rows.length === 0) return rows;
+  const balanceMap = await computeAllTimeExchangeBalances(rows.map((row) => row._id));
+  return rows.map((row) => {
+    const computed = balanceMap.get(String(row._id));
+    if (computed == null) return row;
+    return { ...row, currentBalance: computed };
+  });
+}
+
 export async function listExchanges(query: ListExchangeQuery, options?: { timeZone?: string }) {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const filter = buildExchangeListFilter(query, timeZone);
@@ -267,7 +286,7 @@ export async function listExchanges(query: ListExchangeQuery, options?: { timeZo
   const skip = (query.page - 1) * query.pageSize;
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
-  const [rows, total] = await Promise.all([
+  const [rawRows, total] = await Promise.all([
     ExchangeModel.find(filter)
       .populate("createdBy", "fullName username")
       .sort({ [query.sortBy]: sortValue })
@@ -276,6 +295,8 @@ export async function listExchanges(query: ListExchangeQuery, options?: { timeZo
       .lean(),
     ExchangeModel.countDocuments(filter),
   ]);
+
+  const rows = await overlayComputedCurrentBalances(rawRows);
 
   return {
     rows,
@@ -311,11 +332,13 @@ export async function exportExchangesToBuffer(
   const filter = buildExchangeListFilter(query, timeZone);
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
-  const rows = await ExchangeModel.find(filter)
+  const rawRows = await ExchangeModel.find(filter)
     .populate("createdBy", "fullName username")
     .sort({ [query.sortBy]: sortValue })
     .limit(EXPORT_MAX_ROWS)
     .lean();
+
+  const rows = await overlayComputedCurrentBalances(rawRows);
 
   const exportData = rows.map((r) => ({
     "Exchange Name": r.name,
@@ -403,41 +426,8 @@ export async function recomputeExchangeCurrentBalance(exchangeId: string): Promi
   const exchange = await ExchangeModel.findById(exchangeObjectId);
   if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
 
-  const scopedPlayerIds = await PlayerModel.distinct("_id", { exchange: exchangeObjectId });
-
-  const [depositAgg, withdrawalAgg, topupAgg] = await Promise.all([
-    scopedPlayerIds.length
-      ? DepositModel.aggregate<{ total: number }>([
-          { $match: { player: { $in: scopedPlayerIds }, status: { $in: ["verified", "finalized"] } } },
-          {
-            $group: {
-              _id: null,
-              total: { $sum: { $ifNull: ["$totalAmount", "$amount"] } },
-            },
-          },
-        ])
-      : Promise.resolve([] as { total: number }[]),
-    scopedPlayerIds.length
-      ? WithdrawalModel.aggregate<{ total: number }>([
-          { $match: { player: { $in: scopedPlayerIds }, status: { $in: ["approved", "finalized"] } } },
-          {
-            $group: {
-              _id: null,
-              total: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
-            },
-          },
-        ])
-      : Promise.resolve([] as { total: number }[]),
-    ExchangeTopupModel.aggregate<{ total: number }>([
-      { $match: { exchangeId: exchangeObjectId } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]),
-  ]);
-
-  const depositTotal = Number(depositAgg[0]?.total ?? 0);
-  const withdrawalTotal = Number(withdrawalAgg[0]?.total ?? 0);
-  const topupTotal = Number(topupAgg[0]?.total ?? 0);
-  const nextCurrentBalance = exchange.openingBalance - depositTotal + withdrawalTotal + topupTotal;
+  const balanceMap = await computeAllTimeExchangeBalances([exchangeObjectId]);
+  const nextCurrentBalance = balanceMap.get(exchangeId) ?? exchange.openingBalance;
 
   exchange.currentBalance = nextCurrentBalance;
   await exchange.save();
