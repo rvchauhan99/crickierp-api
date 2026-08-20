@@ -3,3 +3,4 @@ dist
 .env
 coverage
 node_modules
+cloudrun.env.yaml

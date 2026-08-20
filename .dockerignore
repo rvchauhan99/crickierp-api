@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+.env.*
+coverage
+tests
+*.md
+.DS_Store
+.cursor
+scripts
+product-browser-business-flow-plan.md
+eslint.config.mjs
+jest.config.ts
+cloudrun.env.yaml
