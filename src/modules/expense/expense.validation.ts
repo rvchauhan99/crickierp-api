@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { moneyFxInputSchema } from "../../shared/validation/moneyFx.validation";
 
 const ymd = z
   .string()
@@ -11,7 +12,7 @@ export const createExpenseBodySchema = z.object({
   description: z.string().trim().max(5000).optional(),
   bankId: z.string().length(24).optional(),
   liabilityPersonId: z.string().length(24).optional(),
-});
+}).merge(moneyFxInputSchema);
 
 export const updateExpenseBodySchema = z.object({
   expenseTypeId: z.string().length(24).optional(),
@@ -19,7 +20,7 @@ export const updateExpenseBodySchema = z.object({
   expenseDate: ymd.optional(),
   description: z.string().trim().max(5000).optional(),
   bankId: z.union([z.string().length(24), z.literal(""), z.null()]).optional(),
-});
+}).merge(moneyFxInputSchema.partial());
 
 export const listExpenseQuerySchema = z.object({
   search: z.string().optional(),

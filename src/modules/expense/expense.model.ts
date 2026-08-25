@@ -14,6 +14,9 @@ export interface ExpenseDocument {
   _id: Types.ObjectId;
   expenseTypeId: Types.ObjectId;
   amount: number;
+  operatedCurrency?: string;
+  operatedAmount?: number;
+  exchangeRate?: number;
   expenseDate: Date;
   description?: string;
   bankId?: Types.ObjectId;
@@ -46,6 +49,9 @@ const expenseSchema = new Schema<ExpenseDocument>(
   {
     expenseTypeId: { type: Schema.Types.ObjectId, ref: "ExpenseType", required: true },
     amount: { type: Number, required: true, min: 0.01 },
+    operatedCurrency: { type: String, trim: true },
+    operatedAmount: { type: Number, min: 0 },
+    exchangeRate: { type: Number, min: 0 },
     expenseDate: { type: Date, required: true },
     description: { type: String, trim: true, default: "" },
     bankId: { type: Schema.Types.ObjectId, ref: "Bank" },

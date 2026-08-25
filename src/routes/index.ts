@@ -15,6 +15,7 @@ import { reasonRouter } from "../modules/reason/reason.route";
 import { liabilityRouter } from "../modules/liability/liability.route";
 import { lookupRouter } from "../modules/lookup/lookup.route";
 import { referralRouter } from "../modules/referral/referral.route";
+import { settingsRouter } from "../modules/settings/settings.route";
 import { collectRouteMetrics } from "../shared/observability/performance-metrics";
 import { evaluatePerformanceGates } from "../shared/observability/performance-gates";
 
@@ -49,5 +50,6 @@ apiRouter.use("/reasons", reasonRouter);
 apiRouter.use("/liability", liabilityRouter);
 apiRouter.use("/lookup", lookupRouter);
 apiRouter.use("/referral", referralRouter);
+apiRouter.use("/settings", settingsRouter);
 
 export { apiRouter };

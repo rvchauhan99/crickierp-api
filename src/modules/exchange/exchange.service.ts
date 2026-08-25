@@ -16,6 +16,7 @@ import {
 } from "../../shared/utils/timezone";
 import { ExchangeModel } from "./exchange.model";
 import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
+import { resolveOpeningMoneyFromRequest } from "../../shared/utils/moneyFx";
 
 type CreateExchangeInput = {
   name: string;
@@ -23,6 +24,9 @@ type CreateExchangeInput = {
   openingBalance: number;
   bonus: number;
   status: "active" | "deactive";
+  openingOperatedCurrency?: string;
+  openingOperatedAmount?: number;
+  openingExchangeRate?: number;
 };
 
 type ListExchangeQuery = z.infer<typeof listExchangeQuerySchema>;
@@ -234,9 +238,23 @@ export async function createExchange(
     throw new AppError("business_rule_error", "Exchange already exists for provider", 409);
   }
 
+  const opening = await resolveOpeningMoneyFromRequest({
+    openingBalance: input.openingBalance,
+    openingOperatedCurrency: input.openingOperatedCurrency,
+    openingOperatedAmount: input.openingOperatedAmount,
+    openingExchangeRate: input.openingExchangeRate,
+  });
+
   const payload = {
-    ...input,
-    currentBalance: input.openingBalance,
+    name: input.name,
+    provider: input.provider,
+    bonus: input.bonus,
+    status: input.status,
+    openingBalance: opening.openingBalance,
+    openingOperatedCurrency: opening.openingOperatedCurrency,
+    openingOperatedAmount: opening.openingOperatedAmount,
+    openingExchangeRate: opening.openingExchangeRate,
+    currentBalance: opening.openingBalance,
     createdBy: new Types.ObjectId(actorId),
     updatedBy: new Types.ObjectId(actorId),
   };
@@ -251,6 +269,9 @@ export async function createExchange(
       name: doc.name,
       provider: doc.provider,
       openingBalance: doc.openingBalance,
+      openingOperatedCurrency: doc.openingOperatedCurrency,
+      openingOperatedAmount: doc.openingOperatedAmount,
+      openingExchangeRate: doc.openingExchangeRate,
       currentBalance: doc.currentBalance,
       bonus: doc.bonus,
       status: doc.status,
@@ -384,12 +405,29 @@ export async function updateExchange(
     version: existing.version,
   };
 
-  Object.assign(existing, input);
+  const { openingBalance, openingOperatedCurrency, openingOperatedAmount, openingExchangeRate, ...rest } =
+    input;
+
+  Object.assign(existing, rest);
+
+  if (openingBalance !== undefined) {
+    const opening = await resolveOpeningMoneyFromRequest({
+      openingBalance,
+      openingOperatedCurrency,
+      openingOperatedAmount,
+      openingExchangeRate,
+    });
+    existing.openingBalance = opening.openingBalance;
+    existing.openingOperatedCurrency = opening.openingOperatedCurrency;
+    existing.openingOperatedAmount = opening.openingOperatedAmount;
+    existing.openingExchangeRate = opening.openingExchangeRate;
+  }
+
   existing.updatedBy = new Types.ObjectId(actorId);
   existing.version += 1;
   await existing.save();
 
-  if (input.openingBalance !== undefined) {
+  if (openingBalance !== undefined) {
     await recomputeExchangeCurrentBalance(existing._id.toString());
     const refreshed = await ExchangeModel.findById(existing._id);
     if (refreshed) {
@@ -407,6 +445,9 @@ export async function updateExchange(
       name: existing.name,
       provider: existing.provider,
       openingBalance: existing.openingBalance,
+      openingOperatedCurrency: existing.openingOperatedCurrency,
+      openingOperatedAmount: existing.openingOperatedAmount,
+      openingExchangeRate: existing.openingExchangeRate,
       currentBalance: existing.currentBalance,
       bonus: existing.bonus,
       status: existing.status,

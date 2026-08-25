@@ -7,8 +7,11 @@ export interface LiabilityPersonDocument {
   email?: string;
   notes?: string;
   isActive: boolean;
-  /** Positive = receivable, Negative = payable */
+  /** Positive = receivable, Negative = payable (platform currency) */
   openingBalance: number;
+  openingOperatedCurrency?: string;
+  openingOperatedAmount?: number;
+  openingExchangeRate?: number;
   totalDebits: number;
   totalCredits: number;
   closingBalance: number;
@@ -26,6 +29,9 @@ const liabilityPersonSchema = new Schema<LiabilityPersonDocument>(
     notes: { type: String, trim: true, default: "" },
     isActive: { type: Boolean, default: true },
     openingBalance: { type: Number, default: 0 },
+    openingOperatedCurrency: { type: String, trim: true },
+    openingOperatedAmount: { type: Number, min: 0 },
+    openingExchangeRate: { type: Number, min: 0 },
     totalDebits: { type: Number, default: 0, min: 0 },
     totalCredits: { type: Number, default: 0, min: 0 },
     closingBalance: { type: Number, default: 0 },

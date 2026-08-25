@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { openingMoneyFxInputSchema } from "../../shared/validation/moneyFx.validation";
 
 export const createExchangeBodySchema = z.object({
   name: z.string().min(2).max(120),
@@ -6,7 +7,7 @@ export const createExchangeBodySchema = z.object({
   openingBalance: z.number().min(0),
   bonus: z.number().min(0).default(0),
   status: z.enum(["active", "deactive"]).default("active"),
-});
+}).merge(openingMoneyFxInputSchema);
 
 export const updateExchangeBodySchema = z.object({
   name: z.string().min(2).max(120).optional(),
@@ -15,7 +16,7 @@ export const updateExchangeBodySchema = z.object({
   bonus: z.number().min(0).optional(),
   status: z.enum(["active", "deactive"]).optional(),
   version: z.number().int().positive(),
-});
+}).merge(openingMoneyFxInputSchema.partial());
 
 export const listExchangeQuerySchema = z.object({
   search: z.string().optional(),

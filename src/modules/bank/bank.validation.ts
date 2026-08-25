@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { moneyFxInputSchema, openingMoneyFxInputSchema } from "../../shared/validation/moneyFx.validation";
 
 export const createBankBodySchema = z.object({
   holderName: z.string().min(2),
@@ -7,7 +8,7 @@ export const createBankBodySchema = z.object({
   ifsc: z.string().min(4),
   openingBalance: z.number().min(0),
   status: z.enum(["active", "deactive"]).default("active"),
-});
+}).merge(openingMoneyFxInputSchema);
 
 export const listBankQuerySchema = z.object({
   search: z.string().optional(),

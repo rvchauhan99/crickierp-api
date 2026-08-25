@@ -38,6 +38,10 @@ export interface DepositDocument {
   liabilityEntryId?: Types.ObjectId;
   utr: string;
   amount: number;
+  /** FX reference: currency the user entered the amount in */
+  operatedCurrency?: string;
+  operatedAmount?: number;
+  exchangeRate?: number;
   status: DepositStatus;
   createdBy: Types.ObjectId;
   player?: Types.ObjectId;
@@ -100,6 +104,9 @@ const depositSchema = new Schema<DepositDocument>(
     liabilityEntryId: { type: Schema.Types.ObjectId, ref: "LiabilityEntry" },
     utr: { type: String, required: true, trim: true },
     amount: { type: Number, required: true, min: 0 },
+    operatedCurrency: { type: String, trim: true },
+    operatedAmount: { type: Number, min: 0 },
+    exchangeRate: { type: Number, min: 0 },
     status: {
       type: String,
       enum: ["pending", "not_settled", "verified", "rejected", "finalized"],

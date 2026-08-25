@@ -19,10 +19,11 @@ const REFRESH_COOKIE = "crickierp_refresh";
 const REFRESH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 function setRefreshCookie(res: Response, refreshToken: string) {
+  // Cross-origin (Vercel → Cloud Run) needs SameSite=None + Secure
   res.cookie(REFRESH_COOKIE, refreshToken, {
     httpOnly: true,
     secure: env.cookieSecure,
-    sameSite: "lax",
+    sameSite: env.cookieSecure ? "none" : "lax",
     maxAge: REFRESH_TTL_MS,
     path: "/api/v1/auth",
     domain: env.cookieDomain,
@@ -60,7 +61,7 @@ export async function logoutController(_req: Request, res: Response) {
   res.clearCookie(REFRESH_COOKIE, {
     httpOnly: true,
     secure: env.cookieSecure,
-    sameSite: "lax",
+    sameSite: env.cookieSecure ? "none" : "lax",
     path: "/api/v1/auth",
     domain: env.cookieDomain,
   });

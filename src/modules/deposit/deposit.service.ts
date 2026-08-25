@@ -47,6 +47,9 @@ import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/
 import { createLiabilityEntry, deleteLiabilityEntryForReversal } from "../liability/liability.service";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
 import { chunkArray } from "../../shared/utils/chunkArray";
+import { resolveMoneyFromRequest, convertSecondaryAmount, roundMoneyToCurrency } from "../../shared/utils/moneyFx";
+import { getCurrencyMinUnit } from "../../shared/constants/currencies";
+import { requirePlatformCurrency } from "../settings/settings.service";
 
 export const DEPOSIT_IMPORT_CHUNK_SIZE = 100;
 
@@ -379,18 +382,20 @@ async function resolveImportPlayerFields(input: CreateDepositInput): Promise<{
   const player = await PlayerModel.findById(input.playerMongoId).select("_id").lean();
   if (!player) throw new AppError("not_found", "Player not found", 404);
 
-  const bonus = Math.round(Number(input.bonusAmount ?? 0));
-  if (!Number.isFinite(bonus) || bonus < 0) {
+  const platformCurrency = await requirePlatformCurrency();
+  const rawBonus = Number(input.bonusAmount ?? 0);
+  if (!Number.isFinite(rawBonus) || rawBonus < 0) {
     throw new AppError("validation_error", "Invalid bonus amount", 400);
   }
+  const bonusRounded = roundMoneyToCurrency(rawBonus, platformCurrency);
   const totalAmount =
     input.totalAmount != null
-      ? Math.round(input.totalAmount)
-      : Math.round(input.amount + bonus);
+      ? roundMoneyToCurrency(input.totalAmount, platformCurrency)
+      : roundMoneyToCurrency(input.amount + bonusRounded, platformCurrency);
 
   return {
     player: new Types.ObjectId(input.playerMongoId),
-    bonusAmount: bonus,
+    bonusAmount: bonusRounded,
     totalAmount,
   };
 }
@@ -398,11 +403,27 @@ async function resolveImportPlayerFields(input: CreateDepositInput): Promise<{
 export async function createDeposit(input: CreateDepositInput, actorId: string, requestId?: string) {
   await ensureGlobalUtrUniqueForDeposit(input.utr);
   const mode = input.settlementAccountType ?? "bank";
-  const playerFields = await resolveImportPlayerFields(input);
+  const platformCurrency = await requirePlatformCurrency();
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(platformCurrency) },
+  );
+  const playerFields = await resolveImportPlayerFields({
+    ...input,
+    amount: money.amount,
+  });
 
   const base = {
     utr: normalizeUtr(input.utr),
-    amount: input.amount,
+    amount: money.amount,
+    operatedCurrency: money.operatedCurrency,
+    operatedAmount: money.operatedAmount,
+    exchangeRate: money.exchangeRate,
     status: "pending" as const,
     entryAt: parseBusinessDateTime(input.entryAt, "entryAt"),
     createdBy: new Types.ObjectId(actorId),
@@ -432,7 +453,10 @@ export async function createDeposit(input: CreateDepositInput, actorId: string, 
         settlementAccountType: "bank",
         bankId: bankIdStr,
         utr: base.utr,
-        amount: input.amount,
+        amount: money.amount,
+        operatedCurrency: money.operatedCurrency,
+        operatedAmount: money.operatedAmount,
+        exchangeRate: money.exchangeRate,
         entryAt: doc.entryAt,
       } as unknown as Record<string, unknown>,
       requestId,
@@ -464,7 +488,10 @@ export async function createDeposit(input: CreateDepositInput, actorId: string, 
       liabilityPersonId: personId,
       liabilityPersonName: doc.liabilityPersonName,
       utr: base.utr,
-      amount: input.amount,
+      amount: money.amount,
+      operatedCurrency: money.operatedCurrency,
+      operatedAmount: money.operatedAmount,
+      exchangeRate: money.exchangeRate,
       entryAt: doc.entryAt,
     } as unknown as Record<string, unknown>,
     requestId,
@@ -484,6 +511,17 @@ export async function updateDepositByBanker(id: string, input: BankerDepositCrea
   if (utrTrim !== normalizeUtr(doc.utr)) {
     await ensureGlobalUtrUniqueForDeposit(utrTrim, doc._id);
   }
+
+  const platformCurrency = await requirePlatformCurrency();
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(platformCurrency) },
+  );
 
   const mode = input.settlementAccountType ?? "bank";
   const prev = {
@@ -524,7 +562,10 @@ export async function updateDepositByBanker(id: string, input: BankerDepositCrea
   }
 
   doc.utr = utrTrim;
-  doc.amount = input.amount;
+  doc.amount = money.amount;
+  doc.operatedCurrency = money.operatedCurrency;
+  doc.operatedAmount = money.operatedAmount;
+  doc.exchangeRate = money.exchangeRate;
   await doc.save();
 
   await createAuditLog({
@@ -538,7 +579,10 @@ export async function updateDepositByBanker(id: string, input: BankerDepositCrea
       bankId: mode === "bank" ? input.bankId : undefined,
       liabilityPersonId: mode === "person" ? input.liabilityPersonId : undefined,
       utr: utrTrim,
-      amount: input.amount,
+      amount: money.amount,
+      operatedCurrency: money.operatedCurrency,
+      operatedAmount: money.operatedAmount,
+      exchangeRate: money.exchangeRate,
     } as unknown as Record<string, unknown>,
     requestId,
   });
@@ -823,8 +867,8 @@ export async function deleteDepositWithReversal(id: string, actorId: string, req
   return { id: String(doc._id), deleted: true };
 }
 
-function bonusAmountFromPercent(amount: number, percent: number): number {
-  return Math.round((amount * percent) / 100);
+function bonusAmountFromPercent(amount: number, percent: number, platformCurrency: string): number {
+  return roundMoneyToCurrency((amount * percent) / 100, platformCurrency);
 }
 
 async function isFirstDepositForPlayer(playerId: Types.ObjectId, currentDepositId: Types.ObjectId): Promise<boolean> {
@@ -871,7 +915,8 @@ export async function exchangeApproveDeposit(
 
   const doc = await DepositModel.findById(id);
   if (!doc) throw new AppError("not_found", "Deposit not found", 404);
-  const requestedBonusRounded = Math.round(requestedBonus);
+  const platformCurrency = await requirePlatformCurrency();
+  const requestedBonusRounded = roundMoneyToCurrency(requestedBonus, platformCurrency);
   if (doc.status === "verified") {
     const samePlayer = doc.player && String(doc.player) === input.playerId;
     const sameBonus = Number(doc.bonusAmount ?? 0) === requestedBonusRounded;
@@ -906,9 +951,9 @@ export async function exchangeApproveDeposit(
   const appliedBonusPercent = isFirstDeposit
     ? playerDoc.firstDepositBonusPercentage
     : playerDoc.regularBonusPercentage;
-  const bonusFromRule = bonusAmountFromPercent(doc.amount, appliedBonusPercent);
+  const bonusFromRule = bonusAmountFromPercent(doc.amount, appliedBonusPercent, platformCurrency);
   const bonus = requestedBonusRounded;
-  const totalAmount = Math.round(Number(doc.amount) + bonus);
+  const totalAmount = roundMoneyToCurrency(Number(doc.amount) + bonus, platformCurrency);
   const bankCashCredit = doc.amount;
 
   const previousStatus = doc.status;
@@ -1301,8 +1346,22 @@ async function amendVerifiedDepositPersonSettlement(
     throw new AppError("business_rule_error", "Player has no exchange assigned", 400);
   }
 
-  const bonus = Math.round(Number(input.bonusAmount));
-  const totalAmount = Math.round(Number(input.amount) + bonus);
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: 0 },
+  );
+  const bonusPlatform = convertSecondaryAmount(
+    Number(input.bonusAmount ?? 0),
+    money.exchangeRate,
+    money.platformCurrency,
+    money.operatedCurrency,
+  );
+  const totalAmount = roundMoneyToCurrency(money.amount + bonusPlatform, money.platformCurrency);
   const nextEntryAt = input.entryAt ? parseBusinessDateTime(input.entryAt, "entryAt") : doc.entryAt;
   const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.DEPOSIT_FINAL_AMEND);
   const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
@@ -1311,7 +1370,7 @@ async function amendVerifiedDepositPersonSettlement(
   const lpName = String(doc.liabilityPersonName ?? "").trim();
 
   const needsLiabilityRefresh =
-    Number(input.amount) !== Number(doc.amount) ||
+    Number(money.amount) !== Number(doc.amount) ||
     utrTrim !== normalizeUtr(doc.utr) ||
     !entryAtMsEqual(nextEntryAt, doc.entryAt);
 
@@ -1331,9 +1390,9 @@ async function amendVerifiedDepositPersonSettlement(
     liabilityPersonId: lpIdStr,
     liabilityPersonName: lpName || undefined,
     utr: utrTrim,
-    amount: input.amount,
+    amount: money.amount,
     playerId: input.playerId,
-    bonusAmount: bonus,
+    bonusAmount: bonusPlatform,
     totalAmount,
   };
 
@@ -1357,9 +1416,12 @@ async function amendVerifiedDepositPersonSettlement(
   }
 
   doc.utr = utrTrim;
-  doc.amount = input.amount;
+  doc.amount = money.amount;
+  doc.operatedCurrency = money.operatedCurrency;
+  doc.operatedAmount = money.operatedAmount;
+  doc.exchangeRate = money.exchangeRate;
   doc.player = new Types.ObjectId(input.playerId);
-  doc.bonusAmount = bonus;
+  doc.bonusAmount = bonusPlatform;
   doc.totalAmount = totalAmount;
   doc.entryAt = nextEntryAt;
   doc.bankBalanceAfter = undefined;
@@ -1529,8 +1591,22 @@ export async function amendVerifiedDeposit(
     throw new AppError("business_rule_error", "Player has no exchange assigned", 400);
   }
 
-  const bonus = Math.round(Number(input.bonusAmount));
-  const totalAmount = Math.round(Number(input.amount) + bonus);
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: 0 },
+  );
+  const bonusPlatform = convertSecondaryAmount(
+    Number(input.bonusAmount ?? 0),
+    money.exchangeRate,
+    money.platformCurrency,
+    money.operatedCurrency,
+  );
+  const totalAmount = roundMoneyToCurrency(money.amount + bonusPlatform, money.platformCurrency);
   const nextEntryAt = input.entryAt ? parseBusinessDateTime(input.entryAt, "entryAt") : doc.entryAt;
   const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.DEPOSIT_FINAL_AMEND);
   const amendReasonText = composeRejectReasonText(resolved.masterText, input.remark);
@@ -1538,7 +1614,7 @@ export async function amendVerifiedDeposit(
   const oldBankId = doc.bankId;
   const oldAmount = doc.amount;
   const newBankId = new Types.ObjectId(input.bankId);
-  const newAmount = input.amount;
+  const newAmount = money.amount;
 
   const oldSnapshot: DepositAmendmentSnapshot = {
     bankId: doc.bankId?.toString(),
@@ -1555,9 +1631,9 @@ export async function amendVerifiedDeposit(
     bankId: input.bankId,
     bankName: bankDisplayName(newBankDoc),
     utr: utrTrim,
-    amount: input.amount,
+    amount: money.amount,
     playerId: input.playerId,
-    bonusAmount: bonus,
+    bonusAmount: bonusPlatform,
     totalAmount,
   };
 
@@ -1615,9 +1691,12 @@ export async function amendVerifiedDeposit(
     doc.bankId = newBankId;
     doc.bankName = newSnapshotPlain.bankName ?? doc.bankName;
     doc.utr = utrTrim;
-    doc.amount = input.amount;
+    doc.amount = money.amount;
+    doc.operatedCurrency = money.operatedCurrency;
+    doc.operatedAmount = money.operatedAmount;
+    doc.exchangeRate = money.exchangeRate;
     doc.player = new Types.ObjectId(input.playerId);
-    doc.bonusAmount = bonus;
+    doc.bonusAmount = bonusPlatform;
     doc.totalAmount = totalAmount;
     doc.entryAt = nextEntryAt;
     doc.bankBalanceAfter = newBankBalanceAfter;

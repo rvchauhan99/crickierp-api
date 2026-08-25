@@ -9,6 +9,9 @@ export interface LiabilityEntryDocument {
   entryDate: Date;
   entryType: LiabilityEntryType;
   amount: number;
+  operatedCurrency?: string;
+  operatedAmount?: number;
+  exchangeRate?: number;
   fromAccountType: LiabilityAccountType;
   fromAccountId: Types.ObjectId;
   toAccountType: LiabilityAccountType;
@@ -34,6 +37,9 @@ const liabilityEntrySchema = new Schema<LiabilityEntryDocument>(
       default: "journal",
     },
     amount: { type: Number, required: true, min: 0.01 },
+    operatedCurrency: { type: String, trim: true },
+    operatedAmount: { type: Number, min: 0 },
+    exchangeRate: { type: Number, min: 0 },
     fromAccountType: { type: String, enum: ["bank", "person", "expense", "deposit", "withdrawal"], required: true },
     fromAccountId: { type: Schema.Types.ObjectId, required: true },
     toAccountType: { type: String, enum: ["bank", "person", "expense", "deposit", "withdrawal"], required: true },

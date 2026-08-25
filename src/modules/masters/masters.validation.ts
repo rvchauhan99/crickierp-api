@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { MasterModelKey } from "./masters.registry";
 import { MASTER_MODEL_KEYS } from "./masters.registry";
+import { SUPPORTED_CURRENCIES } from "../../shared/constants/currencies";
 
 const mongoIdString = z.string().regex(/^[a-f0-9]{24}$/i, "Invalid id");
 
@@ -67,12 +68,56 @@ export const createExpenseTypeBodySchema = z
 
 export const updateExpenseTypeBodySchema = createExpenseTypeBodySchema.partial().strict();
 
+const currencyEnum = z.enum(SUPPORTED_CURRENCIES);
+
+export const createExchangeRateBodySchema = z
+  .object({
+    fromCurrency: currencyEnum,
+    toCurrency: currencyEnum,
+    rate: z.number().positive(),
+    isActive: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((data, ctx) => {
+    if (data.fromCurrency === data.toCurrency) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "From and to currency must be different",
+        path: ["toCurrency"],
+      });
+    }
+  });
+
+export const updateExchangeRateBodySchema = z
+  .object({
+    fromCurrency: currencyEnum.optional(),
+    toCurrency: currencyEnum.optional(),
+    rate: z.number().positive().optional(),
+    isActive: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((data, ctx) => {
+    if (
+      data.fromCurrency !== undefined &&
+      data.toCurrency !== undefined &&
+      data.fromCurrency === data.toCurrency
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "From and to currency must be different",
+        path: ["toCurrency"],
+      });
+    }
+  });
+
 export function parseCreateBody(modelKey: MasterModelKey, body: unknown): Record<string, unknown> {
   switch (modelKey) {
     case "reason":
       return createReasonBodySchema.parse(body) as Record<string, unknown>;
     case "expenseType":
       return createExpenseTypeBodySchema.parse(body) as Record<string, unknown>;
+    case "exchangeRate":
+      return createExchangeRateBodySchema.parse(body) as Record<string, unknown>;
     default: {
       const _x: never = modelKey;
       return _x;
@@ -86,6 +131,8 @@ export function parseUpdateBody(modelKey: MasterModelKey, body: unknown): Record
       return updateReasonBodySchema.parse(body) as Record<string, unknown>;
     case "expenseType":
       return updateExpenseTypeBodySchema.parse(body) as Record<string, unknown>;
+    case "exchangeRate":
+      return updateExchangeRateBodySchema.parse(body) as Record<string, unknown>;
     default: {
       const _x: never = modelKey;
       return _x;

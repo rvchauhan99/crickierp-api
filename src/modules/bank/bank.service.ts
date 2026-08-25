@@ -18,6 +18,7 @@ import { BankModel } from "./bank.model";
 import { BankBalanceSettlementModel } from "./bank-balance-settlement.model";
 import { computeClosingBalanceActualByBankIds } from "./bankClosingBalance";
 import { listBankQuerySchema } from "./bank.validation";
+import { resolveOpeningMoneyFromRequest } from "../../shared/utils/moneyFx";
 
 type ListBankQuery = z.infer<typeof listBankQuerySchema>;
 
@@ -242,12 +243,29 @@ export async function createBank(input: {
   ifsc: string;
   openingBalance: number;
   status: "active" | "deactive";
+  openingOperatedCurrency?: string;
+  openingOperatedAmount?: number;
+  openingExchangeRate?: number;
 }, actorId: string, requestId?: string) {
   const existing = await BankModel.findOne({ accountNumber: input.accountNumber });
   if (existing) throw new AppError("business_rule_error", "Account number already exists", 409);
+  const opening = await resolveOpeningMoneyFromRequest({
+    openingBalance: input.openingBalance,
+    openingOperatedCurrency: input.openingOperatedCurrency,
+    openingOperatedAmount: input.openingOperatedAmount,
+    openingExchangeRate: input.openingExchangeRate,
+  });
   const doc = await BankModel.create({
-    ...input,
-    currentBalance: input.openingBalance,
+    holderName: input.holderName,
+    bankName: input.bankName,
+    accountNumber: input.accountNumber,
+    ifsc: input.ifsc,
+    status: input.status,
+    openingBalance: opening.openingBalance,
+    openingOperatedCurrency: opening.openingOperatedCurrency,
+    openingOperatedAmount: opening.openingOperatedAmount,
+    openingExchangeRate: opening.openingExchangeRate,
+    currentBalance: opening.openingBalance,
     createdBy: new Types.ObjectId(actorId),
   });
   await createAuditLog({
@@ -255,7 +273,17 @@ export async function createBank(input: {
     action: "bank.create",
     entity: "bank",
     entityId: doc._id.toString(),
-    newValue: input as unknown as Record<string, unknown>,
+    newValue: {
+      holderName: input.holderName,
+      bankName: input.bankName,
+      accountNumber: input.accountNumber,
+      ifsc: input.ifsc,
+      openingBalance: opening.openingBalance,
+      openingOperatedCurrency: opening.openingOperatedCurrency,
+      openingOperatedAmount: opening.openingOperatedAmount,
+      openingExchangeRate: opening.openingExchangeRate,
+      status: input.status,
+    } as unknown as Record<string, unknown>,
     requestId,
   });
   return doc;

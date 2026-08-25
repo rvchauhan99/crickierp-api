@@ -34,6 +34,9 @@ import { enqueueExchangeRecompute } from "../../shared/queue/queue";
 import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 import { logger } from "../../shared/logger";
 import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/utr";
+import { resolveMoneyFromRequest, convertSecondaryAmount, roundMoneyToCurrency } from "../../shared/utils/moneyFx";
+import { getCurrencyMinUnit } from "../../shared/constants/currencies";
+import { requirePlatformCurrency } from "../settings/settings.service";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -287,9 +290,9 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Re
   return { $and: conditions };
 }
 
-function payableFromAmounts(amount: number, reverseBonus: number): number {
+function payableFromAmounts(amount: number, reverseBonus: number, platformCurrency: string): number {
   const raw = amount - reverseBonus;
-  return Math.max(0, Math.round(raw));
+  return Math.max(0, roundMoneyToCurrency(raw, platformCurrency));
 }
 
 function entryAtMsEqual(a: Date | undefined, b: Date | undefined): boolean {
@@ -326,6 +329,9 @@ export async function createWithdrawal(
     amount: number;
     reverseBonus: number;
     requestedAt?: string;
+    operatedCurrency?: string;
+    operatedAmount?: number;
+    exchangeRate?: number;
   },
   actorId: string,
   requestId?: string,
@@ -333,8 +339,24 @@ export async function createWithdrawal(
   const player = await PlayerModel.findById(input.playerId);
   if (!player) throw new AppError("not_found", "Player not found", 404);
 
-  const reverseBonus = input.reverseBonus ?? 0;
-  const payableAmount = payableFromAmounts(input.amount, reverseBonus);
+  const platformCurrency = await requirePlatformCurrency();
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(platformCurrency) },
+  );
+  const reverseBonusOperated = input.reverseBonus ?? 0;
+  const reverseBonus = convertSecondaryAmount(
+    reverseBonusOperated,
+    money.exchangeRate,
+    money.platformCurrency,
+    money.operatedCurrency,
+  );
+  const payableAmount = payableFromAmounts(money.amount, reverseBonus, money.platformCurrency);
   const playerLabel = `${player.playerId} · ${player.phone}`;
 
   const doc = await WithdrawalModel.create({
@@ -344,7 +366,10 @@ export async function createWithdrawal(
     accountHolderName: input.accountHolderName.trim(),
     bankName: input.bankName.trim(),
     ifsc: input.ifsc.trim(),
-    amount: input.amount,
+    amount: money.amount,
+    operatedCurrency: money.operatedCurrency,
+    operatedAmount: money.operatedAmount,
+    exchangeRate: money.exchangeRate,
     reverseBonus,
     payableAmount,
     requestedAt: parseBusinessDateTime(input.requestedAt, "requestedAt"),
@@ -360,7 +385,10 @@ export async function createWithdrawal(
     newValue: {
       playerId: input.playerId,
       accountNumber: input.accountNumber,
-      amount: input.amount,
+      amount: money.amount,
+      operatedCurrency: money.operatedCurrency,
+      operatedAmount: money.operatedAmount,
+      exchangeRate: money.exchangeRate,
       payableAmount,
       requestedAt: doc.requestedAt,
     } as unknown as Record<string, unknown>,
@@ -388,6 +416,9 @@ export async function updateWithdrawalByExchange(
     ifsc: string;
     amount: number;
     reverseBonus: number;
+    operatedCurrency?: string;
+    operatedAmount?: number;
+    exchangeRate?: number;
   },
   actorId: string,
   requestId?: string,
@@ -398,8 +429,23 @@ export async function updateWithdrawalByExchange(
     throw new AppError("business_rule_error", "Only requested withdrawals can be updated", 400);
   }
 
-  const nextReverseBonus = input.reverseBonus ?? 0;
-  const payableAmount = payableFromAmounts(input.amount, nextReverseBonus);
+  const platformCurrency = await requirePlatformCurrency();
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(platformCurrency) },
+  );
+  const nextReverseBonus = convertSecondaryAmount(
+    input.reverseBonus ?? 0,
+    money.exchangeRate,
+    money.platformCurrency,
+    money.operatedCurrency,
+  );
+  const payableAmount = payableFromAmounts(money.amount, nextReverseBonus, money.platformCurrency);
   const prev = {
     accountNumber: doc.accountNumber,
     accountHolderName: doc.accountHolderName,
@@ -414,7 +460,10 @@ export async function updateWithdrawalByExchange(
   doc.accountHolderName = input.accountHolderName.trim();
   doc.bankName = input.bankName.trim();
   doc.ifsc = input.ifsc.trim();
-  doc.amount = input.amount;
+  doc.amount = money.amount;
+  doc.operatedCurrency = money.operatedCurrency;
+  doc.operatedAmount = money.operatedAmount;
+  doc.exchangeRate = money.exchangeRate;
   doc.reverseBonus = nextReverseBonus;
   doc.payableAmount = payableAmount;
   await doc.save();
@@ -431,6 +480,9 @@ export async function updateWithdrawalByExchange(
       bankName: doc.bankName,
       ifsc: doc.ifsc,
       amount: doc.amount,
+      operatedCurrency: money.operatedCurrency,
+      operatedAmount: money.operatedAmount,
+      exchangeRate: money.exchangeRate,
       reverseBonus: doc.reverseBonus,
       payableAmount: doc.payableAmount,
     } as unknown as Record<string, unknown>,
@@ -529,7 +581,8 @@ export async function updateWithdrawalByBanker(
     doc.status = "approved";
     await doc.save();
 
-    const payable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
+    const platformCurrency = await requirePlatformCurrency();
+    const payable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0, platformCurrency));
     try {
       const entryAt = doc.requestedAt ?? doc.createdAt ?? new Date();
       const liabilityEntryYmd = formatDateForTimeZone(entryAt, DEFAULT_TIMEZONE) || entryAt.toISOString().slice(0, 10);
@@ -1023,8 +1076,23 @@ async function amendWithdrawalPersonSettlement(
     await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
   }
 
-  const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
-  const newPayable = payableFromAmounts(input.amount, input.reverseBonus);
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: 0 },
+  );
+  const reverseBonusPlatform = convertSecondaryAmount(
+    Number(input.reverseBonus ?? 0),
+    money.exchangeRate,
+    money.platformCurrency,
+    money.operatedCurrency,
+  );
+  const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0, money.platformCurrency));
+  const newPayable = payableFromAmounts(money.amount, reverseBonusPlatform, money.platformCurrency);
   const nextRequestedAt = input.requestedAt
     ? parseBusinessDateTime(input.requestedAt, "requestedAt")
     : doc.requestedAt;
@@ -1052,8 +1120,8 @@ async function amendWithdrawalPersonSettlement(
   };
 
   const newSnapshot: WithdrawalAmendmentSnapshot = {
-    amount: input.amount,
-    reverseBonus: input.reverseBonus,
+    amount: money.amount,
+    reverseBonus: reverseBonusPlatform,
     payableAmount: newPayable,
     payoutLiabilityPersonId: lpIdStr,
     payoutLiabilityPersonName: lpName || undefined,
@@ -1076,8 +1144,11 @@ async function amendWithdrawalPersonSettlement(
     doc.payoutLiabilityEntryId = undefined;
   }
 
-  doc.amount = input.amount;
-  doc.reverseBonus = input.reverseBonus;
+  doc.amount = money.amount;
+  doc.operatedCurrency = money.operatedCurrency;
+  doc.operatedAmount = money.operatedAmount;
+  doc.exchangeRate = money.exchangeRate;
+  doc.reverseBonus = reverseBonusPlatform;
   doc.payableAmount = newPayable;
   doc.utr = utrTrim;
   doc.requestedAt = nextRequestedAt;
@@ -1225,8 +1296,23 @@ export async function amendWithdrawal(
     await ensureGlobalUtrUniqueForWithdrawal(utrTrim, doc._id);
   }
 
-  const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0));
-  const newPayable = payableFromAmounts(input.amount, input.reverseBonus);
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: 0 },
+  );
+  const reverseBonusPlatform = convertSecondaryAmount(
+    Number(input.reverseBonus ?? 0),
+    money.exchangeRate,
+    money.platformCurrency,
+    money.operatedCurrency,
+  );
+  const oldPayable = Number(doc.payableAmount ?? payableFromAmounts(doc.amount, doc.reverseBonus ?? 0, money.platformCurrency));
+  const newPayable = payableFromAmounts(money.amount, reverseBonusPlatform, money.platformCurrency);
   const nextRequestedAt = input.requestedAt
     ? parseBusinessDateTime(input.requestedAt, "requestedAt")
     : doc.requestedAt;
@@ -1245,8 +1331,8 @@ export async function amendWithdrawal(
   };
   const oldRequestedAt = doc.requestedAt;
   const newSnapshot: WithdrawalAmendmentSnapshot = {
-    amount: input.amount,
-    reverseBonus: input.reverseBonus,
+    amount: money.amount,
+    reverseBonus: reverseBonusPlatform,
     payableAmount: newPayable,
     payoutBankId: newBankId,
     payoutBankName: bankDisplayName(newBank),
@@ -1296,8 +1382,11 @@ export async function amendWithdrawal(
   }
 
   try {
-    doc.amount = input.amount;
-    doc.reverseBonus = input.reverseBonus;
+    doc.amount = money.amount;
+    doc.operatedCurrency = money.operatedCurrency;
+    doc.operatedAmount = money.operatedAmount;
+    doc.exchangeRate = money.exchangeRate;
+    doc.reverseBonus = reverseBonusPlatform;
     doc.payableAmount = newPayable;
     doc.payoutBankId = new Types.ObjectId(newBankId);
     doc.payoutBankName = newSnapshot.payoutBankName ?? doc.payoutBankName;

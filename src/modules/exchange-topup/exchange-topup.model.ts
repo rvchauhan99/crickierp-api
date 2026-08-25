@@ -4,6 +4,9 @@ export interface ExchangeTopupDocument {
   _id: Types.ObjectId;
   exchangeId: Types.ObjectId;
   amount: number;
+  operatedCurrency?: string;
+  operatedAmount?: number;
+  exchangeRate?: number;
   remark?: string;
   createdBy: Types.ObjectId;
   createdAt: Date;
@@ -14,6 +17,9 @@ const exchangeTopupSchema = new Schema<ExchangeTopupDocument>(
   {
     exchangeId: { type: Schema.Types.ObjectId, ref: "Exchange", required: true, index: true },
     amount: { type: Number, min: 0.01, required: true },
+    operatedCurrency: { type: String, trim: true },
+    operatedAmount: { type: Number, min: 0 },
+    exchangeRate: { type: Number, min: 0 },
     remark: { type: String, trim: true, maxlength: 1000 },
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
   },

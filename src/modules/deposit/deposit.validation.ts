@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { moneyFxInputSchema } from "../../shared/validation/moneyFx.validation";
 
 const optionalDateTime = z.preprocess(
   (value) => {
@@ -11,9 +12,10 @@ const optionalDateTime = z.preprocess(
 
 const depositCoreFieldsSchema = z.object({
   utr: z.string().min(4).max(120).trim(),
-  amount: z.number().int().min(1),
+  /** Operated-currency amount (converted to platform on save). */
+  amount: z.number().positive(),
   entryAt: optionalDateTime,
-});
+}).merge(moneyFxInputSchema);
 
 export const createDepositBodySchema = depositCoreFieldsSchema
   .extend({
@@ -116,25 +118,25 @@ export const exchangeActionBodySchema = z.discriminatedUnion("action", [
 export const amendDepositBodySchema = z.object({
   bankId: z.string().length(24).optional(),
   utr: z.string().min(4).max(120).trim(),
-  amount: z.number().int().min(0),
+  amount: z.number().min(0),
   playerId: z.string().length(24),
-  bonusAmount: z.number().int().min(0),
+  bonusAmount: z.number().min(0),
   entryAt: optionalDateTime,
   reasonId: z.string().length(24),
   remark: z.string().max(2000).trim().optional(),
-});
+}).merge(moneyFxInputSchema);
 
 const depositImportRowSchema = z.object({
   utr: z.string().min(4).max(120),
-  amount: z.number().int().min(1),
+  amount: z.number().positive(),
   entryAt: z.string().optional(),
   settlementAccountType: z.enum(["bank", "person"]).default("bank"),
   bankId: z.string().length(24).optional(),
   liabilityPersonId: z.string().length(24).optional(),
   playerMongoId: z.string().length(24).optional(),
-  bonusAmount: z.number().int().min(0).optional(),
-  totalAmount: z.number().int().min(1).optional(),
-});
+  bonusAmount: z.number().min(0).optional(),
+  totalAmount: z.number().positive().optional(),
+}).merge(moneyFxInputSchema);
 
 export const commitDepositImportBodySchema = z.object({
   rows: z.array(depositImportRowSchema).min(1).max(500),

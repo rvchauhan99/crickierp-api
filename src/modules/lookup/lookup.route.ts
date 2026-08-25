@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authMiddleware } from "../../shared/middlewares/auth.middleware";
 import {
+  getExchangeRateLookupController,
   getPlayerBonusProfileLookupController,
   listBankLookupController,
   listExchangeLookupController,
@@ -26,6 +27,7 @@ lookupRouter.get(
   getPlayerBonusProfileLookupController,
 );
 lookupRouter.get("/exchanges", lookupPermissionMiddleware("exchanges"), listExchangeLookupController);
+/** Any authenticated user — needed to default FX on money forms */
+lookupRouter.get("/exchange-rate", getExchangeRateLookupController);
 
 export { lookupRouter };
-

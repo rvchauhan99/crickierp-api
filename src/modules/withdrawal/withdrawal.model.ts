@@ -35,8 +35,11 @@ export interface WithdrawalDocument {
   accountHolderName?: string;
   bankName: string;
   ifsc?: string;
-  /** Exchange withdrawal amount */
+  /** Exchange withdrawal amount (platform currency) */
   amount: number;
+  operatedCurrency?: string;
+  operatedAmount?: number;
+  exchangeRate?: number;
   reverseBonus?: number;
   /** amount - reverseBonus (stored for audit) */
   payableAmount?: number;
@@ -104,6 +107,9 @@ const withdrawalSchema = new Schema<WithdrawalDocument>(
     bankName: { type: String, required: true, trim: true },
     ifsc: { type: String, trim: true, default: "" },
     amount: { type: Number, required: true, min: 0 },
+    operatedCurrency: { type: String, trim: true },
+    operatedAmount: { type: Number, min: 0 },
+    exchangeRate: { type: Number, min: 0 },
     reverseBonus: { type: Number, min: 0, default: 0 },
     payableAmount: { type: Number, min: 0 },
     payoutBankId: { type: Schema.Types.ObjectId, ref: "Bank" },

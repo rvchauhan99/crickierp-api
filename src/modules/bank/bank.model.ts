@@ -7,6 +7,9 @@ export interface BankDocument {
   accountNumber: string;
   ifsc: string;
   openingBalance: number;
+  openingOperatedCurrency?: string;
+  openingOperatedAmount?: number;
+  openingExchangeRate?: number;
   /** Running balance; if unset, treat as openingBalance (legacy rows). */
   currentBalance?: number;
   status: "active" | "deactive";
@@ -22,6 +25,9 @@ const bankSchema = new Schema<BankDocument>(
     accountNumber: { type: String, required: true, trim: true, unique: true },
     ifsc: { type: String, required: true, trim: true },
     openingBalance: { type: Number, required: true, min: 0, default: 0 },
+    openingOperatedCurrency: { type: String, trim: true },
+    openingOperatedAmount: { type: Number, min: 0 },
+    openingExchangeRate: { type: Number, min: 0 },
     currentBalance: { type: Number, min: 0 },
     status: { type: String, enum: ["active", "deactive"], default: "active" },
     createdBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },

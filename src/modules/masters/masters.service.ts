@@ -11,7 +11,7 @@ import {
   type MasterRegistryEntry,
 } from "./masters.registry";
 
-export type MasterFieldType = "STRING" | "TEXT" | "BOOLEAN" | "INTEGER" | "DATE";
+export type MasterFieldType = "STRING" | "TEXT" | "BOOLEAN" | "INTEGER" | "DECIMAL" | "DATE";
 
 export type MasterField = {
   name: string;
@@ -42,6 +42,7 @@ const SERVER_ONLY: Set<string> = new Set([
 
 function cacheDomainsForModel(modelKey: MasterModelKey): string[] {
   if (modelKey === "expenseType") return ["expenseType"];
+  if (modelKey === "exchangeRate") return ["exchangeRate"];
   return [];
 }
 
@@ -52,7 +53,10 @@ function pathToFieldType(path: SchemaType, pathName: string): MasterFieldType {
     return "STRING";
   }
   if (inst === "Boolean") return "BOOLEAN";
-  if (inst === "Number") return "INTEGER";
+  if (inst === "Number") {
+    if (pathName === "rate") return "DECIMAL";
+    return "INTEGER";
+  }
   if (inst === "Date") return "DATE";
   return "STRING";
 }

@@ -12,3 +12,8 @@ export const lookupQuerySchema = z.object({
   ),
 });
 
+export const exchangeRateLookupQuerySchema = z.object({
+  from: z.string().trim().min(3).max(3),
+  to: z.string().trim().min(3).max(3),
+});
+

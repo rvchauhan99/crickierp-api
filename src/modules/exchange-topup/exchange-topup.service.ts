@@ -6,9 +6,19 @@ import { ExchangeModel } from "../exchange/exchange.model";
 import { recomputeExchangeCurrentBalance } from "../exchange/exchange.service";
 import { DEFAULT_TIMEZONE, formatDateTimeForTimeZone } from "../../shared/utils/timezone";
 import { ExchangeTopupModel } from "./exchange-topup.model";
+import { resolveMoneyFromRequest } from "../../shared/utils/moneyFx";
+import { getCurrencyMinUnit } from "../../shared/constants/currencies";
+import { requirePlatformCurrency } from "../settings/settings.service";
 
 export async function createExchangeTopup(
-  input: { exchangeId: string; amount: number; remark?: string },
+  input: {
+    exchangeId: string;
+    amount: number;
+    remark?: string;
+    operatedCurrency?: string;
+    operatedAmount?: number;
+    exchangeRate?: number;
+  },
   actorId: string,
   requestId?: string,
 ) {
@@ -19,9 +29,22 @@ export async function createExchangeTopup(
   const exchange = await ExchangeModel.findById(exchangeObjectId).select("_id name provider");
   if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
 
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(await requirePlatformCurrency()) },
+  );
+
   const doc = await ExchangeTopupModel.create({
     exchangeId: exchangeObjectId,
-    amount: input.amount,
+    amount: money.amount,
+    operatedCurrency: money.operatedCurrency,
+    operatedAmount: money.operatedAmount,
+    exchangeRate: money.exchangeRate,
     remark: input.remark?.trim() || undefined,
     createdBy: new Types.ObjectId(actorId),
   });
@@ -36,6 +59,9 @@ export async function createExchangeTopup(
     newValue: {
       exchangeId: exchangeObjectId.toString(),
       amount: doc.amount,
+      operatedCurrency: money.operatedCurrency,
+      operatedAmount: money.operatedAmount,
+      exchangeRate: money.exchangeRate,
       remark: doc.remark,
       currentBalance,
     },

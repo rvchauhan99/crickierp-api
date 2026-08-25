@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
-import { lookupQuerySchema } from "./lookup.validation";
+import { exchangeRateLookupQuerySchema, lookupQuerySchema } from "./lookup.validation";
 import {
   getPlayerBonusProfileLookup,
   listBankLookupOptions,
@@ -8,6 +8,7 @@ import {
   listExpenseTypeLookupOptions,
   listPlayerLookupOptions,
 } from "./lookup.service";
+import { resolveMasterExchangeRate } from "./exchange-rate-lookup.service";
 
 export async function listBankLookupController(req: Request, res: Response) {
   const query = lookupQuerySchema.parse(req.query);
@@ -43,3 +44,9 @@ export async function getPlayerBonusProfileLookupController(req: Request, res: R
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
+export async function getExchangeRateLookupController(req: Request, res: Response) {
+  const query = exchangeRateLookupQuerySchema.parse(req.query);
+  const data = await resolveMasterExchangeRate(query.from, query.to);
+  res.setHeader("Cache-Control", "private, max-age=30");
+  res.status(StatusCodes.OK).json({ success: true, data });
+}

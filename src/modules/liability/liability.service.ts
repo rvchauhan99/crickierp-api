@@ -18,6 +18,9 @@ import {
 import { type LiabilityEntryDocument, LiabilityEntryModel } from "./liability-entry.model";
 import { LiabilityPersonModel } from "./liability-person.model";
 import { liabilityLedgerQuerySchema, listLiabilityEntryQuerySchema, listLiabilityPersonQuerySchema } from "./liability.validation";
+import { resolveMoneyFromRequest, resolveOpeningMoneyFromRequest } from "../../shared/utils/moneyFx";
+import { getCurrencyMinUnit } from "../../shared/constants/currencies";
+import { requirePlatformCurrency } from "../settings/settings.service";
 
 type ListLiabilityPersonQuery = z.infer<typeof listLiabilityPersonQuerySchema>;
 type ListLiabilityEntryQuery = z.infer<typeof listLiabilityEntryQuerySchema>;
@@ -195,11 +198,51 @@ export async function createLiabilityPerson(
     openingBalance?: number;
     openingAmount?: number;
     openingKind?: "payable" | "receivable";
+    openingOperatedCurrency?: string;
+    openingOperatedAmount?: number;
+    openingExchangeRate?: number;
   },
   actorId: string,
   requestId?: string,
 ) {
-  const signedOpening = resolveSignedOpeningFromPersonBody(input, "create") ?? 0;
+  const operatedOpeningAbs =
+    input.openingAmount !== undefined
+      ? Number(input.openingAmount)
+      : input.openingBalance !== undefined
+        ? Math.abs(Number(input.openingBalance))
+        : 0;
+
+  let signedOpening = 0;
+  let openingFx: {
+    openingOperatedCurrency?: string;
+    openingOperatedAmount?: number;
+    openingExchangeRate?: number;
+  } = {};
+
+  if (operatedOpeningAbs > 0 || input.openingOperatedCurrency || input.openingExchangeRate) {
+    const opening = await resolveOpeningMoneyFromRequest({
+      openingBalance: operatedOpeningAbs,
+      openingOperatedCurrency: input.openingOperatedCurrency,
+      openingOperatedAmount: input.openingOperatedAmount ?? operatedOpeningAbs,
+      openingExchangeRate: input.openingExchangeRate,
+    });
+    const kind =
+      input.openingKind ??
+      (input.openingBalance !== undefined && Number(input.openingBalance) < 0 ? "payable" : "receivable");
+    signedOpening = kind === "payable" ? -opening.openingBalance : opening.openingBalance;
+    if (operatedOpeningAbs === 0 && input.openingAmount === undefined && input.openingBalance === undefined) {
+      signedOpening = 0;
+    }
+    if (input.openingAmount !== undefined && input.openingAmount === 0) signedOpening = 0;
+    openingFx = {
+      openingOperatedCurrency: opening.openingOperatedCurrency,
+      openingOperatedAmount: opening.openingOperatedAmount,
+      openingExchangeRate: opening.openingExchangeRate,
+    };
+  } else {
+    signedOpening = resolveSignedOpeningFromPersonBody(input, "create") ?? 0;
+  }
+
   const doc = await LiabilityPersonModel.create({
     name: input.name.trim(),
     phone: input.phone?.trim() ?? "",
@@ -207,6 +250,7 @@ export async function createLiabilityPerson(
     notes: input.notes?.trim() ?? "",
     isActive: input.isActive ?? true,
     openingBalance: signedOpening,
+    ...openingFx,
     totalDebits: 0,
     totalCredits: 0,
     closingBalance: signedOpening,
@@ -221,6 +265,9 @@ export async function createLiabilityPerson(
     newValue: {
       name: doc.name,
       openingBalance: doc.openingBalance,
+      openingOperatedCurrency: doc.openingOperatedCurrency,
+      openingOperatedAmount: doc.openingOperatedAmount,
+      openingExchangeRate: doc.openingExchangeRate,
       isActive: doc.isActive,
     },
     requestId,
@@ -350,6 +397,9 @@ export async function createLiabilityEntry(
     sourceWithdrawalId?: string;
     referenceNo?: string;
     remark?: string;
+    operatedCurrency?: string;
+    operatedAmount?: number;
+    exchangeRate?: number;
   },
   actorId: string,
   requestId?: string,
@@ -360,10 +410,23 @@ export async function createLiabilityEntry(
     ensureAccountExists(input.toAccountType, input.toAccountId),
   ]);
 
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(await requirePlatformCurrency()) },
+  );
+
   const doc = await LiabilityEntryModel.create({
     entryDate: parseYmdToDate(input.entryDate),
     entryType: input.entryType,
-    amount: input.amount,
+    amount: money.amount,
+    operatedCurrency: money.operatedCurrency,
+    operatedAmount: money.operatedAmount,
+    exchangeRate: money.exchangeRate,
     fromAccountType: input.fromAccountType,
     fromAccountId: new Types.ObjectId(input.fromAccountId),
     toAccountType: input.toAccountType,
@@ -390,7 +453,10 @@ export async function createLiabilityEntry(
     newValue: {
       entryDate: input.entryDate,
       entryType: input.entryType,
-      amount: input.amount,
+      amount: money.amount,
+      operatedCurrency: money.operatedCurrency,
+      operatedAmount: money.operatedAmount,
+      exchangeRate: money.exchangeRate,
       fromAccountType: input.fromAccountType,
       fromAccountId: input.fromAccountId,
       toAccountType: input.toAccountType,
@@ -401,7 +467,7 @@ export async function createLiabilityEntry(
       sourceWithdrawalId: input.sourceWithdrawalId,
       referenceNo: input.referenceNo?.trim() || undefined,
       remark: input.remark?.trim() || undefined,
-    },
+    } as unknown as Record<string, unknown>,
     requestId,
   });
 

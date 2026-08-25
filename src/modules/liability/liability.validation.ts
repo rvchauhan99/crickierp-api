@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { moneyFxInputSchema, openingMoneyFxInputSchema } from "../../shared/validation/moneyFx.validation";
 
 const optionalTrimmed = z.preprocess(
   (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
@@ -44,6 +45,7 @@ export const createLiabilityPersonBodySchema = z
     openingAmount: z.number().min(0).optional(),
     openingKind: z.enum(["payable", "receivable"]).optional(),
   })
+  .merge(openingMoneyFxInputSchema)
   .superRefine(openingPersonBodyRefine);
 
 export const updateLiabilityPersonBodySchema = z
@@ -57,6 +59,7 @@ export const updateLiabilityPersonBodySchema = z
     openingAmount: z.number().min(0).optional(),
     openingKind: z.enum(["payable", "receivable"]).optional(),
   })
+  .merge(openingMoneyFxInputSchema.partial())
   .superRefine(openingPersonBodyRefine);
 
 export const listLiabilityPersonQuerySchema = z.object({
@@ -82,7 +85,7 @@ export const createLiabilityEntryBodySchema = z.object({
   toAccountId: z.string().length(24),
   referenceNo: optionalTrimmed,
   remark: optionalTrimmed,
-});
+}).merge(moneyFxInputSchema);
 
 export const listLiabilityEntryQuerySchema = z.object({
   search: optionalTrimmed,

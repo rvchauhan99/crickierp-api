@@ -24,6 +24,9 @@ import {
   listExpenseQuerySchema,
 } from "./expense.validation";
 import { deleteFile, getSignedUrl, uploadFile } from "../../shared/services/bucket.service";
+import { resolveMoneyFromRequest } from "../../shared/utils/moneyFx";
+import { getCurrencyMinUnit } from "../../shared/constants/currencies";
+import { requirePlatformCurrency } from "../settings/settings.service";
 
 type CancelExpenseInput = z.infer<typeof cancelExpenseBodySchema>;
 
@@ -158,6 +161,9 @@ export async function createExpense(
     description?: string;
     bankId?: string;
     liabilityPersonId?: string;
+    operatedCurrency?: string;
+    operatedAmount?: number;
+    exchangeRate?: number;
   },
   actorId: string,
   requestId?: string,
@@ -165,6 +171,16 @@ export async function createExpense(
   const et = await ExpenseTypeModel.findById(input.expenseTypeId);
   if (!et || et.deletedAt) throw new AppError("not_found", "Expense type not found", 404);
   if (!et.isActive) throw new AppError("business_rule_error", "Expense type is inactive", 400);
+
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(await requirePlatformCurrency()) },
+  );
 
   const skipAudit = et.auditRequired === false;
   const bankIdTrim = trimUndef(input.bankId);
@@ -201,7 +217,10 @@ export async function createExpense(
 
   const doc = await ExpenseModel.create({
     expenseTypeId: new Types.ObjectId(input.expenseTypeId),
-    amount: input.amount,
+    amount: money.amount,
+    operatedCurrency: money.operatedCurrency,
+    operatedAmount: money.operatedAmount,
+    exchangeRate: money.exchangeRate,
     expenseDate: parseYmdToDate(input.expenseDate),
     description: input.description?.trim() ?? "",
     bankId: bankObjectId,
@@ -217,11 +236,14 @@ export async function createExpense(
     entityId: doc._id.toString(),
     newValue: {
       expenseTypeId: input.expenseTypeId,
-      amount: input.amount,
+      amount: money.amount,
+      operatedCurrency: money.operatedCurrency,
+      operatedAmount: money.operatedAmount,
+      exchangeRate: money.exchangeRate,
       expenseDate: input.expenseDate,
       bankId: bankIdTrim,
       liabilityPersonId: liabilityPersonIdTrim,
-    },
+    } as unknown as Record<string, unknown>,
     requestId,
   });
 
@@ -256,6 +278,9 @@ export async function updateExpense(
     expenseDate?: string;
     description?: string;
     bankId?: string | null;
+    operatedCurrency?: string;
+    operatedAmount?: number;
+    exchangeRate?: number;
   },
   actorId: string,
   requestId?: string,
@@ -281,7 +306,21 @@ export async function updateExpense(
     doc.expenseTypeId = new Types.ObjectId(input.expenseTypeId);
   }
 
-  if (input.amount !== undefined) doc.amount = input.amount;
+  if (input.amount !== undefined) {
+    const money = await resolveMoneyFromRequest(
+      {
+        amount: input.amount,
+        operatedCurrency: input.operatedCurrency,
+        operatedAmount: input.operatedAmount,
+        exchangeRate: input.exchangeRate,
+      },
+      { minPlatformAmount: getCurrencyMinUnit(await requirePlatformCurrency()) },
+    );
+    doc.amount = money.amount;
+    doc.operatedCurrency = money.operatedCurrency;
+    doc.operatedAmount = money.operatedAmount;
+    doc.exchangeRate = money.exchangeRate;
+  }
   if (input.expenseDate !== undefined) doc.expenseDate = parseYmdToDate(input.expenseDate);
   if (input.description !== undefined) doc.description = input.description.trim();
 
@@ -310,6 +349,9 @@ export async function updateExpense(
     newValue: {
       expenseTypeId: doc.expenseTypeId.toString(),
       amount: doc.amount,
+      operatedCurrency: doc.operatedCurrency,
+      operatedAmount: doc.operatedAmount,
+      exchangeRate: doc.exchangeRate,
       expenseDate: doc.expenseDate,
       description: doc.description,
       bankId: doc.bankId?.toString(),
