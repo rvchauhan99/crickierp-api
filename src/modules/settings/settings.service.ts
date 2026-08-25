@@ -101,43 +101,61 @@ async function backfillExistingMoneyFx(platformCurrency: SupportedCurrency) {
     ],
   };
 
+  const pipelineOpts = { updatePipeline: true as const };
+
   await Promise.all([
-    DepositModel.updateMany(fxUnset, [
-      {
-        $set: {
-          operatedCurrency: platformCurrency,
-          operatedAmount: "$amount",
-          exchangeRate: 1,
+    DepositModel.updateMany(
+      fxUnset,
+      [
+        {
+          $set: {
+            operatedCurrency: platformCurrency,
+            operatedAmount: "$amount",
+            exchangeRate: 1,
+          },
         },
-      },
-    ]),
-    WithdrawalModel.updateMany(fxUnset, [
-      {
-        $set: {
-          operatedCurrency: platformCurrency,
-          operatedAmount: "$amount",
-          exchangeRate: 1,
+      ],
+      pipelineOpts,
+    ),
+    WithdrawalModel.updateMany(
+      fxUnset,
+      [
+        {
+          $set: {
+            operatedCurrency: platformCurrency,
+            operatedAmount: "$amount",
+            exchangeRate: 1,
+          },
         },
-      },
-    ]),
-    ExpenseModel.updateMany(fxUnset, [
-      {
-        $set: {
-          operatedCurrency: platformCurrency,
-          operatedAmount: "$amount",
-          exchangeRate: 1,
+      ],
+      pipelineOpts,
+    ),
+    ExpenseModel.updateMany(
+      fxUnset,
+      [
+        {
+          $set: {
+            operatedCurrency: platformCurrency,
+            operatedAmount: "$amount",
+            exchangeRate: 1,
+          },
         },
-      },
-    ]),
-    LiabilityEntryModel.updateMany(fxUnset, [
-      {
-        $set: {
-          operatedCurrency: platformCurrency,
-          operatedAmount: "$amount",
-          exchangeRate: 1,
+      ],
+      pipelineOpts,
+    ),
+    LiabilityEntryModel.updateMany(
+      fxUnset,
+      [
+        {
+          $set: {
+            operatedCurrency: platformCurrency,
+            operatedAmount: "$amount",
+            exchangeRate: 1,
+          },
         },
-      },
-    ]),
+      ],
+      pipelineOpts,
+    ),
     LiabilityPersonModel.updateMany(
       {
         $or: [
@@ -155,6 +173,7 @@ async function backfillExistingMoneyFx(platformCurrency: SupportedCurrency) {
           },
         },
       ],
+      pipelineOpts,
     ),
     BankModel.updateMany(
       {
@@ -173,6 +192,7 @@ async function backfillExistingMoneyFx(platformCurrency: SupportedCurrency) {
           },
         },
       ],
+      pipelineOpts,
     ),
     ExchangeModel.updateMany(
       {
@@ -191,15 +211,20 @@ async function backfillExistingMoneyFx(platformCurrency: SupportedCurrency) {
           },
         },
       ],
+      pipelineOpts,
     ),
-    ExchangeTopupModel.updateMany(fxUnset, [
-      {
-        $set: {
-          operatedCurrency: platformCurrency,
-          operatedAmount: "$amount",
-          exchangeRate: 1,
+    ExchangeTopupModel.updateMany(
+      fxUnset,
+      [
+        {
+          $set: {
+            operatedCurrency: platformCurrency,
+            operatedAmount: "$amount",
+            exchangeRate: 1,
+          },
         },
-      },
-    ]),
+      ],
+      pipelineOpts,
+    ),
   ]);
 }
