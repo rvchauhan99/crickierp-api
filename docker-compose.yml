@@ -1,0 +1,42 @@
+# addacrm API + Redis. This VPS already has host Caddy on :443 and other
+# apps on :80/:8080 — do not publish Caddy or bind 0.0.0.0 here.
+# REDIS_URL is injected so operators do not store Redis in GitHub.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - addacrm
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8030:8080"
+    networks:
+      - addacrm
+
+networks:
+  addacrm:
+    driver: bridge
+
+volumes:
+  redis-data:

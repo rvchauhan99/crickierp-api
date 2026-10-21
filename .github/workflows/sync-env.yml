@@ -1,0 +1,13 @@
+# Apply a one-key (or many-key) GitHub Environment change without rebuilding the image.
+# Edit the secret/variable in GitHub → Actions → Sync env → Run workflow.
+name: Sync env
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync:
+    uses: ./.github/workflows/vps-apply.yml
+    with:
+      rebuild: false
+    secrets: inherit

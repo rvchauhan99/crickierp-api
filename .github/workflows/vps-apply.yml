@@ -1,0 +1,153 @@
+# Reusable VPS apply. Secrets are mapped by name; never echoed.
+# Required Environment secrets: MONGO_URI, JWT_ACCESS_SECRET, JWT_REFRESH_SECRET
+# Required repo secret: VPS_SSH_KEY
+name: vps-apply
+
+on:
+  workflow_call:
+    inputs:
+      rebuild:
+        description: Build and recreate API image
+        type: boolean
+        default: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      VPS_HOST: ${{ vars.VPS_HOST }}
+      VPS_USER: ${{ vars.VPS_USER }}
+    steps:
+      - name: Check VPS connection vars
+        run: |
+          set -euo pipefail
+          if [ -z "${VPS_HOST}" ]; then
+            echo "missing GitHub variable VPS_HOST" >&2
+            exit 1
+          fi
+          if [ -z "${VPS_USER}" ]; then
+            echo "missing GitHub variable VPS_USER" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Compose production env
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_ACCESS_SECRET: ${{ secrets.JWT_ACCESS_SECRET }}
+          JWT_REFRESH_SECRET: ${{ secrets.JWT_REFRESH_SECRET }}
+          BREVO_MASTER_KEY: ${{ secrets.BREVO_MASTER_KEY }}
+          BUCKET_ACCESS_KEY_ID: ${{ secrets.BUCKET_ACCESS_KEY_ID }}
+          BUCKET_SECRET_ACCESS_KEY: ${{ secrets.BUCKET_SECRET_ACCESS_KEY }}
+          NODE_ENV: ${{ vars.NODE_ENV }}
+          PORT: ${{ vars.PORT }}
+          CORS_ORIGIN: ${{ vars.CORS_ORIGIN }}
+          COOKIE_SECURE: ${{ vars.COOKIE_SECURE }}
+          COOKIE_DOMAIN: ${{ vars.COOKIE_DOMAIN }}
+          PUBLIC_API_HOST: ${{ vars.PUBLIC_API_HOST }}
+          BREVO_USER: ${{ vars.BREVO_USER }}
+          BREVO_FROM: ${{ vars.BREVO_FROM }}
+          BUCKET_ENDPOINT: ${{ vars.BUCKET_ENDPOINT }}
+          BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+          BUCKET_REGION: ${{ vars.BUCKET_REGION }}
+          BUCKET_PUBLIC_URL_BASE: ${{ vars.BUCKET_PUBLIC_URL_BASE }}
+          MONGO_MAX_POOL_SIZE: ${{ vars.MONGO_MAX_POOL_SIZE }}
+          MONGO_MIN_POOL_SIZE: ${{ vars.MONGO_MIN_POOL_SIZE }}
+          MONGO_MAX_CONNECTING: ${{ vars.MONGO_MAX_CONNECTING }}
+          MONGO_WAIT_QUEUE_TIMEOUT_MS: ${{ vars.MONGO_WAIT_QUEUE_TIMEOUT_MS }}
+          MONGO_SOCKET_TIMEOUT_MS: ${{ vars.MONGO_SOCKET_TIMEOUT_MS }}
+          MONGO_SERVER_SELECTION_TIMEOUT_MS: ${{ vars.MONGO_SERVER_SELECTION_TIMEOUT_MS }}
+          MONGO_SLOW_QUERY_MS: ${{ vars.MONGO_SLOW_QUERY_MS }}
+          ENABLE_MONGO_SLOW_QUERY_LOG: ${{ vars.ENABLE_MONGO_SLOW_QUERY_LOG }}
+          ENABLE_PERFORMANCE_METRICS: ${{ vars.ENABLE_PERFORMANCE_METRICS }}
+          API_P95_WARN_MS: ${{ vars.API_P95_WARN_MS }}
+          API_JSON_LIMIT: ${{ vars.API_JSON_LIMIT }}
+          MONGO_FAMILY: ${{ vars.MONGO_FAMILY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          chmod +x deploy/compose-env.sh
+          ./deploy/compose-env.sh "${RUNNER_TEMP}/addacrm.env"
+
+      - name: Install SSH key
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "${VPS_SSH_KEY}" > ~/.ssh/addacrm_deploy
+          chmod 600 ~/.ssh/addacrm_deploy
+          ssh-keyscan -H "${VPS_HOST}" >> ~/.ssh/known_hosts
+          echo "SSH_OPTS=-i ${HOME}/.ssh/addacrm_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" >> "${GITHUB_ENV}"
+
+      - name: Sync application to VPS
+        if: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            --exclude 'node_modules/' \
+            --exclude 'dist/' \
+            --exclude 'coverage/' \
+            --exclude '.DS_Store' \
+            -e "ssh ${SSH_OPTS}" \
+            ./ "${VPS_USER}@${VPS_HOST}:/opt/addacrm/"
+
+      - name: Copy env to VPS
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          scp ${SSH_OPTS} "${RUNNER_TEMP}/addacrm.env" "${VPS_USER}@${VPS_HOST}:/opt/addacrm/.env.next"
+          # shellcheck disable=SC2086
+          ssh ${SSH_OPTS} "${VPS_USER}@${VPS_HOST}" 'set -euo pipefail
+            cd /opt/addacrm
+            mv .env.next .env
+            chmod 600 .env
+          '
+
+      - name: Apply compose
+        env:
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh ${SSH_OPTS} "${VPS_USER}@${VPS_HOST}" "set -euo pipefail
+            cd /opt/addacrm
+            if [ \"${REBUILD}\" = \"true\" ]; then
+              docker compose up -d --build
+            else
+              docker compose up -d --no-build --force-recreate api
+            fi
+            docker compose ps
+          "
+
+      - name: Health check
+        env:
+          PUBLIC_API_HOST: ${{ vars.PUBLIC_API_HOST }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PUBLIC_API_HOST}" ] || [ "${PUBLIC_API_HOST}" = ":80" ]; then
+            echo "missing GitHub variable PUBLIC_API_HOST (use addacrm.178.92.120.191.sslip.io)" >&2
+            exit 1
+          fi
+          url="https://${PUBLIC_API_HOST}/api/v1/health"
+          echo "checking ${url}"
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 "${url}" | grep -q '"status":"ok"'; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${ok}" != "1" ]; then
+            echo "health check failed after retries" >&2
+            exit 1
+          fi

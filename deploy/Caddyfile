@@ -1,0 +1,13 @@
+# Snippet for the VPS host Caddy (/etc/caddy/Caddyfile).
+# Do not run a second Caddy container — :443 is already taken.
+# Same origin: /api/* → API, everything else → Next.js.
+
+addacrm.178.92.120.191.sslip.io {
+	encode gzip
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8030
+	}
+	handle {
+		reverse_proxy 127.0.0.1:3030
+	}
+}
