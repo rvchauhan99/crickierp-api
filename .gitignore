@@ -6,3 +6,5 @@ coverage
 node_modules
 cloudrun.env.yaml
 scripts/clear-db-except-superadmin.ts
+scripts/qa-seed-exchange-dashboard-local.ts
+scripts/qa-*.ts

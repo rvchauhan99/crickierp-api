@@ -798,6 +798,9 @@ export async function getDashboardSummary(
           name: { $first: { $ifNull: ["$exchangeDoc.name", "Unknown"] } },
           depositTotal: { $sum: "$amount" },
           depositVerified: { $sum: { $cond: [{ $in: ["$status", ["verified", "finalized"]] }, "$amount", 0] } },
+          depositVerifiedCount: {
+            $sum: { $cond: [{ $in: ["$status", ["verified", "finalized"]] }, 1, 0] },
+          },
           bonusTotal: { $sum: { $ifNull: ["$bonusAmount", 0] } },
         },
       },
@@ -830,6 +833,9 @@ export async function getDashboardSummary(
           name: { $first: { $ifNull: ["$exchangeDoc.name", "Unknown"] } },
           withdrawalTotal: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
           withdrawalApproved: { $sum: { $cond: [{ $eq: ["$status", "approved"] }, { $ifNull: ["$payableAmount", "$amount"] }, 0] } },
+          withdrawalApprovedCount: {
+            $sum: { $cond: [{ $eq: ["$status", "approved"] }, 1, 0] },
+          },
           reverseBonusTotal: { $sum: { $ifNull: ["$reverseBonus", 0] } },
         },
       },
@@ -1193,8 +1199,10 @@ export async function getDashboardSummary(
       name: string;
       depositTotal: number;
       depositVerified: number;
+      depositVerifiedCount: number;
       withdrawalTotal: number;
       withdrawalApproved: number;
+      withdrawalApprovedCount: number;
       bonusGiven: number;
       bonusRecovered: number;
     }
@@ -1207,8 +1215,10 @@ export async function getDashboardSummary(
         name,
         depositTotal: 0,
         depositVerified: 0,
+        depositVerifiedCount: 0,
         withdrawalTotal: 0,
         withdrawalApproved: 0,
+        withdrawalApprovedCount: 0,
         bonusGiven: 0,
         bonusRecovered: 0,
       };
@@ -1221,6 +1231,7 @@ export async function getDashboardSummary(
     const obj = getExchangeObj(String(row._id), String(row.name));
     obj.depositTotal = row.depositTotal ?? 0;
     obj.depositVerified = row.depositVerified ?? 0;
+    obj.depositVerifiedCount = row.depositVerifiedCount ?? 0;
     obj.bonusGiven = row.bonusTotal ?? 0;
   }
 
@@ -1228,6 +1239,7 @@ export async function getDashboardSummary(
     const obj = getExchangeObj(String(row._id), String(row.name));
     obj.withdrawalTotal = row.withdrawalTotal ?? 0;
     obj.withdrawalApproved = row.withdrawalApproved ?? 0;
+    obj.withdrawalApprovedCount = row.withdrawalApprovedCount ?? 0;
     obj.bonusRecovered = row.reverseBonusTotal ?? 0;
   }
 
@@ -1248,21 +1260,27 @@ export async function getDashboardSummary(
   });
 
   const leafRows = exchangesBreakdown
-    .map((e) => ({
-      ...e,
-      exchangeId: e.exchangeIdString,
-      newPlayers:
-        exchangeNewPlayersAgg.find((row: { _id?: unknown; newPlayers?: number }) => String(row._id) === e.exchangeId)
-          ?.newPlayers ?? 0,
-      firstTimeDepositAmount:
-        exchangeFirstTimeDepositAgg.find(
-          (row: { _id?: unknown; firstTimeDepositAmount?: number }) => String(row._id) === e.exchangeId,
-        )?.firstTimeDepositAmount ?? 0,
-      netPL: e.depositVerified - e.withdrawalApproved,
-      netBonus: e.bonusGiven - e.bonusRecovered,
-      periodOpeningBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodOpeningBalance ?? 0 : 0,
-      periodClosingBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodClosingBalance ?? 0 : 0,
-    }));
+    .map((e) => {
+      const netBonus = e.bonusGiven - e.bonusRecovered;
+      const netPL = e.depositVerified - e.withdrawalApproved;
+      return {
+        ...e,
+        exchangeId: e.exchangeIdString,
+        newPlayers:
+          exchangeNewPlayersAgg.find((row: { _id?: unknown; newPlayers?: number }) => String(row._id) === e.exchangeId)
+            ?.newPlayers ?? 0,
+        firstTimeDepositAmount:
+          exchangeFirstTimeDepositAgg.find(
+            (row: { _id?: unknown; firstTimeDepositAmount?: number }) => String(row._id) === e.exchangeId,
+          )?.firstTimeDepositAmount ?? 0,
+        netPL,
+        netBonus,
+        /** Sheet-style Sub Total / Gross P&L: deposits − withdrawals + net bonus */
+        grossPL: netPL + netBonus,
+        periodOpeningBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodOpeningBalance ?? 0 : 0,
+        periodClosingBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodClosingBalance ?? 0 : 0,
+      };
+    });
 
   const leafIds = leafRows
     .map((e) => e.exchangeObjectId)
@@ -1319,27 +1337,34 @@ export async function getDashboardSummary(
   const rolledParents = [...byParent.entries()].map(([parentId, subs]) => {
     const depositTotal = subs.reduce((s, r) => s + r.depositTotal, 0);
     const depositVerified = subs.reduce((s, r) => s + r.depositVerified, 0);
+    const depositVerifiedCount = subs.reduce((s, r) => s + (r.depositVerifiedCount ?? 0), 0);
     const withdrawalTotal = subs.reduce((s, r) => s + r.withdrawalTotal, 0);
     const withdrawalApproved = subs.reduce((s, r) => s + r.withdrawalApproved, 0);
+    const withdrawalApprovedCount = subs.reduce((s, r) => s + (r.withdrawalApprovedCount ?? 0), 0);
     const bonusGiven = subs.reduce((s, r) => s + r.bonusGiven, 0);
     const bonusRecovered = subs.reduce((s, r) => s + r.bonusRecovered, 0);
     const newPlayers = subs.reduce((s, r) => s + r.newPlayers, 0);
     const firstTimeDepositAmount = subs.reduce((s, r) => s + r.firstTimeDepositAmount, 0);
     const periodOpeningBalance = subs.reduce((s, r) => s + r.periodOpeningBalance, 0);
     const periodClosingBalance = subs.reduce((s, r) => s + r.periodClosingBalance, 0);
+    const netPL = depositVerified - withdrawalApproved;
+    const netBonus = bonusGiven - bonusRecovered;
     return {
       exchangeId: parentId,
       name: parentNameMap.get(parentId) ?? leafMeta.get(parentId)?.name ?? "Unknown",
       depositTotal,
       depositVerified,
+      depositVerifiedCount,
       withdrawalTotal,
       withdrawalApproved,
+      withdrawalApprovedCount,
       bonusGiven,
       bonusRecovered,
       newPlayers,
       firstTimeDepositAmount,
-      netPL: depositVerified - withdrawalApproved,
-      netBonus: bonusGiven - bonusRecovered,
+      netPL,
+      netBonus,
+      grossPL: netPL + netBonus,
       periodOpeningBalance,
       periodClosingBalance,
       isSubExchange: false,
