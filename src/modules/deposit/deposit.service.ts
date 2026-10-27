@@ -48,8 +48,14 @@ import { createLiabilityEntry, deleteLiabilityEntryForReversal } from "../liabil
 import { LiabilityPersonModel } from "../liability/liability-person.model";
 import { chunkArray } from "../../shared/utils/chunkArray";
 import { resolveMoneyFromRequest, convertSecondaryAmount, roundMoneyToCurrency } from "../../shared/utils/moneyFx";
+import { canSetCustomBusinessEntryDateTime } from "../../shared/utils/businessEntryDateTime";
+import { UserModel } from "../users/user.model";
 import { getCurrencyMinUnit } from "../../shared/constants/currencies";
-import { requirePlatformCurrency } from "../settings/settings.service";
+import {
+  assertLiabilityModuleEnabled,
+  isLiabilityModuleEnabled,
+  requirePlatformCurrency,
+} from "../settings/settings.service";
 
 export const DEPOSIT_IMPORT_CHUNK_SIZE = 100;
 
@@ -403,6 +409,7 @@ async function resolveImportPlayerFields(input: CreateDepositInput): Promise<{
 export async function createDeposit(input: CreateDepositInput, actorId: string, requestId?: string) {
   await ensureGlobalUtrUniqueForDeposit(input.utr);
   const mode = input.settlementAccountType ?? "bank";
+  if (mode === "person") assertLiabilityModuleEnabled();
   const platformCurrency = await requirePlatformCurrency();
   const money = await resolveMoneyFromRequest(
     {
@@ -524,6 +531,7 @@ export async function updateDepositByBanker(id: string, input: BankerDepositCrea
   );
 
   const mode = input.settlementAccountType ?? "bank";
+  if (mode === "person") assertLiabilityModuleEnabled();
   const prev = {
     settlementAccountType: doc.settlementAccountType,
     bankId: doc.bankId?.toString(),
@@ -1917,6 +1925,9 @@ export async function validateDepositImportRows(
     const rowErrors: string[] = [];
 
     const mode = rd.settlementType.toLowerCase() === "person" ? "person" : "bank";
+    if (mode === "person" && !isLiabilityModuleEnabled()) {
+      rowErrors.push("Liability module is disabled; person settlement is not allowed");
+    }
 
     if (!rd.utr) {
       rowErrors.push("UTR is required");
@@ -2158,13 +2169,20 @@ function buildDepositImportInsertDoc(
   actorOid: Types.ObjectId,
   bankById: Map<string, BankImportLean>,
   personById: Map<string, PersonImportLean>,
+  canSetCustomEntryAt: boolean,
 ): Record<string, unknown> | { error: string; ok?: false } {
   const mode = row.settlementAccountType ?? "bank";
+  if (mode === "person" && !isLiabilityModuleEnabled()) {
+    return { error: "Liability module is disabled; person settlement is not allowed" };
+  }
   const base: Record<string, unknown> = {
     utr: normalizeUtr(row.utr),
     amount: row.amount,
     status: "pending",
-    entryAt: row.entryAt ? parseBusinessDateTime(row.entryAt, "entryAt") : new Date(),
+    entryAt:
+      canSetCustomEntryAt && row.entryAt
+        ? parseBusinessDateTime(row.entryAt, "entryAt")
+        : new Date(),
     createdBy: actorOid,
     settlementAccountType: mode,
     amendmentCount: 0,
@@ -2237,6 +2255,8 @@ export async function applyDepositImportRows(
   },
 ): Promise<{ created: number; errors: DepositImportCommitError[] }> {
   const actorOid = new Types.ObjectId(actorId);
+  const actor = await UserModel.findById(actorId).select("role").lean();
+  const canSetCustomEntryAt = canSetCustomBusinessEntryDateTime(actor?.role);
   const chunkSize = options?.chunkSize ?? DEPOSIT_IMPORT_CHUNK_SIZE;
   const totalRows = rows.length;
   let created = 0;
@@ -2265,7 +2285,13 @@ export async function applyDepositImportRows(
         continue;
       }
 
-      const built = buildDepositImportInsertDoc(item.row, actorOid, bankById, personById);
+      const built = buildDepositImportInsertDoc(
+        item.row,
+        actorOid,
+        bankById,
+        personById,
+        canSetCustomEntryAt,
+      );
       if ("error" in built && typeof built.error === "string") {
         errors.push({ row: item.index + 1, utr: item.row.utr, error: built.error });
         continue;

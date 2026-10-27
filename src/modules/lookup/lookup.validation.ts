@@ -10,6 +10,17 @@ export const lookupQuerySchema = z.object({
     (v) => (v === "" || v === null || v === undefined ? undefined : String(v).trim()),
     mongoId24.optional(),
   ),
+  assignableOnly: z
+    .preprocess((v) => {
+      if (v === true || v === "true" || v === "1") return true;
+      if (v === false || v === "false" || v === "0") return false;
+      return undefined;
+    }, z.boolean().optional())
+    .optional(),
+  parentId: z.preprocess(
+    (v) => (v === "" || v === null || v === undefined ? undefined : String(v).trim()),
+    mongoId24.optional(),
+  ),
 });
 
 export const exchangeRateLookupQuerySchema = z.object({

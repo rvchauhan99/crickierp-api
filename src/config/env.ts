@@ -1,3 +1,8 @@
+import {
+  isSupportedCurrency,
+  type SupportedCurrency,
+} from "../shared/constants/currencies";
+
 type EnvConfig = {
   nodeEnv: string;
   port: number;
@@ -38,6 +43,22 @@ type EnvConfig = {
 
   // Cache / queue
   redisUrl?: string;
+
+  /**
+   * Default / seed platform ledger currency (ISO 4217).
+   * Used to auto-lock PlatformSettings when unset. Does not override a locked DB value.
+   */
+  platformCurrency: SupportedCurrency;
+  /**
+   * When false (default), all money ops use platform currency only (rate=1).
+   * Multi-currency clients must set CURRENCY_CONVERSION_ENABLED=true.
+   */
+  currencyConversionEnabled: boolean;
+  /**
+   * When false, liability persons/entries/ledger/reports are off and all settlements are bank-only.
+   * Bank→bank transfers still use LiabilityEntry internally. Default true.
+   */
+  liabilityModuleEnabled: boolean;
 };
 
 function required(name: string, fallback?: string): string {
@@ -64,6 +85,16 @@ function parseCorsOrigin(raw: string | undefined): string[] {
     .filter(Boolean);
   if (parts.length === 0) return fallback;
   return [...new Set(parts)];
+}
+
+function parsePlatformCurrency(raw: string | undefined): SupportedCurrency {
+  const value = (raw?.trim().toUpperCase() || "INR") as string;
+  if (!isSupportedCurrency(value)) {
+    throw new Error(
+      `Invalid PLATFORM_CURRENCY="${raw ?? ""}". Must be one of the supported ISO codes.`,
+    );
+  }
+  return value;
 }
 
 export const env: EnvConfig = {
@@ -104,4 +135,8 @@ export const env: EnvConfig = {
   apiP95WarnMs: Number(process.env.API_P95_WARN_MS ?? 500),
   apiJsonLimit: process.env.API_JSON_LIMIT ?? "10mb",
   redisUrl: process.env.REDIS_URL,
+
+  platformCurrency: parsePlatformCurrency(process.env.PLATFORM_CURRENCY),
+  currencyConversionEnabled: (process.env.CURRENCY_CONVERSION_ENABLED ?? "false") === "true",
+  liabilityModuleEnabled: (process.env.LIABILITY_MODULE_ENABLED ?? "true") === "true",
 };

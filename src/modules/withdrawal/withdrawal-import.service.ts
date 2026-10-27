@@ -14,6 +14,7 @@ import {
 } from "../deposit/deposit-import-resolve";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
 import { PlayerModel } from "../player/player.model";
+import { isLiabilityModuleEnabled } from "../settings/settings.service";
 import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
 import { chunkArray } from "../../shared/utils/chunkArray";
 import {
@@ -23,8 +24,10 @@ import {
   parseImportDateTime,
 } from "../../shared/utils/importDateTime";
 import { DEFAULT_TIMEZONE } from "../../shared/utils/timezone";
+import { canSetCustomBusinessEntryDateTime } from "../../shared/utils/businessEntryDateTime";
 import { logger } from "../../shared/logger";
 import { normalizeUtr } from "../../shared/utils/utr";
+import { UserModel } from "../users/user.model";
 import { WithdrawalModel } from "./withdrawal.model";
 
 export const WITHDRAWAL_IMPORT_CHUNK_SIZE = 100;
@@ -494,6 +497,9 @@ export async function validateWithdrawalImportRows(
     const hasPayoutSettlement = rd.payoutSettlementType.trim() !== "";
     const hasAnyPayout = hasPayoutUtr || hasPayoutBank || hasPayoutPerson || hasPayoutSettlement;
     const payoutMode = rd.payoutSettlementType.toLowerCase() === "person" ? "person" : "bank";
+    if (payoutMode === "person" && !isLiabilityModuleEnabled()) {
+      rowErrors.push("Liability module is disabled; person payout settlement is not allowed");
+    }
 
     let resolvedPayoutBankId: string | undefined;
     let resolvedPayoutBankDisplay: string | undefined;
@@ -713,6 +719,7 @@ function buildWithdrawalImportInsertDoc(
     personById: Map<string, PersonImportLean>;
     playerById: Map<string, { playerId: string; phone: string; label: string }>;
   },
+  canSetCustomRequestedAt: boolean,
 ): Record<string, unknown> | { error: string } {
   const player = lookups.playerById.get(row.playerMongoId);
   if (!player) return { error: "Player not found" };
@@ -730,7 +737,10 @@ function buildWithdrawalImportInsertDoc(
     amount: row.amount,
     reverseBonus,
     payableAmount,
-    requestedAt: row.requestedAt ? parseBusinessDateTime(row.requestedAt, "requestedAt") : new Date(),
+    requestedAt:
+      canSetCustomRequestedAt && row.requestedAt
+        ? parseBusinessDateTime(row.requestedAt, "requestedAt")
+        : new Date(),
     // Imported rows must remain in requested stage for banker confirmation flow.
     status: "requested",
     createdBy: actorOid,
@@ -740,6 +750,9 @@ function buildWithdrawalImportInsertDoc(
 
   if (row.payoutUtr?.trim()) {
     const payoutMode = row.payoutSettlementType ?? "bank";
+    if (payoutMode === "person" && !isLiabilityModuleEnabled()) {
+      return { error: "Liability module is disabled; person payout settlement is not allowed" };
+    }
     base.utr = normalizeUtr(row.payoutUtr);
     base.payoutSettlementType = payoutMode;
 
@@ -795,6 +808,8 @@ export async function applyWithdrawalImportRows(
   },
 ): Promise<{ created: number; errors: WithdrawalImportCommitError[] }> {
   const actorOid = new Types.ObjectId(actorId);
+  const actor = await UserModel.findById(actorId).select("role").lean();
+  const canSetCustomRequestedAt = canSetCustomBusinessEntryDateTime(actor?.role);
   const chunkSize = options?.chunkSize ?? WITHDRAWAL_IMPORT_CHUNK_SIZE;
   const totalRows = rows.length;
   let created = 0;
@@ -826,7 +841,12 @@ export async function applyWithdrawalImportRows(
         }
       }
 
-      const built = buildWithdrawalImportInsertDoc(item.row, actorOid, { bankById, personById, playerById });
+      const built = buildWithdrawalImportInsertDoc(
+        item.row,
+        actorOid,
+        { bankById, personById, playerById },
+        canSetCustomRequestedAt,
+      );
       if ("error" in built && typeof built.error === "string") {
         errors.push({
           row: item.index + 1,

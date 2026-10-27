@@ -17,6 +17,7 @@ export const PERMISSIONS = {
 
   BANK_ADD: "bank.add",
   BANK_LIST: "bank.list",
+  BANK_TRANSFER: "bank.transfer",
   BANK_STATEMENT: "bank.statement",
 
   DEPOSIT_BANKER: "deposit.banker",

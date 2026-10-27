@@ -5,6 +5,7 @@ import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { ExchangeModel } from "../exchange/exchange.model";
+import { assertAssignableExchange } from "../exchange/exchange-hierarchy";
 import {
   DEFAULT_TIMEZONE,
   formatDateTimeForTimeZone,
@@ -169,9 +170,15 @@ async function buildPlayerListFilter(q: ListPlayerQuery, timeZone: string): Prom
     conditions.push({ exchange: { $in: ids } });
   }
 
+  const subExId = trimUndef(q.subExchangeId);
+  if (subExId && Types.ObjectId.isValid(subExId)) {
+    conditions.push({ exchange: new Types.ObjectId(subExId) });
+  }
+
   const exId = trimUndef(q.exchangeId);
-  if (exId && Types.ObjectId.isValid(exId)) {
-    conditions.push({ exchange: new Types.ObjectId(exId) });
+  if (exId && Types.ObjectId.isValid(exId) && !(subExId && Types.ObjectId.isValid(subExId))) {
+    // Prefer rootExchange so filtering a parent includes all its sub-exchange players
+    conditions.push({ rootExchange: new Types.ObjectId(exId) });
   }
 
   const createdBy = trimUndef(q.createdBy);
@@ -255,10 +262,7 @@ export async function createPlayer(
   actorId: string,
   requestId?: string,
 ) {
-  const exchange = await ExchangeModel.findById(input.exchangeId);
-  if (!exchange) {
-    throw new AppError("not_found", "Exchange not found", 404);
-  }
+  const resolved = await assertAssignableExchange(input.exchangeId);
 
   const playerId = input.playerId.trim();
   const phone = input.phone.trim();
@@ -280,7 +284,8 @@ export async function createPlayer(
 
   try {
     const doc = await PlayerModel.create({
-      exchange: new Types.ObjectId(input.exchangeId),
+      exchange: resolved.exchangeId,
+      rootExchange: resolved.rootExchangeId,
       playerId,
       phone,
       regularBonusPercentage,
@@ -297,7 +302,8 @@ export async function createPlayer(
       entity: "player",
       entityId: doc._id.toString(),
       newValue: {
-        exchangeId: input.exchangeId,
+        exchangeId: resolved.exchangeId.toString(),
+        rootExchangeId: resolved.rootExchangeId.toString(),
         playerId,
         phone,
         regularBonusPercentage,
@@ -323,8 +329,9 @@ export async function getPlayerById(id: string) {
     throw new AppError("validation_error", "Invalid player id", 400);
   }
   const doc = await PlayerModel.findById(id)
-    .select("exchange playerId phone regularBonusPercentage firstDepositBonusPercentage referredByPlayerId referralPercentage")
-    .populate("exchange", "name provider")
+    .select("exchange rootExchange playerId phone regularBonusPercentage firstDepositBonusPercentage referredByPlayerId referralPercentage")
+    .populate("exchange", "name provider parentExchange")
+    .populate("rootExchange", "name provider")
     .populate("referredByPlayerId", "playerId phone exchange")
     .lean();
   if (!doc) {
@@ -434,7 +441,12 @@ export async function listPlayers(query: ListPlayerQuery, options?: { timeZone?:
       .sort({ [sortBy]: sortOrder })
       .skip(cursor ? 0 : skip)
       .limit(pageSize)
-      .populate("exchange", "name provider")
+      .populate({
+        path: "exchange",
+        select: "name provider parentExchange",
+        populate: { path: "parentExchange", select: "name provider" },
+      })
+      .populate("rootExchange", "name provider")
       .populate("referredByPlayerId", "playerId phone exchange")
       .populate("createdBy", "fullName username")
       .populate("updatedBy", "fullName username")
@@ -481,7 +493,12 @@ export async function exportPlayersToBuffer(
   const rows = await PlayerModel.find(filter)
     .sort({ [sortBy]: sortOrder })
     .limit(EXPORT_MAX_ROWS)
-    .populate("exchange", "name provider")
+    .populate({
+      path: "exchange",
+      select: "name provider parentExchange",
+      populate: { path: "parentExchange", select: "name provider" },
+    })
+    .populate("rootExchange", "name provider")
     .populate("createdBy", "fullName username")
     .lean();
 
@@ -499,10 +516,17 @@ export async function exportPlayersToBuffer(
   }
 
   const exportData = rows.map((r) => {
-    const ex = r.exchange as { name?: string; provider?: string } | null;
+    const ex = r.exchange as
+      | { name?: string; provider?: string; parentExchange?: { name?: string; provider?: string } | null }
+      | null;
+    const root = r.rootExchange as { name?: string; provider?: string } | null;
+    const isSub = Boolean(ex?.parentExchange);
     return {
-      "Exchange Name": ex?.name ?? "",
-      Provider: ex?.provider ?? "",
+      "Exchange Name": isSub ? (root?.name ?? ex?.parentExchange?.name ?? "") : (ex?.name ?? ""),
+      "Sub Exchange": isSub ? (ex?.name ?? "") : "",
+      Provider: isSub
+        ? (root?.provider ?? ex?.parentExchange?.provider ?? "")
+        : (ex?.provider ?? ""),
       "Player Id": r.playerId,
       Phone: r.phone,
       "Regular Bonus %": r.regularBonusPercentage ?? 0,
@@ -523,8 +547,8 @@ export async function exportPlayersToBuffer(
 
 export function getSampleCsvBuffer(): Buffer {
   const header =
-    "exchange_name,player_id,phone,bonus_percentage,first_deposit_bonus_percentage,old_player\n";
-  const example = "Example Exchange,PLAYER001,9876543210,5,10,no\n";
+    "exchange_name,sub_exchange_name,player_id,phone,bonus_percentage,first_deposit_bonus_percentage,old_player\n";
+  const example = "Example Exchange,,PLAYER001,9876543210,5,10,no\n";
   return Buffer.from(header + example, "utf-8");
 }
 
@@ -665,6 +689,8 @@ type ParsedImportRow = {
   rowNum: number;
   exchangeName: string;
   exchangeId: Types.ObjectId;
+  rootExchangeId: Types.ObjectId;
+  subExchangeName?: string;
   playerId: string;
   phone: string;
   regularBonusPercentage: number;
@@ -716,7 +742,8 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
   return chunks;
 }
 
-async function resolveExchangeMapByName(names: string[]): Promise<Map<string, Types.ObjectId>> {
+/** Resolve top-level exchange names only (parentExchange null). */
+async function resolveTopLevelExchangeMapByName(names: string[]): Promise<Map<string, Types.ObjectId>> {
   if (names.length === 0) return new Map();
   const uniqueByLower = new Map<string, string>();
   for (const rawName of names) {
@@ -726,7 +753,14 @@ async function resolveExchangeMapByName(names: string[]): Promise<Map<string, Ty
   }
   const uniqueNames = Array.from(uniqueByLower.values());
   const conditions = uniqueNames.map((name) => ({ name: { $regex: new RegExp(`^${escapeRegex(name)}$`, "i") } }));
-  const exchanges = await ExchangeModel.find({ $or: conditions }).select("_id name").lean();
+  const exchanges = await ExchangeModel.find({
+    $and: [
+      { $or: conditions },
+      { $or: [{ parentExchange: null }, { parentExchange: { $exists: false } }] },
+    ],
+  })
+    .select("_id name")
+    .lean();
 
   const bucket = new Map<string, Types.ObjectId[]>();
   for (const ex of exchanges) {
@@ -743,6 +777,22 @@ async function resolveExchangeMapByName(names: string[]): Promise<Map<string, Ty
   return resolved;
 }
 
+async function resolveSubExchangeUnderParent(
+  parentId: Types.ObjectId,
+  subName: string,
+): Promise<Types.ObjectId | null> {
+  const trimmed = subName.trim();
+  if (!trimmed) return null;
+  const matches = await ExchangeModel.find({
+    parentExchange: parentId,
+    name: { $regex: new RegExp(`^${escapeRegex(trimmed)}$`, "i") },
+  })
+    .select("_id")
+    .lean();
+  if (matches.length !== 1) return null;
+  return matches[0]._id as Types.ObjectId;
+}
+
 export async function parsePlayerImportFile(
   buffer: Buffer,
   originalName: string,
@@ -755,6 +805,7 @@ export async function parsePlayerImportFile(
   const rowInputCache: Array<{
     rowNum: number;
     exchangeName: string;
+    subExchangeName: string;
     playerId: string;
     phone: string;
     regularBonusRaw: string;
@@ -767,6 +818,13 @@ export async function parsePlayerImportFile(
     const row = rows[i];
     const rowNum = i + 2;
     const exchangeName = pickCell(row, "exchange_name", "exchange", "exchange name");
+    const subExchangeName = pickCell(
+      row,
+      "sub_exchange_name",
+      "subexchange_name",
+      "sub exchange name",
+      "sub_exchange",
+    );
     const playerId = pickCell(row, "player_id", "playerid", "player id");
     const phone = pickCell(row, "phone", "phone_number", "phone number", "mobile");
     const regularBonusRaw = pickCellRaw(
@@ -820,6 +878,7 @@ export async function parsePlayerImportFile(
     rowInputCache.push({
       rowNum,
       exchangeName,
+      subExchangeName,
       playerId,
       phone,
       regularBonusRaw,
@@ -829,23 +888,64 @@ export async function parsePlayerImportFile(
     });
   }
 
-  const exchangeMap = await resolveExchangeMapByName(exchangeNames);
+  const exchangeMap = await resolveTopLevelExchangeMapByName(exchangeNames);
+  const groupParentIds = new Set<string>();
+  const parentIds = [...new Set([...exchangeMap.values()].map(String))].map((id) => new Types.ObjectId(id));
+  if (parentIds.length > 0) {
+    const withSubs = await ExchangeModel.aggregate<{ _id: Types.ObjectId }>([
+      { $match: { parentExchange: { $in: parentIds } } },
+      { $group: { _id: "$parentExchange" } },
+    ]);
+    for (const g of withSubs) groupParentIds.add(String(g._id));
+  }
+
   for (const row of rowInputCache) {
     const exchangeKey = row.exchangeName.trim().toLowerCase();
-    const exchangeId = exchangeMap.get(exchangeKey);
-    if (!exchangeId) {
-      const resolved = await resolveExchangeIdByName(row.exchangeName);
-      if (resolved.notFound) {
-        errors.push(buildImportError(row.rowNum, `No exchange found for name "${row.exchangeName}"`, row.rowData));
-      } else if (resolved.ambiguous) {
+    const rootExchangeId = exchangeMap.get(exchangeKey);
+    if (!rootExchangeId) {
+      errors.push(
+        buildImportError(
+          row.rowNum,
+          `No top-level exchange found for name "${row.exchangeName}"`,
+          row.rowData,
+        ),
+      );
+      continue;
+    }
+
+    const isGroup = groupParentIds.has(String(rootExchangeId));
+    let leafExchangeId = rootExchangeId;
+    if (isGroup) {
+      if (!row.subExchangeName.trim()) {
         errors.push(
           buildImportError(
             row.rowNum,
-            `Multiple exchanges match "${row.exchangeName}"; names must be unique for import`,
+            `sub_exchange_name is required for exchange "${row.exchangeName}"`,
             row.rowData,
           ),
         );
+        continue;
       }
+      const subId = await resolveSubExchangeUnderParent(rootExchangeId, row.subExchangeName);
+      if (!subId) {
+        errors.push(
+          buildImportError(
+            row.rowNum,
+            `No sub exchange "${row.subExchangeName}" under "${row.exchangeName}"`,
+            row.rowData,
+          ),
+        );
+        continue;
+      }
+      leafExchangeId = subId;
+    } else if (row.subExchangeName.trim()) {
+      errors.push(
+        buildImportError(
+          row.rowNum,
+          `Exchange "${row.exchangeName}" has no sub exchanges; omit sub_exchange_name`,
+          row.rowData,
+        ),
+      );
       continue;
     }
 
@@ -878,7 +978,9 @@ export async function parsePlayerImportFile(
     parsedRows.push({
       rowNum: row.rowNum,
       exchangeName: row.exchangeName,
-      exchangeId,
+      exchangeId: leafExchangeId,
+      rootExchangeId,
+      subExchangeName: row.subExchangeName || undefined,
       playerId: row.playerId,
       phone: row.phone,
       regularBonusPercentage: regularBonusParsed.value,
@@ -889,7 +991,7 @@ export async function parsePlayerImportFile(
 
   const seenFirstRow = new Map<string, number>();
   for (const p of parsedRows) {
-    const key = `${p.exchangeId.toString()}:${p.playerId}`;
+    const key = `${p.rootExchangeId.toString()}:${p.playerId}`;
     const first = seenFirstRow.get(key);
     if (first !== undefined) {
       errors.push({
@@ -948,20 +1050,23 @@ export async function applyPlayerImportRows(
 
   for (const chunk of chunks) {
     const orConditions = chunk.map((p) => ({
-      exchange: p.exchangeId,
+      rootExchange: p.rootExchangeId,
       playerId: p.playerId,
     }));
-    const existing = await PlayerModel.find({ $or: orConditions }).select("_id exchange playerId").lean();
+    const existing = await PlayerModel.find({ $or: orConditions })
+      .select("_id exchange rootExchange playerId")
+      .lean();
     const existingByKey = new Map<string, Types.ObjectId>();
     for (const doc of existing) {
-      const exId = (doc.exchange as Types.ObjectId).toString();
-      existingByKey.set(`${exId}:${doc.playerId}`, doc._id as Types.ObjectId);
+      const rootId = (doc.rootExchange as Types.ObjectId).toString();
+      existingByKey.set(`${rootId}:${doc.playerId}`, doc._id as Types.ObjectId);
     }
 
     const docsToCreate = chunk
-      .filter((p) => !existingByKey.has(`${p.exchangeId.toString()}:${p.playerId}`))
+      .filter((p) => !existingByKey.has(`${p.rootExchangeId.toString()}:${p.playerId}`))
       .map((p) => ({
         exchange: p.exchangeId,
+        rootExchange: p.rootExchangeId,
         playerId: p.playerId,
         phone: p.phone,
         regularBonusPercentage: p.regularBonusPercentage,
@@ -973,7 +1078,7 @@ export async function applyPlayerImportRows(
 
     const updateOps = chunk
       .map((p) => {
-        const key = `${p.exchangeId.toString()}:${p.playerId}`;
+        const key = `${p.rootExchangeId.toString()}:${p.playerId}`;
         const existingId = existingByKey.get(key);
         if (!existingId) return null;
         return {
@@ -981,6 +1086,8 @@ export async function applyPlayerImportRows(
             filter: { _id: existingId },
             update: {
               $set: {
+                exchange: p.exchangeId,
+                rootExchange: p.rootExchangeId,
                 phone: p.phone,
                 regularBonusPercentage: p.regularBonusPercentage,
                 firstDepositBonusPercentage: p.firstDepositBonusPercentage,

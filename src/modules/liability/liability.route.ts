@@ -1,14 +1,16 @@
-import { Router } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import { authMiddleware } from "../../shared/middlewares/auth.middleware";
 import { permissionMiddleware } from "../../shared/middlewares/permission.middleware";
 import { validate } from "../../shared/middlewares/validate.middleware";
 import { PERMISSIONS } from "../../shared/constants/permissions";
+import { assertLiabilityModuleEnabled } from "../settings/settings.service";
 import {
   createLiabilityEntryController,
   createLiabilityPersonController,
   exportLiabilityEntryController,
   exportLiabilityLedgerController,
   exportLiabilityPersonController,
+  exportLiabilityReportController,
   liabilityPersonLedgerController,
   liabilityPersonWiseReportController,
   liabilitySummaryReportController,
@@ -21,6 +23,7 @@ import {
   createLiabilityPersonBodySchema,
   liabilityLedgerQuerySchema,
   liabilityPersonIdParamSchema,
+  liabilityReportQuerySchema,
   listLiabilityEntryQuerySchema,
   listLiabilityPersonQuerySchema,
   updateLiabilityPersonBodySchema,
@@ -29,6 +32,14 @@ import {
 const liabilityRouter = Router();
 
 liabilityRouter.use(authMiddleware);
+liabilityRouter.use((_req: Request, _res: Response, next: NextFunction) => {
+  try {
+    assertLiabilityModuleEnabled();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 liabilityRouter.post(
   "/persons",
@@ -91,6 +102,13 @@ liabilityRouter.get(
   permissionMiddleware(PERMISSIONS.LIABILITY_LEDGER_VIEW),
   validate({ params: liabilityPersonIdParamSchema, query: liabilityLedgerQuerySchema }),
   exportLiabilityLedgerController,
+);
+
+liabilityRouter.get(
+  "/reports/export",
+  permissionMiddleware(PERMISSIONS.LIABILITY_REPORT_VIEW),
+  validate({ query: liabilityReportQuerySchema }),
+  exportLiabilityReportController,
 );
 
 liabilityRouter.get(

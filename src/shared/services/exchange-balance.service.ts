@@ -11,11 +11,12 @@ function toAmountMap(rows: Array<{ _id: Types.ObjectId; totalAmount?: number }>)
 }
 
 /**
- * All-time running exchange balance per exchange:
+ * Own-ledger (leaf) all-time balance for the given exchange ids:
  * openingBalance - verified/finalized deposits + approved/finalized withdrawals + topups.
- * Deposits/withdrawals are attributed via player → exchange ($lookup), matching dashboard period balances.
+ * Deposits/withdrawals attributed via player → exchange ($lookup).
+ * Does NOT include sub-exchange rollups.
  */
-export async function computeAllTimeExchangeBalances(
+export async function computeOwnLedgerExchangeBalances(
   exchangeIds: Types.ObjectId[],
 ): Promise<Map<string, number>> {
   const balanceMap = new Map<string, number>();
@@ -83,6 +84,64 @@ export async function computeAllTimeExchangeBalances(
   }
 
   return balanceMap;
+}
+
+/**
+ * All-time running exchange balance per exchange, with parent rollup:
+ * parent currentBalance = parent own ledger + sum(sub own ledgers).
+ * Sub / direct exchanges use own ledger only.
+ */
+export async function computeAllTimeExchangeBalances(
+  exchangeIds: Types.ObjectId[],
+): Promise<Map<string, number>> {
+  if (exchangeIds.length === 0) return new Map();
+
+  const requested = await ExchangeModel.find({ _id: { $in: exchangeIds } })
+    .select({ _id: 1, parentExchange: 1 })
+    .lean();
+
+  const parentIdsNeedingChildren = requested
+    .filter((r) => !r.parentExchange)
+    .map((r) => r._id);
+
+  const children =
+    parentIdsNeedingChildren.length > 0
+      ? await ExchangeModel.find({ parentExchange: { $in: parentIdsNeedingChildren } })
+          .select({ _id: 1, parentExchange: 1 })
+          .lean()
+      : [];
+
+  const allIds = new Map<string, Types.ObjectId>();
+  for (const r of requested) allIds.set(String(r._id), r._id);
+  for (const c of children) allIds.set(String(c._id), c._id);
+
+  const ownBalances = await computeOwnLedgerExchangeBalances([...allIds.values()]);
+
+  const childrenByParent = new Map<string, string[]>();
+  for (const c of children) {
+    const pid = String(c.parentExchange);
+    const list = childrenByParent.get(pid) ?? [];
+    list.push(String(c._id));
+    childrenByParent.set(pid, list);
+  }
+
+  const result = new Map<string, number>();
+  for (const r of requested) {
+    const id = String(r._id);
+    const own = Number(ownBalances.get(id) ?? 0);
+    if (r.parentExchange) {
+      result.set(id, own);
+      continue;
+    }
+    const childIds = childrenByParent.get(id) ?? [];
+    let rolled = own;
+    for (const cid of childIds) {
+      rolled += Number(ownBalances.get(cid) ?? 0);
+    }
+    result.set(id, rolled);
+  }
+
+  return result;
 }
 
 const BALANCE_EPSILON = 0.000001;

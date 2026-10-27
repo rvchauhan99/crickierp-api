@@ -6,7 +6,10 @@ import {
   isSupportedCurrency,
   type SupportedCurrency,
 } from "../constants/currencies";
-import { requirePlatformCurrency } from "../../modules/settings/settings.service";
+import {
+  isCurrencyConversionEnabled,
+  requirePlatformCurrency,
+} from "../../modules/settings/settings.service";
 
 export interface ResolveMoneyInputParams {
   operatedAmount: number;
@@ -143,6 +146,9 @@ export type MoneyRequestFx = {
 /**
  * Resolve body money fields against the locked platform currency.
  * `amount` is treated as operated amount when `operatedAmount` is omitted.
+ *
+ * When CURRENCY_CONVERSION_ENABLED=false: force platform currency + rate 1.
+ * Explicit foreign operatedCurrency is rejected.
  */
 export async function resolveMoneyFromRequest(
   input: MoneyRequestFx,
@@ -153,12 +159,33 @@ export async function resolveMoneyFromRequest(
 ): Promise<ResolvedMoney> {
   const platformCurrency = await requirePlatformCurrency();
   const operatedAmount = input.operatedAmount ?? input.amount;
+  const fieldLabel = options?.fieldLabel ?? "amount";
+
+  if (!isCurrencyConversionEnabled()) {
+    const rawCurrency = input.operatedCurrency?.trim().toUpperCase();
+    if (rawCurrency && rawCurrency !== platformCurrency) {
+      throw new AppError(
+        "currency_conversion_disabled",
+        `Currency conversion is disabled. Operated currency must be ${platformCurrency}.`,
+        400,
+      );
+    }
+    return resolveMoneyInput({
+      operatedAmount,
+      operatedCurrency: platformCurrency,
+      exchangeRate: 1,
+      platformCurrency,
+      fieldLabel,
+      minPlatformAmount: options?.minPlatformAmount,
+    });
+  }
+
   return resolveMoneyInput({
     operatedAmount,
     operatedCurrency: input.operatedCurrency,
     exchangeRate: input.exchangeRate,
     platformCurrency,
-    fieldLabel: options?.fieldLabel ?? "amount",
+    fieldLabel,
     minPlatformAmount: options?.minPlatformAmount,
   });
 }

@@ -1,6 +1,6 @@
 import { Types } from "mongoose";
 import type { z } from "zod";
-import { generateExcelBuffer } from "../../shared/services/excel.service";
+import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
@@ -8,6 +8,7 @@ import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExpenseModel } from "../expense/expense.model";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
+import { createLiabilityEntry } from "../liability/liability.service";
 import {
   DEFAULT_TIMEZONE,
   formatDateTimeForTimeZone,
@@ -17,10 +18,33 @@ import {
 import { BankModel } from "./bank.model";
 import { BankBalanceSettlementModel } from "./bank-balance-settlement.model";
 import { computeClosingBalanceActualByBankIds } from "./bankClosingBalance";
-import { listBankQuerySchema } from "./bank.validation";
+import {
+  bankSummaryQuerySchema,
+  listBankQuerySchema,
+  listBankTransferQuerySchema,
+} from "./bank.validation";
 import { resolveOpeningMoneyFromRequest } from "../../shared/utils/moneyFx";
+import { getBanksBreakdownSummary } from "../reports/reports.service";
 
 type ListBankQuery = z.infer<typeof listBankQuerySchema>;
+type BankSummaryQuery = z.infer<typeof bankSummaryQuerySchema>;
+type ListBankTransferQuery = z.infer<typeof listBankTransferQuerySchema>;
+
+function isBankToBankLiability(le: {
+  fromAccountType?: string;
+  toAccountType?: string;
+}): boolean {
+  return le.fromAccountType === "bank" && le.toAccountType === "bank";
+}
+
+function bankDisplayLabel(b: {
+  holderName?: string;
+  bankName?: string;
+  accountNumber?: string;
+}): string {
+  const tail = b.accountNumber ? ` (${String(b.accountNumber).slice(-4)})` : "";
+  return `${b.holderName ?? ""} — ${b.bankName ?? ""}${tail}`.trim();
+}
 
 function pageSizeFromQuery(q: ListBankQuery): number {
   return q.limit ?? q.pageSize;
@@ -353,7 +377,7 @@ export async function exportBanksToBuffer(
 type LedgerQuery = {
   fromDate?: string;
   toDate?: string;
-  entryType?: "all" | "deposit" | "withdrawal" | "expense" | "liability" | "settlement";
+  entryType?: "all" | "deposit" | "withdrawal" | "expense" | "liability" | "transfer" | "settlement";
 };
 
 function settlementEventTime(s: { effectiveAt: Date }): Date {
@@ -428,16 +452,37 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
   ]);
 
   const liabilityPersonIds = new Set<string>();
+  const liabilityBankIds = new Set<string>();
   for (const e of allLiabilityEntries) {
     if (e.fromAccountType === "person") liabilityPersonIds.add(String(e.fromAccountId));
     if (e.toAccountType === "person") liabilityPersonIds.add(String(e.toAccountId));
+    if (e.fromAccountType === "bank") liabilityBankIds.add(String(e.fromAccountId));
+    if (e.toAccountType === "bank") liabilityBankIds.add(String(e.toAccountId));
   }
-  const liabilityPersons = await LiabilityPersonModel.find({
-    _id: { $in: [...liabilityPersonIds].filter((id) => Types.ObjectId.isValid(id)).map((id) => new Types.ObjectId(id)) },
-  })
-    .select("_id name")
-    .lean();
+  const [liabilityPersons, liabilityBanks] = await Promise.all([
+    LiabilityPersonModel.find({
+      _id: {
+        $in: [...liabilityPersonIds]
+          .filter((id) => Types.ObjectId.isValid(id))
+          .map((id) => new Types.ObjectId(id)),
+      },
+    })
+      .select("_id name")
+      .lean(),
+    BankModel.find({
+      _id: {
+        $in: [...liabilityBankIds]
+          .filter((id) => Types.ObjectId.isValid(id))
+          .map((id) => new Types.ObjectId(id)),
+      },
+    })
+      .select("_id holderName bankName accountNumber")
+      .lean(),
+  ]);
   const liabilityPersonMap = new Map(liabilityPersons.map((p) => [String(p._id), p.name]));
+  const liabilityBankMap = new Map(
+    liabilityBanks.map((b) => [String(b._id), bankDisplayLabel(b)]),
+  );
 
   let priorNet = 0;
   if (fromD) {
@@ -511,7 +556,12 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
     const at = liabilityEventTime(le);
     if (fromD && at < fromD) continue;
     if (toD && at > toD) continue;
-    if (entryType === "all" || entryType === "liability") {
+    const bankToBank = isBankToBankLiability(le);
+    if (
+      entryType === "all" ||
+      entryType === "liability" ||
+      (entryType === "transfer" && bankToBank)
+    ) {
       events.push({ kind: "liability", t: at.getTime(), doc: le });
     }
   }
@@ -597,17 +647,25 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
         totalCredits += le.amount;
       }
       const createdByObj = le.createdBy as { fullName?: string } | undefined;
-      const counterpartyName =
-        le.fromAccountType === "person"
-          ? liabilityPersonMap.get(String(le.fromAccountId)) ?? ""
-          : le.toAccountType === "person"
-            ? liabilityPersonMap.get(String(le.toAccountId)) ?? ""
-            : "";
+      const bankToBank = isBankToBankLiability(le);
+      let counterpartyName = "";
+      let label = `Liability ${le.entryType}`;
+      if (bankToBank) {
+        const otherId = isBankFrom ? String(le.toAccountId) : String(le.fromAccountId);
+        counterpartyName = liabilityBankMap.get(otherId) ?? "";
+        label = isBankFrom
+          ? `Transfer to ${counterpartyName || "bank"}`
+          : `Transfer from ${counterpartyName || "bank"}`;
+      } else if (le.fromAccountType === "person") {
+        counterpartyName = liabilityPersonMap.get(String(le.fromAccountId)) ?? "";
+      } else if (le.toAccountType === "person") {
+        counterpartyName = liabilityPersonMap.get(String(le.toAccountId)) ?? "";
+      }
       return {
-        kind: "liability" as const,
+        kind: (bankToBank ? "transfer" : "liability") as "liability" | "transfer",
         refId: le._id.toString(),
         at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
-        label: `Liability ${le.entryType}`,
+        label,
         utr: le.referenceNo?.trim() || undefined,
         playerName: counterpartyName,
         createdByName: createdByObj?.fullName ?? "",
@@ -686,6 +744,69 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
   };
 }
 
+export async function exportBankLedgerToBuffer(
+  bankId: string,
+  query: LedgerQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const ledger = await getBankLedger(bankId, query, options);
+  const periodLabel = [query.fromDate?.trim() || "Start", query.toDate?.trim() || "Today"].join(" to ");
+
+  const summaryData = [
+    { Field: "Holder Name", Value: ledger.bank.holderName },
+    { Field: "Bank Name", Value: ledger.bank.bankName },
+    { Field: "Account Number", Value: ledger.bank.accountNumber },
+    { Field: "Period", Value: periodLabel },
+    { Field: "Entry Type Filter", Value: query.entryType || "all" },
+    { Field: "Opening Balance", Value: ledger.periodOpeningBalance },
+    { Field: "Total Credits", Value: ledger.totalCredits },
+    { Field: "Total Debits", Value: ledger.totalDebits },
+    { Field: "Closing Balance", Value: ledger.periodClosingBalance },
+    { Field: "Bonus Given", Value: ledger.totalBonusGiven },
+    { Field: "Bonus Reversed", Value: ledger.totalBonusReversed },
+  ];
+
+  const txnData = ledger.rows.map((r) => ({
+    at: r.at,
+    kind: r.kind,
+    label: r.label,
+    utr: r.utr ?? "",
+    playerName: r.playerName ?? "",
+    createdByName: r.createdByName ?? "",
+    credit: r.direction === "credit" ? r.amount : "",
+    debit: r.direction === "debit" ? r.amount : "",
+    balanceAfter: r.balanceAfter,
+    bonusMemo: r.bonusMemo ?? "",
+  }));
+
+  return generateMultiSheetExcelBuffer([
+    {
+      name: "Summary",
+      data: summaryData,
+      columns: [
+        { header: "Field", key: "Field" },
+        { header: "Value", key: "Value" },
+      ],
+    },
+    {
+      name: "Transactions",
+      data: txnData,
+      columns: [
+        { header: "Date & Time", key: "at" },
+        { header: "Type", key: "kind" },
+        { header: "Description", key: "label" },
+        { header: "UTR", key: "utr" },
+        { header: "Player / Ref", key: "playerName" },
+        { header: "Created By", key: "createdByName" },
+        { header: "Credit", key: "credit" },
+        { header: "Debit", key: "debit" },
+        { header: "Balance", key: "balanceAfter" },
+        { header: "Bonus Memo", key: "bonusMemo" },
+      ],
+    },
+  ]);
+}
+
 export type CreateBankSettlementInput = {
   effectiveAt: Date;
   masterReportedBalance: number;
@@ -715,6 +836,10 @@ export async function listBankSettlements(bankId: string) {
     .limit(100)
     .populate("createdBy", "fullName username")
     .lean();
+}
+
+export async function getBankSummary(query: BankSummaryQuery, options?: { timeZone?: string }) {
+  return getBanksBreakdownSummary(query, options);
 }
 
 export async function createBankSettlement(
@@ -780,4 +905,154 @@ export async function createBankSettlement(
   });
 
   return doc.toObject();
+}
+
+export async function createBankTransfer(
+  input: {
+    fromBankId: string;
+    toBankId: string;
+    amount: number;
+    entryDate: string;
+    referenceNo?: string;
+    remark?: string;
+    operatedCurrency?: string;
+    operatedAmount?: number;
+    exchangeRate?: number;
+  },
+  actorId: string,
+  requestId?: string,
+) {
+  if (input.fromBankId === input.toBankId) {
+    throw new AppError("business_rule_error", "From bank and To bank must be different", 400);
+  }
+
+  const doc = await createLiabilityEntry(
+    {
+      entryDate: input.entryDate,
+      entryType: "contra",
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+      fromAccountType: "bank",
+      fromAccountId: input.fromBankId,
+      toAccountType: "bank",
+      toAccountId: input.toBankId,
+      referenceNo: input.referenceNo,
+      remark: input.remark,
+    },
+    actorId,
+    requestId,
+  );
+
+  await createAuditLog({
+    actorId,
+    action: "bank.transfer.create",
+    entity: "liability_entry",
+    entityId: doc._id.toString(),
+    newValue: {
+      fromBankId: input.fromBankId,
+      toBankId: input.toBankId,
+      amount: Number(doc.amount),
+      entryDate: input.entryDate,
+      referenceNo: input.referenceNo?.trim() || undefined,
+      remark: input.remark?.trim() || undefined,
+    },
+    requestId,
+  });
+
+  return doc;
+}
+
+export async function listBankTransfers(
+  query: ListBankTransferQuery,
+  options?: { timeZone?: string },
+) {
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const page = query.page;
+  const pageSize = query.limit ?? query.pageSize;
+  const skip = (page - 1) * pageSize;
+  const sortValue = query.sortOrder === "asc" ? 1 : -1;
+
+  const conditions: Record<string, unknown>[] = [
+    { fromAccountType: "bank", toAccountType: "bank" },
+  ];
+
+  const bankId = trimUndef(query.bankId);
+  if (bankId && Types.ObjectId.isValid(bankId)) {
+    const bid = new Types.ObjectId(bankId);
+    conditions.push({
+      $or: [{ fromAccountId: bid }, { toAccountId: bid }],
+    });
+  }
+
+  const search = trimUndef(query.search);
+  if (search) {
+    const esc = escapeRegex(search);
+    conditions.push({
+      $or: [
+        { referenceNo: { $regex: esc, $options: "i" } },
+        { remark: { $regex: esc, $options: "i" } },
+      ],
+    });
+  }
+
+  const from = trimUndef(query.entryDate_from);
+  const to = trimUndef(query.entryDate_to);
+  const fromD = from ? ymdToUtcStart(from, timeZone) : null;
+  const toD = to ? ymdToUtcEnd(to, timeZone) : null;
+  if (fromD || toD) {
+    conditions.push({
+      entryDate: {
+        ...(fromD ? { $gte: fromD } : {}),
+        ...(toD ? { $lte: toD } : {}),
+      },
+    });
+  }
+
+  const filter = { $and: conditions };
+
+  const [rows, total] = await Promise.all([
+    LiabilityEntryModel.find(filter)
+      .populate("createdBy", "fullName username")
+      .sort({ [query.sortBy]: sortValue })
+      .skip(skip)
+      .limit(pageSize)
+      .lean(),
+    LiabilityEntryModel.countDocuments(filter),
+  ]);
+
+  const accountIds = new Set<string>();
+  rows.forEach((r) => {
+    accountIds.add(String(r.fromAccountId));
+    accountIds.add(String(r.toAccountId));
+  });
+  const banks = await BankModel.find({
+    _id: {
+      $in: [...accountIds]
+        .filter((id) => Types.ObjectId.isValid(id))
+        .map((id) => new Types.ObjectId(id)),
+    },
+  })
+    .select("_id holderName bankName accountNumber")
+    .lean();
+  const bankMap = new Map(banks.map((b) => [String(b._id), bankDisplayLabel(b)]));
+
+  const mapped = rows.map((r) => {
+    const fromId = String(r.fromAccountId);
+    const toId = String(r.toAccountId);
+    return {
+      ...r,
+      id: String(r._id),
+      fromBankId: fromId,
+      toBankId: toId,
+      fromBankName: bankMap.get(fromId) ?? fromId,
+      toBankName: bankMap.get(toId) ?? toId,
+    };
+  });
+
+  return {
+    rows: mapped,
+    meta: { total, page, pageSize },
+  };
 }

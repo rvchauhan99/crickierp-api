@@ -16,6 +16,7 @@ import {
   exportLiabilityEntriesToBuffer,
   exportLiabilityLedgerToBuffer,
   exportLiabilityPersonsToBuffer,
+  exportLiabilityReportToBuffer,
   getLiabilityPersonLedger,
   getLiabilityReportPersonWise,
   getLiabilityReportSummary,
@@ -24,6 +25,7 @@ import {
   updateLiabilityPerson,
 } from "./liability.service";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
+import { resolveBusinessYmdForActor } from "../../shared/utils/businessEntryDateTime";
 
 export async function createLiabilityPersonController(req: Request, res: Response) {
   const body = createLiabilityPersonBodySchema.parse(req.body);
@@ -55,7 +57,11 @@ export async function exportLiabilityPersonController(req: Request, res: Respons
 }
 
 export async function createLiabilityEntryController(req: Request, res: Response) {
-  const body = createLiabilityEntryBodySchema.parse(req.body);
+  const parsed = createLiabilityEntryBodySchema.parse(req.body);
+  const body = {
+    ...parsed,
+    entryDate: resolveBusinessYmdForActor(parsed.entryDate, req.user!.role),
+  };
   const data = await createLiabilityEntry(body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
 }
@@ -104,4 +110,15 @@ export async function liabilityPersonWiseReportController(_req: Request, res: Re
   const query = liabilityReportQuerySchema.parse(_req.query);
   const data = await getLiabilityReportPersonWise(query);
   res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function exportLiabilityReportController(req: Request, res: Response) {
+  const query = liabilityReportQuerySchema.parse(req.query);
+  const buffer = await exportLiabilityReportToBuffer(query);
+  res.setHeader("Content-Disposition", 'attachment; filename="liability-summary-report.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
 }

@@ -101,6 +101,7 @@ type DashboardFilterContext = {
   expenseDateFilter: Record<string, unknown>;
   appliedRange: { fromDate: string; toDate: string };
   exchangeObjectId: Types.ObjectId | null;
+  subExchangeObjectId: Types.ObjectId | null;
   scopedPlayerIds: Types.ObjectId[] | null;
   depositFilter: Record<string, unknown>;
   withdrawalFilter: Record<string, unknown>;
@@ -198,15 +199,23 @@ async function buildDashboardFilterContext(
 
   const exchangeObjectId =
     query.exchangeId && Types.ObjectId.isValid(query.exchangeId) ? new Types.ObjectId(query.exchangeId) : null;
+  const subExchangeObjectId =
+    query.subExchangeId && Types.ObjectId.isValid(query.subExchangeId)
+      ? new Types.ObjectId(query.subExchangeId)
+      : null;
   const playerObjectId =
     query.playerId && Types.ObjectId.isValid(query.playerId) ? new Types.ObjectId(query.playerId) : null;
   const bankObjectId = query.bankId && Types.ObjectId.isValid(query.bankId) ? new Types.ObjectId(query.bankId) : null;
-  const scopedPlayerIds = exchangeObjectId
-    ? await (await import("../player/player.model")).PlayerModel.distinct("_id", {
-        exchange: exchangeObjectId,
-        isMigratedOldUser: false,
-      })
-    : null;
+  const playerScopeFilter: Record<string, unknown> = { isMigratedOldUser: false };
+  if (subExchangeObjectId) {
+    playerScopeFilter.exchange = subExchangeObjectId;
+  } else if (exchangeObjectId) {
+    playerScopeFilter.rootExchange = exchangeObjectId;
+  }
+  const scopedPlayerIds =
+    exchangeObjectId || subExchangeObjectId
+      ? await (await import("../player/player.model")).PlayerModel.distinct("_id", playerScopeFilter)
+      : null;
 
   const playerFilter =
     scopedPlayerIds && playerObjectId
@@ -293,7 +302,9 @@ async function buildDashboardFilterContext(
       }
     : { _id: { $exists: false } };
 
-  const exchangeStatsFilter = exchangeObjectId ? { _id: exchangeObjectId } : {};
+  const exchangeStatsFilter = exchangeObjectId
+    ? { _id: exchangeObjectId }
+    : { $or: [{ parentExchange: null }, { parentExchange: { $exists: false } }] };
 
   return {
     dateFilter,
@@ -302,6 +313,7 @@ async function buildDashboardFilterContext(
     expenseDateFilter,
     appliedRange,
     exchangeObjectId,
+    subExchangeObjectId,
     scopedPlayerIds,
     depositFilter,
     withdrawalFilter,
@@ -457,6 +469,7 @@ export async function getDashboardSummary(
   const {
     appliedRange,
     exchangeObjectId,
+    subExchangeObjectId,
     scopedPlayerIds,
     depositFilter,
     withdrawalFilter,
@@ -580,14 +593,18 @@ export async function getDashboardSummary(
   };
 
   const todayRange = resolveTodayRangeForTimeZone(timeZone);
-  const periodPlayerFilter = {
+  const periodPlayerFilter: Record<string, unknown> = {
     isMigratedOldUser: false,
     createdAt: {
       $gte: rangeStartUtc,
       $lte: rangeEndUtc,
     },
-    ...(exchangeObjectId ? { exchange: exchangeObjectId } : {}),
   };
+  if (subExchangeObjectId) {
+    periodPlayerFilter.exchange = subExchangeObjectId;
+  } else if (exchangeObjectId) {
+    periodPlayerFilter.rootExchange = exchangeObjectId;
+  }
   const firstDepositBaseMatch: Record<string, unknown> = {
     status: { $in: ["verified", "finalized"] },
     player: scopedPlayerIds ? { $in: scopedPlayerIds } : { $exists: true, $ne: null },
@@ -663,16 +680,33 @@ export async function getDashboardSummary(
       },
     ]),
 
-    // Exchange active/total
-    exchangeObjectId
-      ? Promise.all([
-          ExchangeModel.countDocuments({ ...exchangeStatsFilter }),
-          ExchangeModel.countDocuments({ ...exchangeStatsFilter, status: "active" }),
-        ])
-      : Promise.all([
-          ExchangeModel.countDocuments({}),
-          ExchangeModel.countDocuments({ status: "active" }),
-        ]),
+    // Exchange active/total (top-level only when unscoped)
+    (async () => {
+      const [total, active, subTotal] = await Promise.all([
+        ExchangeModel.countDocuments({ ...exchangeStatsFilter }),
+        ExchangeModel.countDocuments({ ...exchangeStatsFilter, status: "active" }),
+        ExchangeModel.countDocuments(
+          exchangeObjectId
+            ? { parentExchange: exchangeObjectId }
+            : { parentExchange: { $ne: null } },
+        ),
+      ]);
+      const groupParents = await ExchangeModel.aggregate<{ _id: Types.ObjectId }>([
+        { $match: { parentExchange: { $ne: null } } },
+        { $group: { _id: "$parentExchange" } },
+      ]);
+      const groupParentIds = groupParents.map((g) => g._id);
+      const pendingMove =
+        groupParentIds.length === 0
+          ? 0
+          : await PlayerModel.countDocuments({
+              rootExchange: exchangeObjectId
+                ? exchangeObjectId
+                : { $in: groupParentIds },
+              $expr: { $eq: ["$exchange", "$rootExchange"] },
+            });
+      return [total, active, subTotal, pendingMove] as const;
+    })(),
 
     // Total active users
     UserModel.countDocuments({ status: "active" }),
@@ -893,7 +927,11 @@ export async function getDashboardSummary(
               },
             },
           },
-          ...(exchangeObjectId ? [{ $match: { "playerDoc.exchange": exchangeObjectId } }] : []),
+          ...(subExchangeObjectId
+            ? [{ $match: { "playerDoc.exchange": subExchangeObjectId } }]
+            : exchangeObjectId
+              ? [{ $match: { "playerDoc.rootExchange": exchangeObjectId } }]
+              : []),
           {
             $group: {
               _id: "$playerDoc.exchange",
@@ -1098,7 +1136,7 @@ export async function getDashboardSummary(
   const netPL = grossPL - expenseApprovedAmount;
 
   /* ── Exchange stats ────────────────────────────────────────────── */
-  const [exchangeTotal, exchangeActive] = exchangeStats;
+  const [exchangeTotal, exchangeActive, exchangeSubTotal, playersPendingMove] = exchangeStats;
 
   /* ── Build daily trend (fill missing days with 0) ──────────────── */
   const allDays = dateRangeYmd(appliedRange.fromDate, appliedRange.toDate, timeZone);
@@ -1209,7 +1247,7 @@ export async function getDashboardSummary(
     WithdrawalModel,
   });
 
-  const exchangesBreakdownWithBalances = exchangesBreakdown
+  const leafRows = exchangesBreakdown
     .map((e) => ({
       ...e,
       exchangeId: e.exchangeIdString,
@@ -1224,8 +1262,116 @@ export async function getDashboardSummary(
       netBonus: e.bonusGiven - e.bonusRecovered,
       periodOpeningBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodOpeningBalance ?? 0 : 0,
       periodClosingBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodClosingBalance ?? 0 : 0,
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    }));
+
+  const leafIds = leafRows
+    .map((e) => e.exchangeObjectId)
+    .filter((value): value is Types.ObjectId => value instanceof Types.ObjectId);
+  const leafDocs =
+    leafIds.length > 0
+      ? await ExchangeModel.find({ _id: { $in: leafIds } })
+          .select("_id name parentExchange")
+          .lean()
+      : [];
+  const leafMeta = new Map(
+    leafDocs.map((d) => [
+      String(d._id),
+      {
+        parentId: d.parentExchange ? String(d.parentExchange) : null,
+        name: d.name,
+      },
+    ]),
+  );
+  const parentIds = [
+    ...new Set(
+      leafDocs.filter((d) => d.parentExchange).map((d) => String(d.parentExchange)),
+    ),
+  ].map((id) => new Types.ObjectId(id));
+  const parentDocs =
+    parentIds.length > 0
+      ? await ExchangeModel.find({ _id: { $in: parentIds } }).select("_id name").lean()
+      : [];
+  const parentNameMap = new Map(parentDocs.map((p) => [String(p._id), p.name]));
+
+  type BreakdownLeaf = (typeof leafRows)[number] & { isSubExchange?: boolean; subLabel?: string };
+  const parentsWithSubsInBreakdown = new Set(
+    leafDocs.filter((d) => d.parentExchange).map((d) => String(d.parentExchange)),
+  );
+
+  const byParent = new Map<string, BreakdownLeaf[]>();
+  const topLevel: BreakdownLeaf[] = [];
+  for (const leaf of leafRows) {
+    const meta = leafMeta.get(leaf.exchangeId);
+    if (meta?.parentId) {
+      const list = byParent.get(meta.parentId) ?? [];
+      list.push({ ...leaf, isSubExchange: true });
+      byParent.set(meta.parentId, list);
+    } else if (parentsWithSubsInBreakdown.has(leaf.exchangeId)) {
+      // Parent's own (legacy / unassigned) activity → attach as "(direct)" under the group
+      const list = byParent.get(leaf.exchangeId) ?? [];
+      list.push({ ...leaf, isSubExchange: true, subLabel: "(direct)" });
+      byParent.set(leaf.exchangeId, list);
+    } else {
+      topLevel.push({ ...leaf, isSubExchange: false });
+    }
+  }
+
+  const rolledParents = [...byParent.entries()].map(([parentId, subs]) => {
+    const depositTotal = subs.reduce((s, r) => s + r.depositTotal, 0);
+    const depositVerified = subs.reduce((s, r) => s + r.depositVerified, 0);
+    const withdrawalTotal = subs.reduce((s, r) => s + r.withdrawalTotal, 0);
+    const withdrawalApproved = subs.reduce((s, r) => s + r.withdrawalApproved, 0);
+    const bonusGiven = subs.reduce((s, r) => s + r.bonusGiven, 0);
+    const bonusRecovered = subs.reduce((s, r) => s + r.bonusRecovered, 0);
+    const newPlayers = subs.reduce((s, r) => s + r.newPlayers, 0);
+    const firstTimeDepositAmount = subs.reduce((s, r) => s + r.firstTimeDepositAmount, 0);
+    const periodOpeningBalance = subs.reduce((s, r) => s + r.periodOpeningBalance, 0);
+    const periodClosingBalance = subs.reduce((s, r) => s + r.periodClosingBalance, 0);
+    return {
+      exchangeId: parentId,
+      name: parentNameMap.get(parentId) ?? leafMeta.get(parentId)?.name ?? "Unknown",
+      depositTotal,
+      depositVerified,
+      withdrawalTotal,
+      withdrawalApproved,
+      bonusGiven,
+      bonusRecovered,
+      newPlayers,
+      firstTimeDepositAmount,
+      netPL: depositVerified - withdrawalApproved,
+      netBonus: bonusGiven - bonusRecovered,
+      periodOpeningBalance,
+      periodClosingBalance,
+      isSubExchange: false,
+      hasSubExchanges: true,
+      subExchanges: subs
+        .map((s) => ({ ...s, name: s.subLabel ?? s.name }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    };
+  });
+
+  // If filtering by a single sub, return that leaf only; if by parent, return that parent rollup
+  let exchangesBreakdownWithBalances: Array<Record<string, unknown>> = [
+    ...topLevel.map((r) => ({ ...r, hasSubExchanges: false, subExchanges: [] as BreakdownLeaf[] })),
+    ...rolledParents,
+  ].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+  if (subExchangeObjectId) {
+    const sid = String(subExchangeObjectId);
+    exchangesBreakdownWithBalances = leafRows
+      .filter((r) => r.exchangeId === sid)
+      .map((r) => ({ ...r, isSubExchange: true, hasSubExchanges: false, subExchanges: [] }));
+  } else if (exchangeObjectId) {
+    const pid = String(exchangeObjectId);
+    const parentRow = rolledParents.find((r) => r.exchangeId === pid);
+    const directRow = topLevel.find((r) => r.exchangeId === pid);
+    exchangesBreakdownWithBalances = parentRow
+      ? [parentRow]
+      : directRow
+        ? [{ ...directRow, hasSubExchanges: false, subExchanges: [] }]
+        : [];
+  }
+
   const firstTimeDepositAmount =
     (firstTimeDepositPeriodAgg as Array<{ totalAmount?: number }>)[0]?.totalAmount ?? 0;
 
@@ -1353,6 +1499,7 @@ export async function getDashboardSummary(
       fromDate: appliedRange.fromDate,
       toDate: appliedRange.toDate,
       exchangeId: query.exchangeId ?? null,
+      subExchangeId: query.subExchangeId ?? null,
       status: query.status ?? "all",
       transactionType: query.transactionType ?? "all",
       scopedPlayerCount: scopedPlayerIds?.length ?? null,
@@ -1391,6 +1538,8 @@ export async function getDashboardSummary(
     exchanges: {
       total: exchangeTotal,
       active: exchangeActive,
+      subTotal: exchangeSubTotal,
+      playersPendingMove,
     },
     users: {
       total: totalUsers,
@@ -1403,6 +1552,21 @@ export async function getDashboardSummary(
     recentActivity,
     exchangesBreakdown: exchangesBreakdownWithBalances,
     banksBreakdown,
+  };
+}
+
+/**
+ * Bank-wise summary (same banksBreakdown + meta as dashboard).
+ * Shared by GET /reports/dashboard-summary and GET /bank/summary.
+ */
+export async function getBanksBreakdownSummary(
+  query: DashboardSummaryQuery,
+  options?: { timeZone?: string },
+) {
+  const data = await getDashboardSummary(query, options);
+  return {
+    banksBreakdown: data.banksBreakdown ?? [],
+    meta: data.meta,
   };
 }
 

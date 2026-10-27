@@ -26,7 +26,10 @@ import {
 import { deleteFile, getSignedUrl, uploadFile } from "../../shared/services/bucket.service";
 import { resolveMoneyFromRequest } from "../../shared/utils/moneyFx";
 import { getCurrencyMinUnit } from "../../shared/constants/currencies";
-import { requirePlatformCurrency } from "../settings/settings.service";
+import {
+  assertLiabilityModuleEnabled,
+  requirePlatformCurrency,
+} from "../settings/settings.service";
 
 type CancelExpenseInput = z.infer<typeof cancelExpenseBodySchema>;
 
@@ -187,6 +190,8 @@ export async function createExpense(
   const liabilityPersonIdTrim = trimUndef(input.liabilityPersonId);
   const hasBank = Boolean(bankIdTrim);
   const hasPerson = Boolean(liabilityPersonIdTrim);
+
+  if (hasPerson) assertLiabilityModuleEnabled();
 
   if (skipAudit) {
     if (hasBank && hasPerson) {
@@ -375,6 +380,7 @@ export async function approveExpense(
   }
 
   const amount = doc.amount;
+  if (input.settlementAccountType === "person") assertLiabilityModuleEnabled();
   if (input.settlementAccountType === "bank") {
     const bank = await BankModel.findById(input.bankId);
     if (!bank) throw new AppError("not_found", "Bank not found", 404);

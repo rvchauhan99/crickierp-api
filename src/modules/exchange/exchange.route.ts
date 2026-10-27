@@ -7,8 +7,10 @@ import {
   createExchangeController,
   exchangeStatementController,
   exportExchangeController,
+  exportExchangeStatementController,
   getExchangeController,
   listExchangeController,
+  movePlayersController,
   updateExchangeController,
 } from "./exchange.controller";
 import {
@@ -16,6 +18,7 @@ import {
   exchangeIdParamSchema,
   exchangeStatementQuerySchema,
   listExchangeQuerySchema,
+  movePlayersBodySchema,
   updateExchangeBodySchema,
 } from "./exchange.validation";
 
@@ -42,10 +45,22 @@ exchangeRouter.get(
   exportExchangeController,
 );
 exchangeRouter.get(
+  "/:id/statement/export",
+  permissionMiddleware(PERMISSIONS.EXCHANGE_STATEMENT),
+  validate({ params: exchangeIdParamSchema, query: exchangeStatementQuerySchema }),
+  exportExchangeStatementController,
+);
+exchangeRouter.get(
   "/:id/statement",
   permissionMiddleware(PERMISSIONS.EXCHANGE_STATEMENT),
   validate({ params: exchangeIdParamSchema, query: exchangeStatementQuerySchema }),
   exchangeStatementController,
+);
+exchangeRouter.post(
+  "/:id/move-players",
+  permissionMiddleware(PERMISSIONS.PLAYER_EDIT),
+  validate({ params: exchangeIdParamSchema, body: movePlayersBodySchema }),
+  movePlayersController,
 );
 exchangeRouter.get(
   "/:id",
