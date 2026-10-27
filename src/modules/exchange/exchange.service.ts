@@ -1,5 +1,5 @@
 import { computeAllTimeExchangeBalances } from "../../shared/services/exchange-balance.service";
-import { generateExcelBuffer } from "../../shared/services/excel.service";
+import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import { Types } from "mongoose";
 import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
@@ -7,6 +7,7 @@ import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
 import { ExchangeTopupModel } from "../exchange-topup/exchange-topup.model";
 import { PlayerModel } from "../player/player.model";
+import { ReferralAccrualModel } from "../referral/referral-accrual.model";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import {
   DEFAULT_TIMEZONE,
@@ -15,12 +16,23 @@ import {
   ymdToUtcStart,
 } from "../../shared/utils/timezone";
 import { ExchangeModel } from "./exchange.model";
-import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
+import {
+  assertCanBeParent,
+  countSubExchanges,
+  listSubExchangeIds,
+} from "./exchange-hierarchy";
+import {
+  exchangeStatementQuerySchema,
+  listExchangeQuerySchema,
+  movePlayersBodySchema,
+} from "./exchange.validation";
 import { resolveOpeningMoneyFromRequest } from "../../shared/utils/moneyFx";
+import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 
 type CreateExchangeInput = {
   name: string;
-  provider: string;
+  provider?: string;
+  parentExchangeId?: string | null;
   openingBalance: number;
   bonus: number;
   status: "active" | "deactive";
@@ -31,6 +43,7 @@ type CreateExchangeInput = {
 
 type ListExchangeQuery = z.infer<typeof listExchangeQuerySchema>;
 type ExchangeStatementQuery = z.infer<typeof exchangeStatementQuerySchema>;
+type MovePlayersInput = z.infer<typeof movePlayersBodySchema>;
 
 function trimUndef(s: string | undefined): string | undefined {
   if (s == null) return undefined;
@@ -154,6 +167,15 @@ function createdAtCondition(
 function buildExchangeListFilter(q: ListExchangeQuery, timeZone: string): Record<string, unknown> {
   const conditions: Record<string, unknown>[] = [];
 
+  const parentExchangeId = trimUndef(q.parentExchangeId);
+  if (parentExchangeId && Types.ObjectId.isValid(parentExchangeId)) {
+    conditions.push({ parentExchange: new Types.ObjectId(parentExchangeId) });
+  } else if (q.topLevelOnly) {
+    conditions.push({
+      $or: [{ parentExchange: null }, { parentExchange: { $exists: false } }],
+    });
+  }
+
   const search = trimUndef(q.search);
   if (search) {
     conditions.push({
@@ -233,9 +255,37 @@ export async function createExchange(
   actorId: string,
   requestId?: string,
 ) {
-  const exists = await ExchangeModel.findOne({ name: input.name, provider: input.provider });
+  let parentExchange: Types.ObjectId | undefined;
+  let provider = input.provider?.trim() ?? "";
+
+  if (input.parentExchangeId) {
+    await assertCanBeParent(input.parentExchangeId);
+    parentExchange = new Types.ObjectId(input.parentExchangeId);
+    const parent = await ExchangeModel.findById(parentExchange).select("provider").lean();
+    if (!parent) throw new AppError("not_found", "Parent exchange not found", 404);
+    provider = parent.provider;
+  }
+
+  if (!provider || provider.length < 2) {
+    throw new AppError("validation_error", "Provider is required", 400);
+  }
+
+  const existsFilter: Record<string, unknown> = {
+    name: input.name,
+    provider,
+  };
+  if (parentExchange) {
+    existsFilter.parentExchange = parentExchange;
+  } else {
+    existsFilter.$or = [{ parentExchange: null }, { parentExchange: { $exists: false } }];
+  }
+  const exists = await ExchangeModel.findOne(existsFilter);
   if (exists) {
-    throw new AppError("business_rule_error", "Exchange already exists for provider", 409);
+    throw new AppError(
+      "business_rule_error",
+      parentExchange ? "Sub exchange already exists under this parent" : "Exchange already exists for provider",
+      409,
+    );
   }
 
   const opening = await resolveOpeningMoneyFromRequest({
@@ -245,9 +295,9 @@ export async function createExchange(
     openingExchangeRate: input.openingExchangeRate,
   });
 
-  const payload = {
+  const payload: Record<string, unknown> = {
     name: input.name,
-    provider: input.provider,
+    provider,
     bonus: input.bonus,
     status: input.status,
     openingBalance: opening.openingBalance,
@@ -258,7 +308,14 @@ export async function createExchange(
     createdBy: new Types.ObjectId(actorId),
     updatedBy: new Types.ObjectId(actorId),
   };
+  if (parentExchange) {
+    payload.parentExchange = parentExchange;
+  }
   const doc = await ExchangeModel.create(payload);
+
+  if (parentExchange) {
+    await recomputeExchangeCurrentBalance(parentExchange.toString());
+  }
 
   await createAuditLog({
     actorId,
@@ -268,6 +325,7 @@ export async function createExchange(
     newValue: {
       name: doc.name,
       provider: doc.provider,
+      parentExchangeId: parentExchange?.toString() ?? null,
       openingBalance: doc.openingBalance,
       openingOperatedCurrency: doc.openingOperatedCurrency,
       openingOperatedAmount: doc.openingOperatedAmount,
@@ -279,6 +337,7 @@ export async function createExchange(
     requestId,
   });
 
+  await invalidateCacheDomains(["exchange"]);
   return doc;
 }
 
@@ -300,6 +359,44 @@ async function overlayComputedCurrentBalances<T extends ExchangeRowWithBalance>(
   });
 }
 
+async function attachSubExchangeMeta<
+  T extends { _id: Types.ObjectId; parentExchange?: Types.ObjectId | null },
+>(rows: T[]) {
+  if (rows.length === 0) return rows as Array<T & { subExchangeCount: number; unassignedPlayerCount: number }>;
+
+  const topLevelIds = rows.filter((r) => !r.parentExchange).map((r) => r._id);
+  const [subCounts, unassignedCounts] = await Promise.all([
+    topLevelIds.length
+      ? ExchangeModel.aggregate<{ _id: Types.ObjectId; count: number }>([
+          { $match: { parentExchange: { $in: topLevelIds } } },
+          { $group: { _id: "$parentExchange", count: { $sum: 1 } } },
+        ])
+      : Promise.resolve([]),
+    topLevelIds.length
+      ? PlayerModel.aggregate<{ _id: Types.ObjectId; count: number }>([
+          {
+            $match: {
+              rootExchange: { $in: topLevelIds },
+              $expr: { $eq: ["$exchange", "$rootExchange"] },
+            },
+          },
+          { $group: { _id: "$rootExchange", count: { $sum: 1 } } },
+        ])
+      : Promise.resolve([]),
+  ]);
+
+  const subMap = new Map(subCounts.map((r) => [String(r._id), r.count]));
+  const unassignedMap = new Map(unassignedCounts.map((r) => [String(r._id), r.count]));
+
+  return rows.map((row) => {
+    const id = String(row._id);
+    const subExchangeCount = row.parentExchange ? 0 : (subMap.get(id) ?? 0);
+    const unassignedPlayerCount =
+      subExchangeCount > 0 ? (unassignedMap.get(id) ?? 0) : 0;
+    return { ...row, subExchangeCount, unassignedPlayerCount };
+  });
+}
+
 export async function listExchanges(query: ListExchangeQuery, options?: { timeZone?: string }) {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
   const filter = buildExchangeListFilter(query, timeZone);
@@ -310,6 +407,7 @@ export async function listExchanges(query: ListExchangeQuery, options?: { timeZo
   const [rawRows, total] = await Promise.all([
     ExchangeModel.find(filter)
       .populate("createdBy", "fullName username")
+      .populate("parentExchange", "name provider")
       .sort({ [query.sortBy]: sortValue })
       .skip(skip)
       .limit(query.pageSize)
@@ -317,7 +415,8 @@ export async function listExchanges(query: ListExchangeQuery, options?: { timeZo
     ExchangeModel.countDocuments(filter),
   ]);
 
-  const rows = await overlayComputedCurrentBalances(rawRows);
+  const withBalances = await overlayComputedCurrentBalances(rawRows);
+  const rows = await attachSubExchangeMeta(withBalances);
 
   return {
     rows,
@@ -355,31 +454,48 @@ export async function exportExchangesToBuffer(
 
   const rawRows = await ExchangeModel.find(filter)
     .populate("createdBy", "fullName username")
+    .populate("parentExchange", "name provider")
     .sort({ [query.sortBy]: sortValue })
     .limit(EXPORT_MAX_ROWS)
     .lean();
 
-  const rows = await overlayComputedCurrentBalances(rawRows);
+  const withBalances = await overlayComputedCurrentBalances(rawRows);
+  const rows = await attachSubExchangeMeta(withBalances);
 
-  const exportData = rows.map((r) => ({
-    "Exchange Name": r.name,
-    Provider: r.provider,
-    "Opening Balance": r.openingBalance,
-    "Current Balance": r.currentBalance ?? r.openingBalance,
-    Bonus: r.bonus,
-    Version: r.version ?? "",
-    Status: r.status,
-    "Created By": formatCreatedByForExport(r.createdBy),
-    "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
-  }));
+  const exportData = rows.map((r) => {
+    const parent = r.parentExchange as { name?: string } | null | undefined;
+    return {
+      "Exchange Name": r.name,
+      Provider: r.provider,
+      "Parent Exchange": parent?.name ?? "",
+      "Sub Exchanges": r.subExchangeCount,
+      "Pending Move": r.unassignedPlayerCount,
+      "Opening Balance": r.openingBalance,
+      "Current Balance": r.currentBalance ?? r.openingBalance,
+      Bonus: r.bonus,
+      Version: r.version ?? "",
+      Status: r.status,
+      "Created By": formatCreatedByForExport(r.createdBy),
+      "Created At": formatDateTimeForTimeZone(r.createdAt, timeZone),
+    };
+  });
 
   return generateExcelBuffer(exportData, "Exchanges");
 }
 
 export async function getExchangeById(id: string) {
-  const doc = await ExchangeModel.findById(id);
+  const doc = await ExchangeModel.findById(id).populate("parentExchange", "name provider");
   if (!doc) throw new AppError("not_found", "Exchange not found", 404);
-  return doc;
+  const lean = doc.toObject();
+  const subExchangeCount = lean.parentExchange ? 0 : await countSubExchanges(doc._id);
+  const unassignedPlayerCount =
+    subExchangeCount > 0
+      ? await PlayerModel.countDocuments({
+          rootExchange: doc._id,
+          $expr: { $eq: ["$exchange", "$rootExchange"] },
+        })
+      : 0;
+  return { ...lean, subExchangeCount, unassignedPlayerCount };
 }
 
 export async function updateExchange(
@@ -405,7 +521,7 @@ export async function updateExchange(
     version: existing.version,
   };
 
-  const { openingBalance, openingOperatedCurrency, openingOperatedAmount, openingExchangeRate, ...rest } =
+  const { openingBalance, openingOperatedCurrency, openingOperatedAmount, openingExchangeRate, parentExchangeId: _p, ...rest } =
     input;
 
   Object.assign(existing, rest);
@@ -456,6 +572,7 @@ export async function updateExchange(
     requestId,
   });
 
+  await invalidateCacheDomains(["exchange"]);
   return existing;
 }
 
@@ -467,11 +584,28 @@ export async function recomputeExchangeCurrentBalance(exchangeId: string): Promi
   const exchange = await ExchangeModel.findById(exchangeObjectId);
   if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
 
-  const balanceMap = await computeAllTimeExchangeBalances([exchangeObjectId]);
+  const idsToCompute = [exchangeObjectId];
+  if (exchange.parentExchange) {
+    idsToCompute.push(exchange.parentExchange as Types.ObjectId);
+  }
+
+  const balanceMap = await computeAllTimeExchangeBalances(idsToCompute);
   const nextCurrentBalance = balanceMap.get(exchangeId) ?? exchange.openingBalance;
 
   exchange.currentBalance = nextCurrentBalance;
   await exchange.save();
+
+  if (exchange.parentExchange) {
+    const parentId = String(exchange.parentExchange);
+    const parentBalance = balanceMap.get(parentId);
+    if (parentBalance != null) {
+      await ExchangeModel.updateOne(
+        { _id: exchange.parentExchange },
+        { $set: { currentBalance: parentBalance } },
+      );
+    }
+  }
+
   return nextCurrentBalance;
 }
 
@@ -501,6 +635,7 @@ function withdrawalEventTime(w: { requestedAt?: Date; updatedAt?: Date; createdA
  * Exchange-perspective statement:
  * - deposit -> debit (money withdrawn from exchange)
  * - withdrawal -> credit (money deposited into exchange)
+ * Group (parent) exchanges combine own + all sub ledgers; optional subExchangeId filter.
  */
 export async function getExchangeStatement(
   exchangeId: string,
@@ -526,7 +661,36 @@ export async function getExchangeStatement(
     throw new AppError("validation_error", "toDate must be in YYYY-MM-DD format", 400);
   }
 
-  const playerFilter: Record<string, unknown> = { exchange: exchangeObjectId };
+  const isGroup = !exchange.parentExchange && (await countSubExchanges(exchangeObjectId)) > 0;
+  const subIds = isGroup ? await listSubExchangeIds(exchangeObjectId) : [];
+
+  let ledgerExchangeIds: Types.ObjectId[] = [exchangeObjectId];
+  if (isGroup) {
+    if (query.subExchangeId) {
+      if (!Types.ObjectId.isValid(query.subExchangeId)) {
+        throw new AppError("validation_error", "Invalid subExchangeId", 400);
+      }
+      const subOid = new Types.ObjectId(query.subExchangeId);
+      if (!subIds.some((id) => id.equals(subOid))) {
+        throw new AppError("validation_error", "Sub exchange does not belong to this parent", 400);
+      }
+      ledgerExchangeIds = [subOid];
+    } else {
+      ledgerExchangeIds = [exchangeObjectId, ...subIds];
+    }
+  }
+
+  const subExchangeDocs =
+    isGroup && ledgerExchangeIds.length > 1
+      ? await ExchangeModel.find({ _id: { $in: ledgerExchangeIds } }).select("_id name").lean()
+      : isGroup && query.subExchangeId
+        ? await ExchangeModel.find({ _id: { $in: ledgerExchangeIds } }).select("_id name").lean()
+        : [];
+  const subNameMap = new Map(subExchangeDocs.map((s) => [String(s._id), s.name]));
+
+  const playerFilter: Record<string, unknown> = {
+    exchange: ledgerExchangeIds.length === 1 ? ledgerExchangeIds[0] : { $in: ledgerExchangeIds },
+  };
   if (query.playerId) {
     if (!Types.ObjectId.isValid(query.playerId)) {
       throw new AppError("validation_error", "Invalid player id", 400);
@@ -534,9 +698,10 @@ export async function getExchangeStatement(
     playerFilter._id = new Types.ObjectId(query.playerId);
   }
 
-  const players = await PlayerModel.find(playerFilter).select("_id playerId").lean();
+  const players = await PlayerModel.find(playerFilter).select("_id playerId exchange").lean();
   const playerIds = players.map((p) => p._id);
   const playerMap = new Map(players.map((p) => [String(p._id), p.playerId]));
+  const playerExchangeMap = new Map(players.map((p) => [String(p._id), String(p.exchange)]));
 
   const [allDeposits, allWithdrawals, allTopups] = await Promise.all([
     playerIds.length
@@ -555,11 +720,42 @@ export async function getExchangeStatement(
           .select("_id player playerName amount payableAmount reverseBonus utr requestedAt updatedAt createdAt")
           .lean()
       : Promise.resolve([]),
-    ExchangeTopupModel.find({ exchangeId: exchangeObjectId })
+    ExchangeTopupModel.find({
+      exchangeId: ledgerExchangeIds.length === 1 ? ledgerExchangeIds[0] : { $in: ledgerExchangeIds },
+    })
       .populate("createdBy", "fullName username")
       .select("_id exchangeId amount remark createdBy createdAt updatedAt")
       .lean(),
   ]);
+
+  const openingForPeriod = isGroup && !query.subExchangeId
+    ? Number(
+        (
+          await computeAllTimeExchangeBalances([exchangeObjectId])
+        ).get(String(exchangeObjectId)) != null
+          ? // Use sum of opening balances of included ledgers as period base before activity
+            (
+              await ExchangeModel.find({ _id: { $in: ledgerExchangeIds } })
+                .select("openingBalance")
+                .lean()
+            ).reduce((sum, r) => sum + Number(r.openingBalance ?? 0), 0)
+          : exchange.openingBalance,
+      )
+    : (() => {
+        // leaf / filtered sub: opening of that ledger only
+        return Number(exchange.openingBalance);
+      })();
+
+  // For filtered single sub under a group, use that sub's opening
+  let periodOpeningBase = Number(exchange.openingBalance);
+  if (isGroup) {
+    const openings = await ExchangeModel.find({ _id: { $in: ledgerExchangeIds } })
+      .select("openingBalance")
+      .lean();
+    periodOpeningBase = openings.reduce((sum, r) => sum + Number(r.openingBalance ?? 0), 0);
+  } else if (query.subExchangeId) {
+    periodOpeningBase = openingForPeriod;
+  }
 
   if (playerIds.length === 0 && allTopups.length === 0) {
     return {
@@ -569,9 +765,10 @@ export async function getExchangeStatement(
         provider: exchange.provider,
         openingBalance: exchange.openingBalance,
         currentBalance: exchange.currentBalance ?? exchange.openingBalance,
+        isGroup,
       },
-      periodOpeningBalance: exchange.openingBalance,
-      periodClosingBalance: exchange.openingBalance,
+      periodOpeningBalance: periodOpeningBase,
+      periodClosingBalance: periodOpeningBase,
       totalCredits: 0,
       totalDebits: 0,
       totalDepositOutflow: 0,
@@ -631,7 +828,7 @@ export async function getExchangeStatement(
   }
   events.sort((a, b) => a.t - b.t);
 
-  const periodOpeningBalance = exchange.openingBalance + priorNet;
+  const periodOpeningBalance = periodOpeningBase + priorNet;
   let running = periodOpeningBalance;
   let totalCredits = 0;
   let totalDebits = 0;
@@ -646,6 +843,7 @@ export async function getExchangeStatement(
       running -= amount;
       totalDebits += amount;
       totalDepositOutflow += amount;
+      const leafExId = playerExchangeMap.get(String(d.player)) ?? "";
 
       return {
         kind: "deposit" as const,
@@ -658,6 +856,8 @@ export async function getExchangeStatement(
         balanceAfter: running,
         bonusMemo: d.bonusAmount ?? 0,
         utr: d.utr,
+        subExchangeId: isGroup ? leafExId : undefined,
+        subExchangeName: isGroup ? (subNameMap.get(leafExId) ?? (leafExId === String(exchangeObjectId) ? "(direct)" : "")) : undefined,
       };
     }
 
@@ -667,6 +867,7 @@ export async function getExchangeStatement(
       running += amount;
       totalCredits += amount;
       totalWithdrawalInflow += amount;
+      const leafExId = playerExchangeMap.get(String(w.player)) ?? "";
 
       return {
         kind: "withdrawal" as const,
@@ -679,6 +880,8 @@ export async function getExchangeStatement(
         balanceAfter: running,
         bonusMemo: w.reverseBonus ?? 0,
         utr: w.utr,
+        subExchangeId: isGroup ? leafExId : undefined,
+        subExchangeName: isGroup ? (subNameMap.get(leafExId) ?? (leafExId === String(exchangeObjectId) ? "(direct)" : "")) : undefined,
       };
     }
 
@@ -689,6 +892,7 @@ export async function getExchangeStatement(
     const createdByObj = topup.createdBy as { fullName?: string; username?: string } | undefined;
     const createdByLabel =
       createdByObj?.fullName?.trim() || createdByObj?.username?.trim() || "";
+    const topupExId = String(topup.exchangeId);
 
     return {
       kind: "topup" as const,
@@ -703,8 +907,14 @@ export async function getExchangeStatement(
       utr: undefined,
       remark: topup.remark ?? "",
       createdByName: createdByLabel,
+      subExchangeId: isGroup ? topupExId : undefined,
+      subExchangeName: isGroup
+        ? (subNameMap.get(topupExId) ?? (topupExId === String(exchangeObjectId) ? "(direct)" : ""))
+        : undefined,
     };
   });
+
+  const balanceMap = await computeAllTimeExchangeBalances([exchangeObjectId]);
 
   return {
     exchange: {
@@ -712,7 +922,8 @@ export async function getExchangeStatement(
       name: exchange.name,
       provider: exchange.provider,
       openingBalance: exchange.openingBalance,
-      currentBalance: exchange.currentBalance ?? exchange.openingBalance,
+      currentBalance: balanceMap.get(String(exchangeObjectId)) ?? exchange.currentBalance ?? exchange.openingBalance,
+      isGroup,
     },
     periodOpeningBalance,
     periodClosingBalance: running,
@@ -722,5 +933,161 @@ export async function getExchangeStatement(
     totalWithdrawalInflow,
     totalTopUpCredits,
     rows,
+  };
+}
+
+export async function exportExchangeStatementToBuffer(
+  exchangeId: string,
+  query: ExchangeStatementQuery,
+  options?: { timeZone?: string },
+): Promise<Buffer> {
+  const statement = await getExchangeStatement(exchangeId, query, options);
+  const periodLabel = [query.fromDate?.trim() || "Start", query.toDate?.trim() || "Today"].join(" to ");
+
+  const summaryData = [
+    { Field: "Exchange", Value: statement.exchange.name },
+    { Field: "Provider", Value: statement.exchange.provider },
+    { Field: "Period", Value: periodLabel },
+    { Field: "Entry Type Filter", Value: query.entryType || "all" },
+    { Field: "Player Filter", Value: query.playerId || "All" },
+    { Field: "Sub Exchange Filter", Value: query.subExchangeId || "All" },
+    { Field: "Opening Balance", Value: statement.periodOpeningBalance },
+    { Field: "Total Credits", Value: statement.totalCredits },
+    { Field: "Total Debits", Value: statement.totalDebits },
+    { Field: "Top-Up Credits", Value: statement.totalTopUpCredits },
+    { Field: "Closing Balance", Value: statement.periodClosingBalance },
+    { Field: "Current Balance", Value: statement.exchange.currentBalance },
+  ];
+
+  const txnData = statement.rows.map((r) => {
+    const remark = "remark" in r && typeof r.remark === "string" ? r.remark : "";
+    const createdBy =
+      "createdByName" in r && typeof r.createdByName === "string" ? r.createdByName : "";
+    return {
+      at: r.at,
+      kind: r.kind,
+      label: r.label,
+      subExchange: "subExchangeName" in r ? (r.subExchangeName ?? "") : "",
+      utrOrRemark: r.utr || remark || "",
+      playerId: r.playerId || createdBy || "",
+      credit: r.direction === "credit" ? r.amount : "",
+      debit: r.direction === "debit" ? r.amount : "",
+      balanceAfter: r.balanceAfter,
+      bonusMemo: r.bonusMemo || "",
+    };
+  });
+
+  return generateMultiSheetExcelBuffer([
+    {
+      name: "Summary",
+      data: summaryData,
+      columns: [
+        { header: "Field", key: "Field" },
+        { header: "Value", key: "Value" },
+      ],
+    },
+    {
+      name: "Transactions",
+      data: txnData,
+      columns: [
+        { header: "Date & Time", key: "at" },
+        { header: "Type", key: "kind" },
+        { header: "Description", key: "label" },
+        { header: "Sub Exchange", key: "subExchange" },
+        { header: "UTR / Remark", key: "utrOrRemark" },
+        { header: "Player / Ref", key: "playerId" },
+        { header: "Credit", key: "credit" },
+        { header: "Debit", key: "debit" },
+        { header: "Balance", key: "balanceAfter" },
+        { header: "Bonus Memo", key: "bonusMemo" },
+      ],
+    },
+  ]);
+}
+
+/**
+ * Move players still assigned to a group (parent) exchange onto a sub-exchange.
+ */
+export async function movePlayersToSubExchange(
+  parentExchangeId: string,
+  input: MovePlayersInput,
+  actorId: string,
+  requestId?: string,
+) {
+  if (!Types.ObjectId.isValid(parentExchangeId)) {
+    throw new AppError("validation_error", "Invalid exchange id", 400);
+  }
+  if (!Types.ObjectId.isValid(input.targetSubExchangeId)) {
+    throw new AppError("validation_error", "Invalid targetSubExchangeId", 400);
+  }
+
+  const parentOid = new Types.ObjectId(parentExchangeId);
+  const targetOid = new Types.ObjectId(input.targetSubExchangeId);
+
+  const parent = await ExchangeModel.findById(parentOid).select("_id parentExchange").lean();
+  if (!parent) throw new AppError("not_found", "Exchange not found", 404);
+  if (parent.parentExchange) {
+    throw new AppError("business_rule_error", "Can only move players from a top-level exchange", 400);
+  }
+
+  const target = await ExchangeModel.findById(targetOid).select("_id parentExchange").lean();
+  if (!target) throw new AppError("not_found", "Target sub exchange not found", 404);
+  if (!target.parentExchange || !target.parentExchange.equals(parentOid)) {
+    throw new AppError("business_rule_error", "Target must be a sub exchange of this parent", 400);
+  }
+
+  const filter: Record<string, unknown> = {
+    rootExchange: parentOid,
+    exchange: parentOid,
+  };
+  if (!input.all) {
+    const ids = (input.playerIds ?? [])
+      .filter((id) => Types.ObjectId.isValid(id))
+      .map((id) => new Types.ObjectId(id));
+    if (ids.length === 0) {
+      throw new AppError("validation_error", "Provide playerIds or set all=true", 400);
+    }
+    filter._id = { $in: ids };
+  }
+
+  const players = await PlayerModel.find(filter).select("_id exchange rootExchange playerId").lean();
+  if (players.length === 0) {
+    return { moved: 0, targetSubExchangeId: input.targetSubExchangeId };
+  }
+
+  const playerOids = players.map((p) => p._id);
+
+  await PlayerModel.updateMany(
+    { _id: { $in: playerOids } },
+    { $set: { exchange: targetOid, updatedBy: new Types.ObjectId(actorId) } },
+  );
+
+  await ReferralAccrualModel.updateMany(
+    { referrerPlayerId: { $in: playerOids } },
+    { $set: { exchangeId: targetOid } },
+  );
+
+  await recomputeExchangeCurrentBalance(parentOid.toString());
+  await recomputeExchangeCurrentBalance(targetOid.toString());
+
+  await createAuditLog({
+    actorId,
+    action: "exchange.move_players",
+    entity: "exchange",
+    entityId: parentExchangeId,
+    newValue: {
+      targetSubExchangeId: input.targetSubExchangeId,
+      moved: players.length,
+      playerIds: playerOids.map(String),
+      all: Boolean(input.all),
+    },
+    requestId,
+  });
+
+  await invalidateCacheDomains(["exchange", "player", "deposit", "referral"]);
+
+  return {
+    moved: players.length,
+    targetSubExchangeId: input.targetSubExchangeId,
   };
 }

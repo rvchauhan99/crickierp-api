@@ -3,6 +3,8 @@ import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { createApp } from "../src/app";
 import { bootstrapData } from "../src/shared/db/bootstrap";
+import { signAccessToken } from "../src/shared/utils/jwt";
+import { PERMISSIONS } from "../src/shared/constants/permissions";
 import { UserModel } from "../src/modules/users/user.model";
 import { BankModel } from "../src/modules/bank/bank.model";
 import { ExchangeModel } from "../src/modules/exchange/exchange.model";
@@ -16,6 +18,8 @@ describe("Backdated entry datetime integration", () => {
   let mongo: MongoMemoryServer;
   const app = createApp();
   let accessToken = "";
+  let adminToken = "";
+  let subAdminToken = "";
   let actorId = "";
   let bankId = "";
   let playerId = "";
@@ -90,6 +94,42 @@ describe("Backdated entry datetime integration", () => {
     ]);
     depositAmendReasonId = String(depositAmendReason._id);
     withdrawalAmendReasonId = String(withdrawalAmendReason._id);
+
+    const adminUser = await UserModel.create({
+      fullName: "Backdated Admin",
+      email: "bd.admin@example.com",
+      username: "bd_admin",
+      passwordHash: "not-used",
+      role: "admin",
+      status: "active",
+      permissions: [PERMISSIONS.DEPOSIT_BANKER, PERMISSIONS.WITHDRAWAL_EXCHANGE],
+      timezone: "Asia/Kolkata",
+      createdBy: actor!._id,
+    });
+    adminToken = signAccessToken({
+      userId: String(adminUser._id),
+      role: "admin",
+      permissions: [PERMISSIONS.DEPOSIT_BANKER, PERMISSIONS.WITHDRAWAL_EXCHANGE],
+      timezone: "Asia/Kolkata",
+    });
+
+    const subAdminUser = await UserModel.create({
+      fullName: "Backdated Sub Admin",
+      email: "bd.sub@example.com",
+      username: "bd_sub",
+      passwordHash: "not-used",
+      role: "sub_admin",
+      status: "active",
+      permissions: [PERMISSIONS.DEPOSIT_BANKER, PERMISSIONS.WITHDRAWAL_EXCHANGE],
+      timezone: "Asia/Kolkata",
+      createdBy: actor!._id,
+    });
+    subAdminToken = signAccessToken({
+      userId: String(subAdminUser._id),
+      role: "sub_admin",
+      permissions: [PERMISSIONS.DEPOSIT_BANKER, PERMISSIONS.WITHDRAWAL_EXCHANGE],
+      timezone: "Asia/Kolkata",
+    });
   });
 
   afterAll(async () => {
@@ -626,5 +666,70 @@ describe("Backdated entry datetime integration", () => {
     );
     expect(hasDepositByBusinessTime).toBe(true);
     expect(hasWithdrawalByBusinessTime).toBe(true);
+  });
+
+  it("allows admin to create deposit with explicit backdated entryAt", async () => {
+    const explicitEntryAt = "2026-03-01T08:00:00.000Z";
+    const res = await request(app)
+      .post("/api/v1/deposit")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        bankId,
+        utr: "BD-DEP-ADMIN-001",
+        amount: 420,
+        entryAt: explicitEntryAt,
+      });
+
+    expect(res.status).toBe(201);
+    const saved = await DepositModel.findById(res.body.data._id).lean();
+    expect(saved?.entryAt?.toISOString()).toBe(explicitEntryAt);
+  });
+
+  it("forces sub_admin deposit entryAt to now when a past datetime is forged", async () => {
+    const forgedPast = "2020-01-01T00:00:00.000Z";
+    const before = Date.now();
+    const res = await request(app)
+      .post("/api/v1/deposit")
+      .set("Authorization", `Bearer ${subAdminToken}`)
+      .send({
+        bankId,
+        utr: "BD-DEP-SUB-001",
+        amount: 430,
+        entryAt: forgedPast,
+      });
+    const after = Date.now();
+
+    expect(res.status).toBe(201);
+    const saved = await DepositModel.findById(res.body.data._id).lean();
+    const entryAtMs = saved?.entryAt ? new Date(saved.entryAt).getTime() : 0;
+    expect(entryAtMs).not.toBe(new Date(forgedPast).getTime());
+    expect(entryAtMs).toBeGreaterThanOrEqual(before - 1000);
+    expect(entryAtMs).toBeLessThanOrEqual(after + 1000);
+  });
+
+  it("forces sub_admin withdrawal requestedAt to now when a past datetime is forged", async () => {
+    const forgedPast = "2020-02-02T12:00:00.000Z";
+    const before = Date.now();
+    const res = await request(app)
+      .post("/api/v1/withdrawal")
+      .set("Authorization", `Bearer ${subAdminToken}`)
+      .send({
+        playerId,
+        accountNumber: "SUBADMINACCT01",
+        accountHolderName: "Sub Admin Holder",
+        bankName: "Backdated Bank",
+        ifsc: "BKID0000999",
+        amount: 440,
+        reverseBonus: 0,
+        requestedAt: forgedPast,
+      });
+    const after = Date.now();
+
+    expect(res.status).toBe(201);
+    const saved = await WithdrawalModel.findById(res.body.data._id).lean();
+    const requestedAtMs = saved?.requestedAt ? new Date(saved.requestedAt).getTime() : 0;
+    expect(requestedAtMs).not.toBe(new Date(forgedPast).getTime());
+    expect(requestedAtMs).toBeGreaterThanOrEqual(before - 1000);
+    expect(requestedAtMs).toBeLessThanOrEqual(after + 1000);
   });
 });

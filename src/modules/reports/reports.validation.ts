@@ -77,6 +77,10 @@ export const dashboardSummaryQuerySchema = z.object({
     (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
     z.string().length(24).optional(),
   ),
+  subExchangeId: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.string().length(24).optional(),
+  ),
   status: z.preprocess(
     (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
     z.enum(["all", "pending", "approved", "rejected"]).optional(),

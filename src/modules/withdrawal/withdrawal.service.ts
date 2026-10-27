@@ -36,7 +36,10 @@ import { logger } from "../../shared/logger";
 import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/utr";
 import { resolveMoneyFromRequest, convertSecondaryAmount, roundMoneyToCurrency } from "../../shared/utils/moneyFx";
 import { getCurrencyMinUnit } from "../../shared/constants/currencies";
-import { requirePlatformCurrency } from "../settings/settings.service";
+import {
+  assertLiabilityModuleEnabled,
+  requirePlatformCurrency,
+} from "../settings/settings.service";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -524,6 +527,7 @@ export async function updateWithdrawalByBanker(
   }
 
   const mode = input.payoutSettlementType ?? doc.payoutSettlementType ?? "bank";
+  if (mode === "person") assertLiabilityModuleEnabled();
   const utrRaw = input.utr?.trim() || doc.utr?.trim() || "";
   if (!utrRaw || utrRaw.length < 4) {
     throw new AppError("validation_error", "Payout UTR is required", 400);

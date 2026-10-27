@@ -1,6 +1,7 @@
 import { AppError } from "../../shared/errors/AppError";
 import { isSupportedCurrency } from "../../shared/constants/currencies";
 import { roundExchangeRate } from "../../shared/utils/moneyFx";
+import { assertCurrencyConversionEnabled } from "../settings/settings.service";
 import { ExchangeRateModel } from "../masters/exchange-rate.model";
 
 export type MasterExchangeRateSource = "direct" | "reverse";
@@ -18,6 +19,8 @@ export async function resolveMasterExchangeRate(
   from: string,
   to: string,
 ): Promise<MasterExchangeRateResult> {
+  assertCurrencyConversionEnabled();
+
   const fromCurrency = from.trim().toUpperCase();
   const toCurrency = to.trim().toUpperCase();
 

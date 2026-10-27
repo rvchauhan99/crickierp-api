@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { generateExcelBuffer } from "../../shared/services/excel.service";
+import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared/services/excel.service";
 import type { z } from "zod";
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
@@ -157,6 +157,39 @@ function validateDistinctEndpoints(input: {
 }) {
   if (input.fromAccountType === input.toAccountType && input.fromAccountId === input.toAccountId) {
     throw new AppError("business_rule_error", "From and To account cannot be same", 400);
+  }
+}
+
+/** Apply signed delta to Bank.currentBalance (debit = negative). Rejects if result would go negative. */
+async function applyBankCurrentBalanceDelta(bankId: string, signedDelta: number): Promise<void> {
+  if (!Types.ObjectId.isValid(bankId)) throw new AppError("validation_error", "Invalid bank id", 400);
+  const bank = await BankModel.findById(bankId);
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+  const prev = bank.currentBalance ?? bank.openingBalance ?? 0;
+  const next = prev + signedDelta;
+  if (next < 0) {
+    throw new AppError("business_rule_error", "Insufficient bank balance for this transfer", 400);
+  }
+  bank.currentBalance = next;
+  await bank.save();
+}
+
+async function applyLiabilityBankBalanceLegs(
+  fromAccountType: LiabilityEntryAccountLiteral,
+  fromAccountId: string,
+  toAccountType: LiabilityEntryAccountLiteral,
+  toAccountId: string,
+  amount: number,
+  direction: 1 | -1,
+): Promise<void> {
+  const amt = Math.abs(Number(amount));
+  if (!(amt > 0)) return;
+  // from = debit (-), to = credit (+); reverse on delete
+  if (fromAccountType === "bank") {
+    await applyBankCurrentBalanceDelta(fromAccountId, -amt * direction);
+  }
+  if (toAccountType === "bank") {
+    await applyBankCurrentBalanceDelta(toAccountId, amt * direction);
   }
 }
 
@@ -420,6 +453,16 @@ export async function createLiabilityEntry(
     { minPlatformAmount: getCurrencyMinUnit(await requirePlatformCurrency()) },
   );
 
+  // Preflight bank debit so we fail before insert when source bank lacks funds
+  if (input.fromAccountType === "bank") {
+    const fromBank = await BankModel.findById(input.fromAccountId).lean();
+    if (!fromBank) throw new AppError("not_found", "Bank not found", 404);
+    const prev = fromBank.currentBalance ?? fromBank.openingBalance ?? 0;
+    if (prev < money.amount) {
+      throw new AppError("business_rule_error", "Insufficient bank balance for this transfer", 400);
+    }
+  }
+
   const doc = await LiabilityEntryModel.create({
     entryDate: parseYmdToDate(input.entryDate),
     entryType: input.entryType,
@@ -439,6 +482,20 @@ export async function createLiabilityEntry(
     remark: input.remark?.trim() ?? "",
     createdBy: new Types.ObjectId(actorId),
   });
+
+  try {
+    await applyLiabilityBankBalanceLegs(
+      input.fromAccountType,
+      input.fromAccountId,
+      input.toAccountType,
+      input.toAccountId,
+      money.amount,
+      1,
+    );
+  } catch (err) {
+    await LiabilityEntryModel.deleteOne({ _id: doc._id });
+    throw err;
+  }
 
   const recalcTargets = new Set<string>();
   if (input.fromAccountType === "person") recalcTargets.add(input.fromAccountId);
@@ -483,6 +540,14 @@ export async function deleteLiabilityEntryForReversal(entryId: string, actorId: 
   const recalcTargets = new Set<string>();
   if (doc.fromAccountType === "person") recalcTargets.add(String(doc.fromAccountId));
   if (doc.toAccountType === "person") recalcTargets.add(String(doc.toAccountId));
+  await applyLiabilityBankBalanceLegs(
+    doc.fromAccountType as LiabilityEntryAccountLiteral,
+    String(doc.fromAccountId),
+    doc.toAccountType as LiabilityEntryAccountLiteral,
+    String(doc.toAccountId),
+    Number(doc.amount),
+    -1,
+  );
   await LiabilityEntryModel.deleteOne({ _id: eid });
   await Promise.all([...recalcTargets].map((personId) => recomputePersonRollup(personId)));
   await createAuditLog({
@@ -936,4 +1001,55 @@ export async function getLiabilityReportPersonWise(query?: { viewMode?: string }
       viewMode,
     };
   });
+}
+
+export async function exportLiabilityReportToBuffer(query?: { viewMode?: string }): Promise<Buffer> {
+  const [summary, persons] = await Promise.all([
+    getLiabilityReportSummary(query),
+    getLiabilityReportPersonWise(query),
+  ]);
+
+  const summaryData = [
+    { Field: "View Mode", Value: summary.viewMode },
+    { Field: "Total Receivable", Value: summary.totalReceivable },
+    { Field: "Total Payable", Value: summary.totalPayable },
+    { Field: "Net Position", Value: summary.netPosition },
+    { Field: "Net Position Abs", Value: summary.netPositionAbs },
+    { Field: "Net Side", Value: summary.netPositionSide },
+    { Field: "Total Persons", Value: summary.totalPersons },
+  ];
+
+  const personData = persons.map((p) => ({
+    name: p.name,
+    status: p.isActive ? "Active" : "Inactive",
+    totalDebits: p.totalDebits,
+    totalCredits: p.totalCredits,
+    balanceAbs: p.balanceAbs,
+    sideLabel: p.sideLabel,
+    viewMode: p.viewMode,
+  }));
+
+  return generateMultiSheetExcelBuffer([
+    {
+      name: "Summary",
+      data: summaryData,
+      columns: [
+        { header: "Field", key: "Field" },
+        { header: "Value", key: "Value" },
+      ],
+    },
+    {
+      name: "Person Wise",
+      data: personData,
+      columns: [
+        { header: "Name", key: "name" },
+        { header: "Status", key: "status" },
+        { header: "Inward (DR)", key: "totalDebits" },
+        { header: "Outward (CR)", key: "totalCredits" },
+        { header: "Balance", key: "balanceAbs" },
+        { header: "Side", key: "sideLabel" },
+        { header: "View Mode", key: "viewMode" },
+      ],
+    },
+  ]);
 }

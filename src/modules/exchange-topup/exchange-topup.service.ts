@@ -26,8 +26,15 @@ export async function createExchangeTopup(
     throw new AppError("validation_error", "Invalid exchange id", 400);
   }
   const exchangeObjectId = new Types.ObjectId(input.exchangeId);
-  const exchange = await ExchangeModel.findById(exchangeObjectId).select("_id name provider");
+  const exchange = await ExchangeModel.findById(exchangeObjectId).select("_id name provider parentExchange");
   if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
+
+  if (!exchange.parentExchange) {
+    const subCount = await ExchangeModel.countDocuments({ parentExchange: exchangeObjectId });
+    if (subCount > 0) {
+      throw new AppError("business_rule_error", "Select a sub exchange for top-up", 400);
+    }
+  }
 
   const money = await resolveMoneyFromRequest(
     {

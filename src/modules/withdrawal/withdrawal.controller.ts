@@ -37,12 +37,17 @@ import {
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
+import { omitCustomBusinessDateTime } from "../../shared/utils/businessEntryDateTime";
 import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
 import { subscribeWithdrawalImportEvents } from "./withdrawal-import-events";
 import { subscribeWithdrawalBulkApproveEvents } from "./withdrawal-bulk-approve-events";
 
 export async function createWithdrawalController(req: Request, res: Response) {
-  const body = createWithdrawalBodySchema.parse(req.body);
+  const body = omitCustomBusinessDateTime(
+    createWithdrawalBodySchema.parse(req.body),
+    "requestedAt",
+    req.user!.role,
+  );
   const data = await createWithdrawal(body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
 }
@@ -69,7 +74,11 @@ export async function updateWithdrawalBankerController(req: Request, res: Respon
 }
 
 export async function amendWithdrawalController(req: Request, res: Response) {
-  const body = amendWithdrawalBodySchema.parse(req.body);
+  const body = omitCustomBusinessDateTime(
+    amendWithdrawalBodySchema.parse(req.body),
+    "requestedAt",
+    req.user!.role,
+  );
   const id = String(req.params.id);
   const data = await amendWithdrawal(id, body, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });

@@ -22,15 +22,27 @@ import {
   updateExpenseBodySchema,
 } from "./expense.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
+import {
+  omitCustomBusinessDateTime,
+  resolveBusinessYmdForActor,
+} from "../../shared/utils/businessEntryDateTime";
 
 export async function createExpenseController(req: Request, res: Response) {
-  const body = createExpenseBodySchema.parse(req.body);
+  const parsed = createExpenseBodySchema.parse(req.body);
+  const body = {
+    ...parsed,
+    expenseDate: resolveBusinessYmdForActor(parsed.expenseDate, req.user!.role),
+  };
   const data = await createExpense(body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
 }
 
 export async function updateExpenseController(req: Request, res: Response) {
-  const body = updateExpenseBodySchema.parse(req.body);
+  const body = omitCustomBusinessDateTime(
+    updateExpenseBodySchema.parse(req.body),
+    "expenseDate",
+    req.user!.role,
+  );
   const id = String(req.params.id);
   const data = await updateExpense(id, body, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });

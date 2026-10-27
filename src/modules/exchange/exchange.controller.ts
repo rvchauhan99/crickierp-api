@@ -2,13 +2,20 @@ import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
   createExchange,
+  exportExchangeStatementToBuffer,
   exportExchangesToBuffer,
   getExchangeStatement,
   getExchangeById,
   listExchanges,
+  movePlayersToSubExchange,
   updateExchange,
 } from "./exchange.service";
-import { exchangeStatementQuerySchema, listExchangeQuerySchema } from "./exchange.validation";
+import {
+  exchangeIdParamSchema,
+  exchangeStatementQuerySchema,
+  listExchangeQuerySchema,
+  movePlayersBodySchema,
+} from "./exchange.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 
 export async function createExchangeController(req: Request, res: Response) {
@@ -51,5 +58,26 @@ export async function exchangeStatementController(req: Request, res: Response) {
   const query = exchangeStatementQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
   const data = await getExchangeStatement(String(req.params.id), query, { timeZone });
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function exportExchangeStatementController(req: Request, res: Response) {
+  const { id } = exchangeIdParamSchema.parse(req.params);
+  const query = exchangeStatementQuerySchema.parse(req.query);
+  const timeZone = resolveRequestTimeZone(req);
+  const buffer = await exportExchangeStatementToBuffer(id, query, { timeZone });
+  res.setHeader("Content-Disposition", `attachment; filename="exchange-statement-${id}.xlsx"`);
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function movePlayersController(req: Request, res: Response) {
+  const { id } = exchangeIdParamSchema.parse(req.params);
+  const body = movePlayersBodySchema.parse(req.body);
+  const actorId = req.user!.userId;
+  const data = await movePlayersToSubExchange(id, body, actorId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
 }

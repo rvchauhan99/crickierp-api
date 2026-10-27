@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { env } from "../../config/env";
 import { AppError } from "../../shared/errors/AppError";
 import type { SupportedCurrency } from "../../shared/constants/currencies";
 import { SUPPORTED_CURRENCIES } from "../../shared/constants/currencies";
@@ -13,11 +14,14 @@ import { ExchangeTopupModel } from "../exchange-topup/exchange-topup.model";
 import { PLATFORM_SETTINGS_KEY, PlatformSettingsModel } from "./settings.model";
 
 export type PlatformSettingsView = {
-  platformCurrency: SupportedCurrency | null;
+  platformCurrency: SupportedCurrency;
   currencyLockedAt: string | null;
   currencyLockedBy: string | null;
   isLocked: boolean;
+  currencyConversionEnabled: boolean;
   supportedCurrencies: readonly SupportedCurrency[];
+  /** When false, liability module and person settlement are off for this deploy. */
+  liabilityModuleEnabled: boolean;
 };
 
 async function ensureSingleton() {
@@ -28,28 +32,88 @@ async function ensureSingleton() {
   return doc;
 }
 
-export async function getPlatformSettings(): Promise<PlatformSettingsView> {
+/**
+ * Seed platform currency from env when DB has none.
+ * Does not override an already-locked DB value.
+ */
+async function ensurePlatformCurrencySeeded() {
   const doc = await ensureSingleton();
-  const currency = doc.platformCurrency ?? null;
+  if (doc.platformCurrency) return doc;
+
+  doc.platformCurrency = env.platformCurrency;
+  doc.currencyLockedAt = new Date();
+  // Env seed has no user — leave currencyLockedBy unset
+  await doc.save();
+  await backfillExistingMoneyFx(env.platformCurrency);
+  return doc;
+}
+
+function toView(doc: Awaited<ReturnType<typeof ensureSingleton>>): PlatformSettingsView {
+  const currency = (doc.platformCurrency ?? env.platformCurrency) as SupportedCurrency;
+  const conversionEnabled = env.currencyConversionEnabled;
   return {
     platformCurrency: currency,
     currencyLockedAt: doc.currencyLockedAt ? doc.currencyLockedAt.toISOString() : null,
     currencyLockedBy: doc.currencyLockedBy ? String(doc.currencyLockedBy) : null,
-    isLocked: Boolean(currency),
-    supportedCurrencies: SUPPORTED_CURRENCIES,
+    isLocked: Boolean(doc.platformCurrency),
+    currencyConversionEnabled: conversionEnabled,
+    supportedCurrencies: conversionEnabled ? SUPPORTED_CURRENCIES : [currency],
+    liabilityModuleEnabled: env.liabilityModuleEnabled,
   };
 }
 
+export async function getPlatformSettings(): Promise<PlatformSettingsView> {
+  const doc = await ensurePlatformCurrencySeeded();
+  return toView(doc);
+}
+
+/** True when multi-currency FX is allowed for this deploy. */
+export function isCurrencyConversionEnabled(): boolean {
+  return env.currencyConversionEnabled;
+}
+
 /**
- * Returns configured platform currency or throws if not set.
+ * Reject FX master/lookup when conversion is disabled for this deploy.
+ */
+export function assertCurrencyConversionEnabled(): void {
+  if (!env.currencyConversionEnabled) {
+    throw new AppError(
+      "currency_conversion_disabled",
+      "Currency conversion is disabled for this deployment. All amounts use the platform currency only.",
+      403,
+    );
+  }
+}
+
+/** True when liability persons / person settlement are allowed for this deploy. */
+export function isLiabilityModuleEnabled(): boolean {
+  return env.liabilityModuleEnabled;
+}
+
+/**
+ * Reject liability module routes and person settlement when disabled for this deploy.
+ */
+export function assertLiabilityModuleEnabled(): void {
+  if (!env.liabilityModuleEnabled) {
+    throw new AppError(
+      "liability_module_disabled",
+      "Liability module is disabled for this deployment. Settlements use bank accounts only.",
+      403,
+    );
+  }
+}
+
+/**
+ * Returns configured platform currency (auto-seeds from PLATFORM_CURRENCY env when unset).
  * Call from every money create/update path.
  */
 export async function requirePlatformCurrency(): Promise<SupportedCurrency> {
-  const doc = await ensureSingleton();
+  const doc = await ensurePlatformCurrencySeeded();
   if (!doc.platformCurrency) {
+    // Should be unreachable after seed; keep defensive guard
     throw new AppError(
       "platform_currency_required",
-      "Platform currency is not configured. Set it once under Profile / Settings before creating money transactions.",
+      "Platform currency is not configured.",
       400,
     );
   }
@@ -57,17 +121,26 @@ export async function requirePlatformCurrency(): Promise<SupportedCurrency> {
 }
 
 export async function getPlatformCurrencyOrNull(): Promise<SupportedCurrency | null> {
-  const doc = await ensureSingleton();
+  const doc = await ensurePlatformCurrencySeeded();
   return doc.platformCurrency ?? null;
 }
 
 /**
  * Lock platform currency forever and backfill FX reference fields on existing money rows.
+ * Disabled when CURRENCY_CONVERSION_ENABLED=false (currency comes from env).
  */
 export async function setPlatformCurrency(
   currency: SupportedCurrency,
   lockedByUserId: string,
 ): Promise<PlatformSettingsView> {
+  if (!env.currencyConversionEnabled) {
+    throw new AppError(
+      "currency_conversion_disabled",
+      "Platform currency is fixed by PLATFORM_CURRENCY env and cannot be changed while currency conversion is disabled.",
+      403,
+    );
+  }
+
   const doc = await ensureSingleton();
 
   if (doc.platformCurrency) {

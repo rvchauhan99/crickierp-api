@@ -4,12 +4,22 @@ import type { Schema, SchemaType } from "mongoose";
 import { AppError } from "../../shared/errors/AppError";
 import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 import {
+  assertCurrencyConversionEnabled,
+  isCurrencyConversionEnabled,
+} from "../settings/settings.service";
+import {
   getMasterModel,
   getRegistryEntry,
   MASTERS_REGISTRY,
   type MasterModelKey,
   type MasterRegistryEntry,
 } from "./masters.registry";
+
+function assertExchangeRateMasterAllowed(modelKey: string): void {
+  if (modelKey === "exchangeRate") {
+    assertCurrencyConversionEnabled();
+  }
+}
 
 export type MasterFieldType = "STRING" | "TEXT" | "BOOLEAN" | "INTEGER" | "DECIMAL" | "DATE";
 
@@ -79,7 +89,10 @@ export function buildFieldsFromModel(model: Model<unknown>): MasterField[] {
 }
 
 export function listRegistry(): MasterRegistryEntry[] {
-  return [...MASTERS_REGISTRY].sort((a, b) => a.name.localeCompare(b.name));
+  const entries = isCurrencyConversionEnabled()
+    ? MASTERS_REGISTRY
+    : MASTERS_REGISTRY.filter((e) => e.modelKey !== "exchangeRate");
+  return [...entries].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export type ListMastersParams = {
@@ -122,6 +135,7 @@ function allowedSortFields(model: Model<unknown>): string[] {
 }
 
 export async function listMasters(modelKey: string, params: ListMastersParams) {
+  assertExchangeRateMasterAllowed(modelKey);
   const entry = getRegistryEntry(modelKey);
   const Model = getMasterModel(modelKey);
   if (!entry || !Model) {
@@ -172,6 +186,7 @@ function leanToPlain(doc: Record<string, unknown>): Record<string, unknown> {
 }
 
 export async function getMasterById(modelKey: string, id: string) {
+  assertExchangeRateMasterAllowed(modelKey);
   const Model = getMasterModel(modelKey);
   if (!Model) {
     throw new AppError("not_found", "Unknown master type", 404);
@@ -201,6 +216,7 @@ function pickWritablePayload(
 }
 
 export async function createMaster(modelKey: string, body: Record<string, unknown>, actorId: string) {
+  assertExchangeRateMasterAllowed(modelKey);
   const Model = getMasterModel(modelKey);
   if (!Model) {
     throw new AppError("not_found", "Unknown master type", 404);
@@ -220,6 +236,7 @@ export async function createMaster(modelKey: string, body: Record<string, unknow
 }
 
 export async function updateMaster(modelKey: string, id: string, body: Record<string, unknown>, actorId: string) {
+  assertExchangeRateMasterAllowed(modelKey);
   const Model = getMasterModel(modelKey);
   if (!Model) {
     throw new AppError("not_found", "Unknown master type", 404);
@@ -245,6 +262,7 @@ export async function updateMaster(modelKey: string, id: string, body: Record<st
 }
 
 export async function softDeleteMaster(modelKey: string, id: string, actorId: string) {
+  assertExchangeRateMasterAllowed(modelKey);
   const Model = getMasterModel(modelKey);
   if (!Model) {
     throw new AppError("not_found", "Unknown master type", 404);

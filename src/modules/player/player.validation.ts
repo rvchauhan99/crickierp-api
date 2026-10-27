@@ -33,6 +33,7 @@ export const listPlayerQuerySchema = z.object({
   exchangeName: z.string().optional(),
   exchangeName_op: z.string().optional(),
   exchangeId: z.string().length(24).optional(),
+  subExchangeId: z.string().length(24).optional(),
   createdBy: z.string().optional(),
   createdAt_from: z.string().optional(),
   createdAt_to: z.string().optional(),

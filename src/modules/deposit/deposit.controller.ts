@@ -39,12 +39,17 @@ import {
   updateDepositBodySchema,
 } from "./deposit.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
+import { omitCustomBusinessDateTime } from "../../shared/utils/businessEntryDateTime";
 import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
 import { subscribeDepositImportEvents } from "./deposit-import-events";
 import { subscribeDepositBulkExchangeApproveEvents } from "./deposit-bulk-exchange-approve-events";
 
 export async function createDepositController(req: Request, res: Response) {
-  const body = createDepositBodySchema.parse(req.body);
+  const body = omitCustomBusinessDateTime(
+    createDepositBodySchema.parse(req.body),
+    "entryAt",
+    req.user!.role,
+  );
   const data = await createDeposit(body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
 }
@@ -76,7 +81,11 @@ export async function exportDepositController(req: Request, res: Response) {
 }
 
 export async function amendDepositController(req: Request, res: Response) {
-  const body = amendDepositBodySchema.parse(req.body);
+  const body = omitCustomBusinessDateTime(
+    amendDepositBodySchema.parse(req.body),
+    "entryAt",
+    req.user!.role,
+  );
   const id = String(req.params.id);
   const data = await amendVerifiedDeposit(id, body, req.user!.userId, req.requestId);
   res.status(StatusCodes.OK).json({ success: true, data });
