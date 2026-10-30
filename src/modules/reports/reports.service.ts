@@ -1124,22 +1124,44 @@ export async function getDashboardSummary(
 
   /* ── Aggregate expense KPIs ────────────────────────────────────── */
   let expenseTotal = 0, expenseCount = 0, expensePendingCount = 0,
-    expenseApprovedAmount = 0;
+    expensePendingAmount = 0, expenseApprovedAmount = 0,
+    expenseCancelledCount = 0, expenseCancelledAmount = 0;
 
   for (const row of expenseAgg) {
     if (row._id === "rejected") {
       continue;
     }
+    // Cancelled expenses were reversed, so they never debited a bank account:
+    // keep them out of every expense total (reported separately instead).
+    if (row._id === "cancelled") {
+      expenseCancelledCount += row.count ?? 0;
+      expenseCancelledAmount += row.totalAmount ?? 0;
+      continue;
+    }
     
     expenseTotal += row.totalAmount ?? 0;
     expenseCount += row.count ?? 0;
-    if (row._id === "pending_audit") expensePendingCount = row.count ?? 0;
+    if (row._id === "pending_audit") {
+      expensePendingCount = row.count ?? 0;
+      expensePendingAmount = row.totalAmount ?? 0;
+    }
     if (row._id === "approved") expenseApprovedAmount += row.totalAmount ?? 0;
   }
 
   /* ── P&L calculations ──────────────────────────────────────────── */
+  /**
+   * The deposit / withdrawal / expense KPI cards show the whole non-rejected
+   * amount as their headline and the approved-only amount as a smaller footer
+   * figure. The P&L cards mirror that exact structure so the dashboard reads
+   * consistently:
+   *   `grossAll` / `netAll`  → headline (same basis as the three flow cards)
+   *   `gross` / `net`        → approved-only (settled cash) footer figure
+   * which keeps `Total Deposits − Total Withdrawals === pnl.grossAll`.
+   */
   const grossPL = depositVerifiedAmount - withdrawalApprovedAmount;
   const netPL = grossPL - expenseApprovedAmount;
+  const grossPLAll = depositTotal - withdrawalTotal;
+  const netPLAll = grossPLAll - expenseTotal;
 
   /* ── Exchange stats ────────────────────────────────────────────── */
   const [exchangeTotal, exchangeActive, exchangeSubTotal, playersPendingMove] = exchangeStats;
@@ -1554,11 +1576,25 @@ export async function getDashboardSummary(
       totalAmount: expenseTotal,
       totalCount: expenseCount,
       pendingCount: expensePendingCount,
+      pendingAmount: expensePendingAmount,
       approvedAmount: expenseApprovedAmount,
+      cancelledCount: expenseCancelledCount,
+      cancelledAmount: expenseCancelledAmount,
     },
     pnl: {
+      /** Approved-only P&L (settled cash) — shown as the small footer figure. */
       gross: grossPL,
       net: netPL,
+      /** All non-rejected P&L — headline, same basis as the three flow cards. */
+      grossAll: grossPLAll,
+      netAll: netPLAll,
+      /** Headline − approved; the still-unapproved portion of each P&L figure. */
+      pendingGrossAmount: grossPLAll - grossPL,
+      pendingNetAmount: netPLAll - netPL,
+      /** Raw pending inputs, mirrored from the deposit / withdrawal / expense blocks. */
+      pendingDepositAmount: depositPendingAmount,
+      pendingWithdrawalAmount: withdrawalPendingAmount,
+      pendingExpenseAmount: expensePendingAmount,
     },
     exchanges: {
       total: exchangeTotal,
@@ -1712,7 +1748,11 @@ export async function exportDashboardSummaryToBuffer(
     { KPI: "Approved Withdrawals", Value: data.withdrawal.approvedAmount },
     { KPI: "Reverse Bonus", Value: data.withdrawal.reverseBonusTotal },
     { KPI: "Total Expenses", Value: data.expense.totalAmount },
-    { KPI: "Net P&L", Value: data.pnl.net },
+    { KPI: "Approved Expenses", Value: data.expense.approvedAmount },
+    { KPI: "Gross P&L", Value: data.pnl.grossAll },
+    { KPI: "Gross P&L (Approved only)", Value: data.pnl.gross },
+    { KPI: "Net P&L", Value: data.pnl.netAll },
+    { KPI: "Net P&L (Approved only)", Value: data.pnl.net },
     { KPI: "New Players (Selected Period)", Value: data.periodMetrics.newPlayers },
     { KPI: "First-Time Deposit Amount (Selected Period)", Value: data.periodMetrics.firstTimeDepositAmount },
   ];
