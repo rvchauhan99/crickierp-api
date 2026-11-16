@@ -1,8 +1,11 @@
 import { Schema, model, Types } from "mongoose";
 
+export type ExchangeTopupEntryType = "credit" | "debit";
+
 export interface ExchangeTopupDocument {
   _id: Types.ObjectId;
   exchangeId: Types.ObjectId;
+  entryType: ExchangeTopupEntryType;
   amount: number;
   operatedCurrency?: string;
   operatedAmount?: number;
@@ -16,6 +19,13 @@ export interface ExchangeTopupDocument {
 const exchangeTopupSchema = new Schema<ExchangeTopupDocument>(
   {
     exchangeId: { type: Schema.Types.ObjectId, ref: "Exchange", required: true, index: true },
+    entryType: {
+      type: String,
+      enum: ["credit", "debit"],
+      required: true,
+      default: "credit",
+      index: true,
+    },
     amount: { type: Number, min: 0.01, required: true },
     operatedCurrency: { type: String, trim: true },
     operatedAmount: { type: Number, min: 0 },

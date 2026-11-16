@@ -139,3 +139,10 @@ export const bulkBankerApproveBodySchema = z.object({
 });
 
 export const createBulkBankerApproveJobBodySchema = bulkBankerApproveBodySchema;
+
+export const exportWithdrawalQuerySchema = listWithdrawalQuerySchema.omit({
+  page: true,
+  pageSize: true,
+  limit: true,
+  cursor: true,
+});

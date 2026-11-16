@@ -35,6 +35,7 @@ import {
   bulkExchangeApproveBodySchema,
   createBulkExchangeApproveJobBodySchema,
   exchangeActionBodySchema,
+  exportDepositQuerySchema,
   listDepositQuerySchema,
   updateDepositBodySchema,
 } from "./deposit.validation";
@@ -69,9 +70,9 @@ export async function listDepositController(req: Request, res: Response) {
 }
 
 export async function exportDepositController(req: Request, res: Response) {
-  const query = listDepositQuerySchema.parse(req.query);
+  const query = exportDepositQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportDepositsToBuffer(query, { timeZone });
+  const buffer = await exportDepositsToBuffer({ ...query, page: 1, pageSize: 20 }, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="deposits-export.xlsx"');
   res.setHeader(
     "Content-Type",

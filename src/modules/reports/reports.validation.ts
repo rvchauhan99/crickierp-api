@@ -97,6 +97,11 @@ export const dashboardSummaryQuerySchema = z.object({
     (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
     z.string().length(24).optional(),
   ),
+  /** Which banks appear in banksBreakdown. Default active when omitted. */
+  bankStatus: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.enum(["active", "deactive", "all"]).optional(),
+  ),
   amountFrom: z.preprocess(
     (v) => (v === "" || v === undefined || v === null ? undefined : Number(v)),
     z.number().nonnegative().optional(),
@@ -106,4 +111,14 @@ export const dashboardSummaryQuerySchema = z.object({
     z.number().nonnegative().optional(),
   ),
   search: optionalTrimmed,
+});
+
+export const exportTransactionHistoryQuerySchema = transactionHistoryQuerySchema.omit({
+  page: true,
+  pageSize: true,
+});
+
+export const exportExpenseAnalysisRecordsQuerySchema = expenseAnalysisRecordsQuerySchema.omit({
+  page: true,
+  pageSize: true,
 });

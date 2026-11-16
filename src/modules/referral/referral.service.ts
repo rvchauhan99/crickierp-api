@@ -115,8 +115,8 @@ export async function listReferralAccruals(query: {
   }
   const [rows, total] = await Promise.all([
     ReferralAccrualModel.find(queryFilter)
-      .populate("referrerPlayerId", "playerId phone exchange")
-      .populate("referredPlayerId", "playerId phone exchange")
+      .populate("referrerPlayerId", "playerId exchange")
+      .populate("referredPlayerId", "playerId exchange")
       .populate("exchangeId", "name provider")
       .populate("sourceDepositId", "utr amount status entryAt")
       .populate("settlementDepositId", "utr amount entryAt")

@@ -10,7 +10,7 @@ import {
   listPlayers,
   updatePlayer,
 } from "./player.service";
-import { listPlayerQuerySchema } from "./player.validation";
+import { exportPlayerQuerySchema, listPlayerQuerySchema } from "./player.validation";
 import { subscribePlayerImportEvents } from "./player-import-events";
 import {
   createPlayerImportJob,
@@ -64,9 +64,9 @@ export async function listPlayerController(req: Request, res: Response) {
 }
 
 export async function exportPlayerController(req: Request, res: Response) {
-  const query = listPlayerQuerySchema.parse(req.query);
+  const query = exportPlayerQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportPlayersToBuffer(query, { timeZone });
+  const buffer = await exportPlayersToBuffer({ ...query, page: 1 }, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="players-export.xlsx"');
   res.setHeader(
     "Content-Type",

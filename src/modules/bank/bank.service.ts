@@ -4,6 +4,7 @@ import { generateExcelBuffer, generateMultiSheetExcelBuffer } from "../../shared
 import { AppError } from "../../shared/errors/AppError";
 import { createAuditLog } from "../audit/audit.service";
 import { DepositModel } from "../deposit/deposit.model";
+import { depositBankCashMongoFilter } from "../deposit/deposit-bank-cash";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExpenseModel } from "../expense/expense.model";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
@@ -206,8 +207,14 @@ function buildBankListFilter(q: ListBankQuery, timeZone: string): Record<string,
   }
 
   const status = trimUndef(q.status);
-  if (status === "active" || status === "deactive") {
-    conditions.push({ status });
+  // Default: hide deactive banks. Explicit `all` shows every status.
+  if (status === "all") {
+    // no status filter
+  } else if (status === "deactive") {
+    conditions.push({ status: "deactive" });
+  } else {
+    // omitted or `active`
+    conditions.push({ status: "active" });
   }
 
   const createdBy = trimUndef(q.createdBy);
@@ -258,6 +265,47 @@ function formatCreatedByForExport(createdBy: unknown): string {
     return u._id?.toString() ?? "";
   }
   return String(createdBy);
+}
+
+/** Load bank and ensure it is active for new money movements. */
+export async function assertBankActive(bankId: string): Promise<void> {
+  if (!Types.ObjectId.isValid(bankId)) {
+    throw new AppError("validation_error", "Invalid bank id", 400);
+  }
+  const bank = await BankModel.findById(bankId).select("status").lean();
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+  if (bank.status !== "active") {
+    throw new AppError("business_rule_error", "Bank is not active", 400);
+  }
+}
+
+export async function updateBankStatus(
+  bankId: string,
+  status: "active" | "deactive",
+  actorId: string,
+  requestId?: string,
+) {
+  if (!Types.ObjectId.isValid(bankId)) {
+    throw new AppError("validation_error", "Invalid bank id", 400);
+  }
+  const bank = await BankModel.findById(bankId);
+  if (!bank) throw new AppError("not_found", "Bank not found", 404);
+  const previous = bank.status;
+  if (previous === status) {
+    return bank;
+  }
+  bank.status = status;
+  await bank.save();
+  await createAuditLog({
+    actorId,
+    action: "bank.status.update",
+    entity: "bank",
+    entityId: bankId,
+    oldValue: { status: previous },
+    newValue: { status },
+    requestId,
+  });
+  return bank;
 }
 
 export async function createBank(input: {
@@ -384,7 +432,8 @@ function settlementEventTime(s: { effectiveAt: Date }): Date {
   return new Date(s.effectiveAt);
 }
 
-function depositEventTime(d: { settledAt?: Date; createdAt?: Date }): Date {
+function depositEventTime(d: { entryAt?: Date; settledAt?: Date; createdAt?: Date }): Date {
+  if (d.entryAt) return new Date(d.entryAt);
   if (d.settledAt) return new Date(d.settledAt);
   if (d.createdAt) return new Date(d.createdAt);
   return new Date(0);
@@ -429,7 +478,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
   const entryType = query.entryType || "all";
 
   const [allDeposits, allWithdrawals, allExpenses, allLiabilityEntries, allSettlements] = await Promise.all([
-    DepositModel.find({ bankId: bid, status: "verified" })
+    DepositModel.find(depositBankCashMongoFilter({ bankId: bid }))
       .populate("player", "name")
       .populate("createdBy", "fullName")
       .lean(),
@@ -598,7 +647,9 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
         kind: "deposit" as const,
         refId: d._id.toString(),
         at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
-        label: `Deposit`,
+        label: d.status && d.status !== "verified" && d.status !== "finalized"
+          ? `Deposit (${d.status})`
+          : "Deposit",
         utr: d.utr,
         playerName: playerObj?.name ?? "",
         createdByName: createdByObj?.fullName ?? "",
@@ -606,6 +657,7 @@ export async function getBankLedger(bankId: string, query: LedgerQuery, options?
         direction: "credit" as const,
         balanceAfter: running,
         bonusMemo: bonus > 0 ? bonus : undefined,
+        status: d.status,
       };
     }
     
@@ -854,6 +906,9 @@ export async function createBankSettlement(
   const bid = new Types.ObjectId(bankId);
   const bank = await BankModel.findById(bid).lean();
   if (!bank) throw new AppError("not_found", "Bank not found", 404);
+  if (bank.status !== "active") {
+    throw new AppError("business_rule_error", "Bank is not active", 400);
+  }
 
   const master = Number(input.masterReportedBalance);
   if (!Number.isFinite(master) || master < 0) {

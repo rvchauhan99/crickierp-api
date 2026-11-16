@@ -12,6 +12,7 @@ import {
   listBankSettlements,
   listBankTransfers,
   listBanks,
+  updateBankStatus,
 } from "./bank.service";
 import {
   bankIdParamSchema,
@@ -19,8 +20,10 @@ import {
   bankSummaryQuerySchema,
   createBankSettlementBodySchema,
   createBankTransferBodySchema,
+  exportBankQuerySchema,
   listBankQuerySchema,
   listBankTransferQuerySchema,
+  updateBankStatusBodySchema,
 } from "./bank.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
 import { resolveBusinessYmdForActor } from "../../shared/utils/businessEntryDateTime";
@@ -28,6 +31,13 @@ import { resolveBusinessYmdForActor } from "../../shared/utils/businessEntryDate
 export async function createBankController(req: Request, res: Response) {
   const data = await createBank(req.body, req.user!.userId, req.requestId);
   res.status(StatusCodes.CREATED).json({ success: true, data });
+}
+
+export async function updateBankStatusController(req: Request, res: Response) {
+  const { id } = bankIdParamSchema.parse(req.params);
+  const body = updateBankStatusBodySchema.parse(req.body);
+  const data = await updateBankStatus(id, body.status, req.user!.userId, req.requestId);
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
 
 export async function listBankController(req: Request, res: Response) {
@@ -45,9 +55,9 @@ export async function bankSummaryController(req: Request, res: Response) {
 }
 
 export async function exportBankController(req: Request, res: Response) {
-  const query = listBankQuerySchema.parse(req.query);
+  const query = exportBankQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportBanksToBuffer(query, { timeZone });
+  const buffer = await exportBanksToBuffer({ ...query, page: 1, pageSize: 20 }, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="banks-export.xlsx"');
   res.setHeader(
     "Content-Type",

@@ -2,13 +2,14 @@ import { Types } from "mongoose";
 import { BankModel } from "./bank.model";
 import { BankBalanceSettlementModel } from "./bank-balance-settlement.model";
 import { DepositModel } from "../deposit/deposit.model";
+import { depositBankCashMongoFilter } from "../deposit/deposit-bank-cash";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExpenseModel } from "../expense/expense.model";
 import { LiabilityEntryModel } from "../liability/liability-entry.model";
 
 /**
  * Statement-equivalent closing per bank:
- * openingBalance + verified deposits - approved withdrawals - approved expenses +/- liabilities
+ * openingBalance + non-rejected bank-impact deposits - approved withdrawals - approved expenses +/- liabilities
  * + sum of persisted master settlement signed amounts.
  */
 export async function computeClosingBalanceActualByBankIds(
@@ -19,7 +20,7 @@ export async function computeClosingBalanceActualByBankIds(
     BankModel.find({ _id: { $in: bankIds } })
       .select({ _id: 1, openingBalance: 1 })
       .lean(),
-    DepositModel.find({ bankId: { $in: bankIds }, status: "verified" })
+    DepositModel.find(depositBankCashMongoFilter({ bankId: { $in: bankIds } }))
       .select({ bankId: 1, amount: 1 })
       .lean(),
     WithdrawalModel.find({ payoutBankId: { $in: bankIds }, status: "approved" })

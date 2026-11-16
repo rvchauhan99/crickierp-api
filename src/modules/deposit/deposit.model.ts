@@ -1,6 +1,12 @@
 import { Schema, model, Types } from "mongoose";
 
-/** pending = awaiting exchange; not_settled = approved but unclaimed; verified = approved and settled on bank; rejected = exchange rejected; finalized = legacy */
+/**
+ * pending = awaiting exchange (bank cash already posted when bankImpact);
+ * not_settled = exchange marked unclaimed (cash stays until reject);
+ * verified = exchange approved (details only — cash already in bank);
+ * rejected = exchange rejected (bank cash reversed when bankImpact);
+ * finalized = legacy (treated like verified for bank cash).
+ */
 export type DepositStatus = "pending" | "not_settled" | "verified" | "rejected" | "finalized";
 
 /** Snapshot of deposit fields stored on each amendment entry (plain ids for JSON stability). */

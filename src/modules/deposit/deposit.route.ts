@@ -36,6 +36,7 @@ import {
   bulkExchangeApproveBodySchema,
   createBulkExchangeApproveJobBodySchema,
   exchangeActionBodySchema,
+  exportDepositQuerySchema,
   listDepositQuerySchema,
   updateDepositBodySchema,
 } from "./deposit.validation";
@@ -126,7 +127,7 @@ depositRouter.get(
 depositRouter.get(
   "/export",
   depositListPermissionMiddleware,
-  validate({ query: listDepositQuerySchema }),
+  validate({ query: exportDepositQuerySchema }),
   exportDepositController,
 );
 

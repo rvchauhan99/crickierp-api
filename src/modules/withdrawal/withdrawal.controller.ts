@@ -31,6 +31,7 @@ import {
   createBulkBankerApproveJobBodySchema,
   createWithdrawalBodySchema,
   createWithdrawalImportJobBodySchema,
+  exportWithdrawalQuerySchema,
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
@@ -91,9 +92,9 @@ export async function deleteWithdrawalController(req: Request, res: Response) {
 }
 
 export async function exportWithdrawalController(req: Request, res: Response) {
-  const query = listWithdrawalQuerySchema.parse(req.query);
+  const query = exportWithdrawalQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportWithdrawalsToBuffer(query, { timeZone });
+  const buffer = await exportWithdrawalsToBuffer({ ...query, page: 1, pageSize: 20 }, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="withdrawals-export.xlsx"');
   res.setHeader(
     "Content-Type",

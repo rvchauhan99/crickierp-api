@@ -145,3 +145,10 @@ export const commitDepositImportBodySchema = z.object({
 export const createDepositImportJobBodySchema = z.object({
   rows: z.array(depositImportRowSchema).min(1).max(10000),
 });
+
+export const exportDepositQuerySchema = listDepositQuerySchema.omit({
+  page: true,
+  pageSize: true,
+  limit: true,
+  cursor: true,
+});

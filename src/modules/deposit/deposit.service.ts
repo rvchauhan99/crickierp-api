@@ -31,6 +31,7 @@ import {
 } from "../../shared/utils/timezone";
 import type { DepositAmendmentSnapshot, DepositDocument } from "./deposit.model";
 import { DepositModel, DepositStatus } from "./deposit.model";
+import { applyBankCashDelta, DEPOSIT_BANK_CASH_STATUSES } from "./deposit-bank-cash";
 import { amendDepositBodySchema, createDepositBodySchema, listDepositQuerySchema } from "./deposit.validation";
 import { emitApprovalQueueEvent } from "../approval/approval-queue-events";
 import {
@@ -444,12 +445,20 @@ export async function createDeposit(input: CreateDepositInput, actorId: string, 
     if (!bank) throw new AppError("not_found", "Bank not found", 404);
     if (bank.status !== "active") throw new AppError("business_rule_error", "Bank is not active", 400);
 
-    const doc = await DepositModel.create({
-      ...base,
-      bankId: new Types.ObjectId(bankIdStr),
-      bankName: bankDisplayName(bank),
-      bankImpact: true,
-    });
+    const bankBalanceAfter = await applyBankCashDelta(bankIdStr, money.amount);
+    let doc;
+    try {
+      doc = await DepositModel.create({
+        ...base,
+        bankId: new Types.ObjectId(bankIdStr),
+        bankName: bankDisplayName(bank),
+        bankImpact: true,
+        bankBalanceAfter,
+      });
+    } catch (err) {
+      await applyBankCashDelta(bankIdStr, -money.amount);
+      throw err;
+    }
 
     await createAuditLog({
       actorId,
@@ -465,6 +474,7 @@ export async function createDeposit(input: CreateDepositInput, actorId: string, 
         operatedAmount: money.operatedAmount,
         exchangeRate: money.exchangeRate,
         entryAt: doc.entryAt,
+        bankBalanceAfter,
       } as unknown as Record<string, unknown>,
       requestId,
     });
@@ -543,6 +553,10 @@ export async function updateDepositByBanker(id: string, input: BankerDepositCrea
     bankImpact: doc.bankImpact,
   };
 
+  const oldBankImpact = doc.bankImpact !== false && !!doc.bankId;
+  const oldBankId = doc.bankId ? String(doc.bankId) : "";
+  const oldAmount = Number(doc.amount ?? 0);
+
   if (mode === "bank") {
     const bankIdStr = input.bankId as string;
     const bank = await BankModel.findById(bankIdStr);
@@ -574,6 +588,18 @@ export async function updateDepositByBanker(id: string, input: BankerDepositCrea
   doc.operatedCurrency = money.operatedCurrency;
   doc.operatedAmount = money.operatedAmount;
   doc.exchangeRate = money.exchangeRate;
+
+  // Pending bank cash already posted — move/adjust before save.
+  if (oldBankImpact && oldBankId) {
+    await applyBankCashDelta(oldBankId, -oldAmount);
+  }
+  if (mode === "bank" && doc.bankId) {
+    const nextBal = await applyBankCashDelta(doc.bankId, money.amount);
+    doc.bankBalanceAfter = nextBal;
+  } else {
+    doc.bankBalanceAfter = undefined;
+  }
+
   await doc.save();
 
   await createAuditLog({
@@ -655,7 +681,7 @@ export async function listDeposits(
     DepositModel.find(queryFilter)
       .populate("bankId", "holderName bankName accountNumber ifsc openingBalance currentBalance")
       .populate("liabilityPersonId", "name isActive")
-      .populate("player", "playerId phone exchange")
+      .populate("player", "playerId exchange")
       .populate("createdBy", "fullName username")
       .populate("exchangeActionBy", "fullName username")
       .populate("lastAmendedBy", "fullName username")
@@ -815,7 +841,7 @@ export async function deleteDepositWithReversal(id: string, actorId: string, req
   };
 
   const shouldReverseBank =
-    (doc.status === "verified" || doc.status === "finalized") &&
+    DEPOSIT_BANK_CASH_STATUSES.includes(doc.status as (typeof DEPOSIT_BANK_CASH_STATUSES)[number]) &&
     doc.bankImpact !== false &&
     !!doc.bankId &&
     Number.isFinite(Number(doc.amount));
@@ -962,7 +988,6 @@ export async function exchangeApproveDeposit(
   const bonusFromRule = bonusAmountFromPercent(doc.amount, appliedBonusPercent, platformCurrency);
   const bonus = requestedBonusRounded;
   const totalAmount = roundMoneyToCurrency(Number(doc.amount) + bonus, platformCurrency);
-  const bankCashCredit = doc.amount;
 
   const previousStatus = doc.status;
   const previousPlayer = doc.player;
@@ -977,28 +1002,22 @@ export async function exchangeApproveDeposit(
   if (!isPersonSettlement) {
     const bank = await BankModel.findById(doc.bankId);
     if (!bank) throw new AppError("not_found", "Bank not found", 404);
-
-    const prev = bank.currentBalance ?? bank.openingBalance;
-    const bankBalanceAfter = prev + bankCashCredit;
-
-    bank.currentBalance = bankBalanceAfter;
-    await bank.save();
-
-    try {
-      doc.status = "verified" as DepositStatus;
-      doc.player = playerObjectId;
-      doc.bonusAmount = bonus;
-      doc.totalAmount = totalAmount;
-      doc.exchangeActionBy = new Types.ObjectId(actorId);
-      doc.exchangeActionAt = new Date();
-      doc.bankBalanceAfter = bankBalanceAfter;
-      doc.settledAt = new Date();
-      await doc.save();
-    } catch (err) {
-      bank.currentBalance = prev;
-      await bank.save();
-      throw err;
+    if (bank.status !== "active") {
+      throw new AppError("business_rule_error", "Bank is not active", 400);
     }
+
+    // Cash was already posted on banker create / pending update — approve only updates details.
+    const bankBalanceAfter = Number(bank.currentBalance ?? bank.openingBalance ?? 0);
+
+    doc.status = "verified" as DepositStatus;
+    doc.player = playerObjectId;
+    doc.bonusAmount = bonus;
+    doc.totalAmount = totalAmount;
+    doc.exchangeActionBy = new Types.ObjectId(actorId);
+    doc.exchangeActionAt = new Date();
+    doc.bankBalanceAfter = bankBalanceAfter;
+    doc.settledAt = new Date();
+    await doc.save();
   } else {
     doc.status = "verified" as DepositStatus;
     doc.player = playerObjectId;
@@ -1099,7 +1118,8 @@ export async function exchangeApproveDeposit(
         appliedBonusPercent,
         appliedBonusType: isFirstDeposit ? "first_deposit" : "regular",
         totalAmount,
-        bankCashCredit,
+        bankCashCreditOnApprove: 0,
+        bankCashAlreadyPosted: !isPersonSettlement,
         settlementAccountType: isPersonSettlement ? "person" : "bank",
         bankBalanceAfter: isPersonSettlement ? undefined : doc.bankBalanceAfter,
         liabilityPersonId: isPersonSettlement ? doc.liabilityPersonId?.toString() : undefined,
@@ -1294,6 +1314,12 @@ export async function exchangeRejectDeposit(
     throw new AppError("business_rule_error", "Deposit is not pending/not-settled exchange action", 400);
   }
 
+  // Reverse bank cash posted when the banker recorded receipt (bank settlement only).
+  if (doc.bankImpact !== false && doc.bankId) {
+    await applyBankCashDelta(doc.bankId, -Number(doc.amount ?? 0));
+    doc.bankBalanceAfter = undefined;
+  }
+
   doc.status = "rejected";
   doc.rejectReason = rejectText;
   doc.rejectReasonId = new Types.ObjectId(resolved.id);
@@ -1311,6 +1337,7 @@ export async function exchangeRejectDeposit(
       rejectReason: rejectText,
       rejectReasonId: resolved.id,
       remark: input.remark?.trim() || undefined,
+      bankCashReversed: doc.bankImpact !== false,
     },
     requestId,
   });
@@ -2246,6 +2273,20 @@ function bulkWriteErrorMessage(writeError: { errmsg?: string; code?: number }): 
   return writeError.errmsg || "Insert failed";
 }
 
+async function creditBanksForImportedDeposits(
+  docs: Array<{ bankId?: Types.ObjectId; amount?: number; bankImpact?: boolean }>,
+): Promise<void> {
+  const byBank = new Map<string, number>();
+  for (const doc of docs) {
+    if (doc.bankImpact === false || !doc.bankId) continue;
+    const id = String(doc.bankId);
+    byBank.set(id, (byBank.get(id) ?? 0) + Number(doc.amount ?? 0));
+  }
+  for (const [bankId, amount] of byBank) {
+    if (amount > 0) await applyBankCashDelta(bankId, amount);
+  }
+}
+
 export async function applyDepositImportRows(
   rows: DepositImportCommitRow[],
   actorId: string,
@@ -2308,11 +2349,17 @@ export async function applyDepositImportRows(
           { ordered: false },
         );
         created += inserted.length;
+        await creditBanksForImportedDeposits(inserted as Array<{ bankId?: Types.ObjectId; amount?: number; bankImpact?: boolean }>);
       } catch (err: unknown) {
         if (isMongooseBulkWriteError(err)) {
           const insertedCount =
             err.insertedDocs?.length ?? err.result?.insertedCount ?? 0;
           created += insertedCount;
+          if (Array.isArray(err.insertedDocs) && err.insertedDocs.length > 0) {
+            await creditBanksForImportedDeposits(
+              err.insertedDocs as Array<{ bankId?: Types.ObjectId; amount?: number; bankImpact?: boolean }>,
+            );
+          }
           for (const we of err.writeErrors ?? []) {
             const pending = pendingInserts[we.index];
             if (!pending) continue;
