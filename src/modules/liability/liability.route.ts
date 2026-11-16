@@ -21,6 +21,8 @@ import {
 import {
   createLiabilityEntryBodySchema,
   createLiabilityPersonBodySchema,
+  exportLiabilityEntryQuerySchema,
+  exportLiabilityPersonQuerySchema,
   liabilityLedgerQuerySchema,
   liabilityPersonIdParamSchema,
   liabilityReportQuerySchema,
@@ -65,7 +67,7 @@ liabilityRouter.get(
 liabilityRouter.get(
   "/persons/export",
   permissionMiddleware(PERMISSIONS.LIABILITY_PERSON_LIST),
-  validate({ query: listLiabilityPersonQuerySchema }),
+  validate({ query: exportLiabilityPersonQuerySchema }),
   exportLiabilityPersonController,
 );
 
@@ -86,7 +88,7 @@ liabilityRouter.get(
 liabilityRouter.get(
   "/entries/export",
   permissionMiddleware(PERMISSIONS.LIABILITY_ENTRY_LIST),
-  validate({ query: listLiabilityEntryQuerySchema }),
+  validate({ query: exportLiabilityEntryQuerySchema }),
   exportLiabilityEntryController,
 );
 

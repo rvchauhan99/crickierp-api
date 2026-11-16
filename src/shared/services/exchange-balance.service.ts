@@ -12,7 +12,8 @@ function toAmountMap(rows: Array<{ _id: Types.ObjectId; totalAmount?: number }>)
 
 /**
  * Own-ledger (leaf) all-time balance for the given exchange ids:
- * openingBalance - verified/finalized deposits + approved/finalized withdrawals + topups.
+ * openingBalance - verified/finalized deposits + approved/finalized withdrawals
+ * + topup credits - topup debits.
  * Deposits/withdrawals attributed via player → exchange ($lookup).
  * Does NOT include sub-exchange rollups.
  */
@@ -64,7 +65,20 @@ export async function computeOwnLedgerExchangeBalances(
     ]),
     ExchangeTopupModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
       { $match: { exchangeId: { $in: exchangeIds } } },
-      { $group: { _id: "$exchangeId", totalAmount: { $sum: "$amount" } } },
+      {
+        $group: {
+          _id: "$exchangeId",
+          totalAmount: {
+            $sum: {
+              $cond: [
+                { $eq: [{ $ifNull: ["$entryType", "credit"] }, "debit"] },
+                { $multiply: ["$amount", -1] },
+                "$amount",
+              ],
+            },
+          },
+        },
+      },
     ]),
   ]);
 

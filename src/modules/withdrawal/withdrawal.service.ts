@@ -44,6 +44,17 @@ import {
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
 type BankerPayoutInput = z.infer<typeof withdrawalBankerPayoutBodySchema>;
+
+/** Strip legacy `playerId · phone` so API responses never leak contact digits. */
+function sanitizeWithdrawalPlayerName(name: unknown): string {
+  const raw = String(name ?? "").trim();
+  if (!raw) return "";
+  const sep = " · ";
+  const idx = raw.indexOf(sep);
+  if (idx === -1) return raw;
+  return raw.slice(0, idx).trim();
+}
+
 type DuplicateTransactionContext = {
   type: "deposit" | "withdrawal";
   id: string;
@@ -360,7 +371,7 @@ export async function createWithdrawal(
     money.operatedCurrency,
   );
   const payableAmount = payableFromAmounts(money.amount, reverseBonus, money.platformCurrency);
-  const playerLabel = `${player.playerId} · ${player.phone}`;
+  const playerLabel = String(player.playerId ?? "").trim();
 
   const doc = await WithdrawalModel.create({
     player: new Types.ObjectId(input.playerId),
@@ -792,9 +803,9 @@ export async function listWithdrawals(
     }
   }
 
-  const [rows, total, lastBankerPayout] = await Promise.all([
+  const [rowsRaw, total, lastBankerPayout] = await Promise.all([
     WithdrawalModel.find(queryFilter)
-      .populate("player", "playerId phone")
+      .populate("player", "playerId")
       .populate("payoutBankId", "holderName bankName accountNumber")
       .populate("payoutLiabilityPersonId", "name isActive")
       .populate("createdBy", "fullName username")
@@ -806,6 +817,10 @@ export async function listWithdrawals(
     WithdrawalModel.countDocuments(filter),
     lastBankerPayoutBankForActor(query.view, options?.actorId),
   ]);
+  const rows = rowsRaw.map((row) => ({
+    ...row,
+    playerName: sanitizeWithdrawalPlayerName(row.playerName),
+  }));
 
   const meta: {
     total: number;
@@ -943,7 +958,7 @@ export async function exportWithdrawalsToBuffer(
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await WithdrawalModel.find(filter)
-    .populate("player", "playerId phone")
+    .populate("player", "playerId")
     .populate("payoutBankId", "holderName bankName accountNumber")
     .populate("payoutLiabilityPersonId", "name")
     .populate("createdBy", "fullName username")
@@ -953,7 +968,6 @@ export async function exportWithdrawalsToBuffer(
 
   return generateExcelBuffer(rows, [
     { header: "Player ID", transform: (r) => (r.player as any)?.playerId ?? "" },
-    { header: "Player Phone", transform: (r) => (r.player as any)?.phone ?? "" },
     { header: "Account Number", key: "accountNumber" },
     { header: "Account Holder", key: "accountHolderName" },
     { header: "Bank", key: "bankName" },

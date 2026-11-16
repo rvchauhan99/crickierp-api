@@ -104,9 +104,11 @@ describe("Sub exchange management", () => {
     expect(String(created!.rootExchange)).toBe(parentId);
   });
 
-  it("rejects top-up on a group parent", async () => {
+  it("rejects top-up and debit on a group parent", async () => {
     const parent = await ExchangeModel.findOne({ name: "Parent EX", provider: "Prov Sub" }).lean();
-    const res = await request(app)
+    expect(parent).toBeTruthy();
+
+    const creditRes = await request(app)
       .post("/api/v1/exchange-topup")
       .set("Authorization", `Bearer ${accessToken}`)
       .send({
@@ -114,8 +116,20 @@ describe("Sub exchange management", () => {
         amount: 50,
         remark: "should fail",
       });
-    expect(res.status).toBe(400);
-    expect(String(res.body.error?.message || "")).toMatch(/sub exchange/i);
+    expect(creditRes.status).toBe(400);
+    expect(String(creditRes.body.error?.message || "")).toMatch(/sub exchange/i);
+
+    const debitRes = await request(app)
+      .post("/api/v1/exchange-topup")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        exchangeId: String(parent!._id),
+        entryType: "debit",
+        amount: 50,
+        remark: "should fail",
+      });
+    expect(debitRes.status).toBe(400);
+    expect(String(debitRes.body.error?.message || "")).toMatch(/sub exchange/i);
   });
 
   it("rolls parent balance as own ledger + sub ledgers", async () => {

@@ -7,6 +7,8 @@ import { migration003LiabilityPersonSideClosingBalance } from "./003-liability-p
 import { migration004SeedExpenseCancelReasons } from "./004-seed-expense-cancel-reasons";
 import { migration005RecomputeExchangeCurrentBalances } from "./005-recompute-exchange-current-balances";
 import { migration006SubExchangeRootAndIndexes } from "./006-sub-exchange-root-and-indexes";
+import { migration007ExchangeTopupEntryType } from "./007-exchange-topup-entry-type";
+import { migration008DepositPendingBankCash } from "./008-deposit-pending-bank-cash";
 
 export const MIGRATIONS_COLLECTION = "__migrations";
 
@@ -22,6 +24,8 @@ const registry: Migration[] = [
   migration004SeedExpenseCancelReasons,
   migration005RecomputeExchangeCurrentBalances,
   migration006SubExchangeRootAndIndexes,
+  migration007ExchangeTopupEntryType,
+  migration008DepositPendingBankCash,
 ];
 
 export async function runMigrations(): Promise<void> {

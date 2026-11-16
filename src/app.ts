@@ -24,7 +24,21 @@ export function createApp() {
   );
   app.use(express.json({ limit: env.apiJsonLimit }));
   app.use(express.urlencoded({ extended: true, limit: env.apiJsonLimit }));
-  app.use(compression());
+  app.use(
+    compression({
+      filter: (req, res) => {
+        const type = String(res.getHeader("Content-Type") || "");
+        if (
+          type.includes("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") ||
+          type.includes("text/csv") ||
+          type.includes("application/octet-stream")
+        ) {
+          return false;
+        }
+        return compression.filter(req, res);
+      },
+    }),
+  );
   app.use(cookieParser());
   app.use(requestIdMiddleware);
   app.use(auditContextMiddleware);

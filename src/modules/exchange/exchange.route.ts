@@ -17,6 +17,7 @@ import {
   createExchangeBodySchema,
   exchangeIdParamSchema,
   exchangeStatementQuerySchema,
+  exportExchangeQuerySchema,
   listExchangeQuerySchema,
   movePlayersBodySchema,
   updateExchangeBodySchema,
@@ -41,7 +42,7 @@ exchangeRouter.get(
 exchangeRouter.get(
   "/export",
   permissionMiddleware(PERMISSIONS.EXCHANGE_LIST),
-  validate({ query: listExchangeQuerySchema }),
+  validate({ query: exportExchangeQuerySchema }),
   exportExchangeController,
 );
 exchangeRouter.get(

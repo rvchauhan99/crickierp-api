@@ -4,6 +4,8 @@ import {
   dashboardSummaryQuerySchema,
   expenseAnalysisRecordsQuerySchema,
   expenseAnalysisSummaryQuerySchema,
+  exportExpenseAnalysisRecordsQuerySchema,
+  exportTransactionHistoryQuerySchema,
   transactionHistoryQuerySchema,
 } from "./reports.validation";
 import {
@@ -45,9 +47,12 @@ export async function transactionHistoryController(req: Request, res: Response) 
 }
 
 export async function exportTransactionHistoryController(req: Request, res: Response) {
-  const query = transactionHistoryQuerySchema.parse(req.query);
+  const query = exportTransactionHistoryQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportTransactionHistoryToBuffer(query, { scope: "transactions", timeZone });
+  const buffer = await exportTransactionHistoryToBuffer(
+    { ...query, page: 1, pageSize: 20 },
+    { scope: "transactions", timeZone },
+  );
   res.setHeader("Content-Disposition", 'attachment; filename="audit-history-export.xlsx"');
   res.setHeader(
     "Content-Type",
@@ -80,9 +85,12 @@ export async function expenseAnalysisRecordsController(req: Request, res: Respon
 }
 
 export async function exportExpenseAnalysisController(req: Request, res: Response) {
-  const query = expenseAnalysisRecordsQuerySchema.parse(req.query);
+  const query = exportExpenseAnalysisRecordsQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportExpenseAnalysisToBuffer(query, { timeZone });
+  const buffer = await exportExpenseAnalysisToBuffer(
+    { ...query, page: 1, pageSize: 20 },
+    { timeZone },
+  );
   res.setHeader("Content-Disposition", 'attachment; filename="expense-analysis-export.xlsx"');
   res.setHeader(
     "Content-Type",

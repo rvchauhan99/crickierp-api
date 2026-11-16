@@ -17,6 +17,7 @@ import {
   approveExpenseBodySchema,
   cancelExpenseBodySchema,
   createExpenseBodySchema,
+  exportExpenseQuerySchema,
   listExpenseQuerySchema,
   rejectExpenseBodySchema,
   updateExpenseBodySchema,
@@ -61,9 +62,9 @@ export async function listExpenseController(req: Request, res: Response) {
 }
 
 export async function exportExpenseController(req: Request, res: Response) {
-  const query = listExpenseQuerySchema.parse(req.query);
+  const query = exportExpenseQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportExpensesToBuffer(query, { timeZone });
+  const buffer = await exportExpensesToBuffer({ ...query, page: 1, pageSize: 20 }, { timeZone });
   res.setHeader("Content-Disposition", 'attachment; filename="expenses-export.xlsx"');
   res.setHeader(
     "Content-Type",

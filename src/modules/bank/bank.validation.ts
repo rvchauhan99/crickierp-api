@@ -31,7 +31,11 @@ export const listBankQuerySchema = z.object({
   accountNumber_op: z.string().optional(),
   ifsc: z.string().optional(),
   ifsc_op: z.string().optional(),
-  status: z.string().optional(),
+  /** Omit or `active` → active only; `deactive` → inactive; `all` → no status filter. */
+  status: z.preprocess(
+    (v) => (v === "" || v === undefined || v === null ? undefined : String(v).trim()),
+    z.enum(["active", "deactive", "all"]).optional(),
+  ),
   createdBy: z.string().optional(),
   createdAt_from: z.string().optional(),
   createdAt_to: z.string().optional(),
@@ -99,4 +103,14 @@ export const createBankSettlementBodySchema = z.object({
 
 export const bankIdParamSchema = z.object({
   id: z.string().length(24),
+});
+
+export const updateBankStatusBodySchema = z.object({
+  status: z.enum(["active", "deactive"]),
+});
+
+export const exportBankQuerySchema = listBankQuerySchema.omit({
+  page: true,
+  pageSize: true,
+  limit: true,
 });

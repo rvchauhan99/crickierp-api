@@ -110,3 +110,15 @@ export const liabilityLedgerQuerySchema = z.object({
 export const liabilityReportQuerySchema = z.object({
   viewMode: liabilityViewModeSchema,
 });
+
+export const exportLiabilityPersonQuerySchema = listLiabilityPersonQuerySchema.omit({
+  page: true,
+  pageSize: true,
+  limit: true,
+});
+
+export const exportLiabilityEntryQuerySchema = listLiabilityEntryQuerySchema.omit({
+  page: true,
+  pageSize: true,
+  limit: true,
+});

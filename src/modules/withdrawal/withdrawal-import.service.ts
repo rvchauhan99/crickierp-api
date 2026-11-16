@@ -678,7 +678,7 @@ async function loadWithdrawalImportLookups(rows: WithdrawalImportCommitRow[]) {
       : [],
     playerIdSet.size > 0
       ? PlayerModel.find({ _id: { $in: [...playerIdSet].map((id) => new Types.ObjectId(id)) } })
-          .select("playerId phone")
+          .select("playerId")
           .lean()
       : [],
   ]);
@@ -688,7 +688,7 @@ async function loadWithdrawalImportLookups(rows: WithdrawalImportCommitRow[]) {
     playerById: new Map(
       players.map((p) => [
         String(p._id),
-        { playerId: p.playerId, phone: p.phone, label: `${p.playerId} · ${p.phone}` },
+        { playerId: String(p.playerId ?? ""), label: String(p.playerId ?? "") },
       ]),
     ),
   };
@@ -717,7 +717,7 @@ function buildWithdrawalImportInsertDoc(
   lookups: {
     bankById: Map<string, BankImportLean>;
     personById: Map<string, PersonImportLean>;
-    playerById: Map<string, { playerId: string; phone: string; label: string }>;
+    playerById: Map<string, { playerId: string; label: string }>;
   },
   canSetCustomRequestedAt: boolean,
 ): Record<string, unknown> | { error: string } {
@@ -729,7 +729,7 @@ function buildWithdrawalImportInsertDoc(
 
   const base: Record<string, unknown> = {
     player: new Types.ObjectId(row.playerMongoId),
-    playerName: player.label,
+    playerName: player.playerId || player.label,
     accountNumber: row.accountNumber.trim(),
     accountHolderName: row.accountHolderName.trim(),
     bankName: row.bankName.trim(),

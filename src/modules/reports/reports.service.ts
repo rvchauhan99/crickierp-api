@@ -419,11 +419,37 @@ async function getExchangePeriodBalancesForDashboard(args: {
     ]),
     ExchangeTopupModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
       { $match: { exchangeId: { $in: exchangeIds }, createdAt: { $lt: fromUtc } } },
-      { $group: { _id: "$exchangeId", totalAmount: { $sum: "$amount" } } },
+      {
+        $group: {
+          _id: "$exchangeId",
+          totalAmount: {
+            $sum: {
+              $cond: [
+                { $eq: [{ $ifNull: ["$entryType", "credit"] }, "debit"] },
+                { $multiply: ["$amount", -1] },
+                "$amount",
+              ],
+            },
+          },
+        },
+      },
     ]),
     ExchangeTopupModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
       { $match: { exchangeId: { $in: exchangeIds }, createdAt: { $gte: fromUtc, $lte: toUtc } } },
-      { $group: { _id: "$exchangeId", totalAmount: { $sum: "$amount" } } },
+      {
+        $group: {
+          _id: "$exchangeId",
+          totalAmount: {
+            $sum: {
+              $cond: [
+                { $eq: [{ $ifNull: ["$entryType", "credit"] }, "debit"] },
+                { $multiply: ["$amount", -1] },
+                "$amount",
+              ],
+            },
+          },
+        },
+      },
     ]),
   ]);
 
@@ -518,7 +544,9 @@ export async function getDashboardSummary(
   const { expenseDate: _expenseDateRange, ...expenseFilterNoDate } = expenseFilter as Record<string, unknown>;
 
   const depositBalanceStatusFilter =
-    status === "all" || !status ? { status: { $in: ["verified", "finalized"] } } : {};
+    status === "all" || !status
+      ? { status: { $in: ["pending", "not_settled", "verified", "finalized"] }, bankImpact: { $ne: false } }
+      : {};
   const withdrawalBalanceStatusFilter = status === "all" || !status ? { status: "approved" } : {};
   const expenseBalanceStatusFilter = status === "all" || !status ? { status: "approved" } : {};
 
@@ -946,8 +974,15 @@ export async function getDashboardSummary(
           },
         ]),
 
-    BankModel.find({ status: "active" })
-      .select({ _id: 1, holderName: 1, bankName: 1, openingBalance: 1 })
+    BankModel.find(
+      (() => {
+        const bankStatus = (query.bankStatus as "active" | "deactive" | "all" | undefined) ?? "active";
+        if (bankStatus === "all") return {};
+        if (bankStatus === "deactive") return { status: "deactive" };
+        return { status: "active" };
+      })(),
+    )
+      .select({ _id: 1, holderName: 1, bankName: 1, openingBalance: 1, status: 1 })
       .lean(),
 
     DepositModel.aggregate([

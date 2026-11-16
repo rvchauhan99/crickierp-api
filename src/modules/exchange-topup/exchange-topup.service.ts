@@ -13,6 +13,7 @@ import { requirePlatformCurrency } from "../settings/settings.service";
 export async function createExchangeTopup(
   input: {
     exchangeId: string;
+    entryType?: "credit" | "debit";
     amount: number;
     remark?: string;
     operatedCurrency?: string;
@@ -29,10 +30,12 @@ export async function createExchangeTopup(
   const exchange = await ExchangeModel.findById(exchangeObjectId).select("_id name provider parentExchange");
   if (!exchange) throw new AppError("not_found", "Exchange not found", 404);
 
+  const entryType = input.entryType === "debit" ? "debit" : "credit";
+
   if (!exchange.parentExchange) {
     const subCount = await ExchangeModel.countDocuments({ parentExchange: exchangeObjectId });
     if (subCount > 0) {
-      throw new AppError("business_rule_error", "Select a sub exchange for top-up", 400);
+      throw new AppError("business_rule_error", "Select a sub exchange for top-up / debit", 400);
     }
   }
 
@@ -48,6 +51,7 @@ export async function createExchangeTopup(
 
   const doc = await ExchangeTopupModel.create({
     exchangeId: exchangeObjectId,
+    entryType,
     amount: money.amount,
     operatedCurrency: money.operatedCurrency,
     operatedAmount: money.operatedAmount,
@@ -65,6 +69,7 @@ export async function createExchangeTopup(
     entityId: doc._id.toString(),
     newValue: {
       exchangeId: exchangeObjectId.toString(),
+      entryType,
       amount: doc.amount,
       operatedCurrency: money.operatedCurrency,
       operatedAmount: money.operatedAmount,
@@ -83,6 +88,7 @@ export async function createExchangeTopup(
 
 export async function listExchangeTopups(query: {
   exchangeId?: string;
+  entryType?: "credit" | "debit";
   page: number;
   pageSize: number;
   sortOrder: "asc" | "desc";
@@ -93,6 +99,9 @@ export async function listExchangeTopups(query: {
       throw new AppError("validation_error", "Invalid exchange id", 400);
     }
     filter.exchangeId = new Types.ObjectId(query.exchangeId);
+  }
+  if (query.entryType) {
+    filter.entryType = query.entryType;
   }
 
   const skip = (query.page - 1) * query.pageSize;
@@ -123,6 +132,7 @@ const EXPORT_MAX_ROWS = 10_000;
 
 export async function exportExchangeTopupsToBuffer(query: {
   exchangeId?: string;
+  entryType?: "credit" | "debit";
   sortOrder: "asc" | "desc";
 }, options?: { timeZone?: string }): Promise<Buffer> {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
@@ -145,6 +155,7 @@ export async function exportExchangeTopupsToBuffer(query: {
       Date: formatDateTimeForTimeZone(r.createdAt, timeZone),
       Exchange: exchange?.name || "",
       Provider: exchange?.provider || "",
+      Type: r.entryType === "debit" ? "Debit" : "Credit",
       Amount: r.amount,
       Remark: r.remark || "",
       "Created By": authorName,

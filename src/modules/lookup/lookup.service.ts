@@ -152,7 +152,7 @@ export async function listPlayerLookupOptions({ q, limit }: LookupQueryParams) {
     .populate("rootExchange", "name provider")
     .sort({ playerId: 1 })
     .limit(limit)
-    .select({ playerId: 1, phone: 1, exchange: 1, rootExchange: 1 })
+    .select({ playerId: 1, exchange: 1, rootExchange: 1 })
     .lean()
     .exec();
   const data = rows.map((row) => {
@@ -189,7 +189,6 @@ export async function listPlayerLookupOptions({ q, limit }: LookupQueryParams) {
       id: String(row._id),
       label: `${String(row.playerId ?? "")}${exchangeLabel ? ` - ${exchangeLabel}` : ""}`,
       playerId: String(row.playerId ?? ""),
-      phone: String(row.phone ?? ""),
       exchangeId: root?._id != null ? String(root._id) : exchange?._id != null ? String(exchange._id) : undefined,
       exchangeName: isSub ? parentName : leafName,
       exchangeProvider,

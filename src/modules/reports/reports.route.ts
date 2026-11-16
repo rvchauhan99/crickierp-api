@@ -7,6 +7,7 @@ import {
   dashboardSummaryQuerySchema,
   expenseAnalysisRecordsQuerySchema,
   expenseAnalysisSummaryQuerySchema,
+  exportExpenseAnalysisRecordsQuerySchema,
 } from "./reports.validation";
 import {
    auditEntitiesController,
@@ -64,7 +65,7 @@ reportsRouter.get(
 reportsRouter.get(
   "/expense-analysis/export",
   permissionMiddleware(PERMISSIONS.REPORTS_EXPENSE_ANALYSIS),
-  validate({ query: expenseAnalysisRecordsQuerySchema }),
+  validate({ query: exportExpenseAnalysisRecordsQuerySchema }),
   exportExpenseAnalysisController,
 );
 

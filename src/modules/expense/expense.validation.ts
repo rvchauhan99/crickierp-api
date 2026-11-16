@@ -68,3 +68,9 @@ export const expenseDocumentViewParamsSchema = z.object({
   id: z.string().length(24),
   docIndex: z.coerce.number().int().nonnegative(),
 });
+
+export const exportExpenseQuerySchema = listExpenseQuerySchema.omit({
+  page: true,
+  pageSize: true,
+  limit: true,
+});

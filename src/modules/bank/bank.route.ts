@@ -16,6 +16,7 @@ import {
   listBankController,
   listBankSettlementsController,
   listBankTransferController,
+  updateBankStatusController,
 } from "./bank.controller";
 import {
   bankIdParamSchema,
@@ -24,18 +25,26 @@ import {
   createBankBodySchema,
   createBankSettlementBodySchema,
   createBankTransferBodySchema,
+  exportBankQuerySchema,
   listBankQuerySchema,
   listBankTransferQuerySchema,
+  updateBankStatusBodySchema,
 } from "./bank.validation";
 
 const bankRouter = Router();
 
 bankRouter.use(authMiddleware);
 bankRouter.post("/", permissionMiddleware(PERMISSIONS.BANK_ADD), validate({ body: createBankBodySchema }), createBankController);
+bankRouter.patch(
+  "/:id/status",
+  permissionMiddleware(PERMISSIONS.BANK_ADD),
+  validate({ params: bankIdParamSchema, body: updateBankStatusBodySchema }),
+  updateBankStatusController,
+);
 bankRouter.get(
   "/export",
   permissionMiddleware(PERMISSIONS.BANK_LIST),
-  validate({ query: listBankQuerySchema }),
+  validate({ query: exportBankQuerySchema }),
   exportBankController,
 );
 bankRouter.get(

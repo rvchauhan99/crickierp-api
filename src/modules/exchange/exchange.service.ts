@@ -724,7 +724,7 @@ export async function getExchangeStatement(
       exchangeId: ledgerExchangeIds.length === 1 ? ledgerExchangeIds[0] : { $in: ledgerExchangeIds },
     })
       .populate("createdBy", "fullName username")
-      .select("_id exchangeId amount remark createdBy createdAt updatedAt")
+      .select("_id exchangeId entryType amount remark createdBy createdAt updatedAt")
       .lean(),
   ]);
 
@@ -774,6 +774,7 @@ export async function getExchangeStatement(
       totalDepositOutflow: 0,
       totalWithdrawalInflow: 0,
       totalTopUpCredits: 0,
+      totalTopUpDebits: 0,
       rows: [],
     };
   }
@@ -790,7 +791,8 @@ export async function getExchangeStatement(
     }
     for (const t of allTopups) {
       if (new Date(t.createdAt) >= from) continue;
-      priorNet += t.amount;
+      const signed = t.entryType === "debit" ? -Number(t.amount) : Number(t.amount);
+      priorNet += signed;
     }
   }
 
@@ -835,6 +837,7 @@ export async function getExchangeStatement(
   let totalDepositOutflow = 0;
   let totalWithdrawalInflow = 0;
   let totalTopUpCredits = 0;
+  let totalTopUpDebits = 0;
 
   const rows = events.map((ev) => {
     if (ev.kind === "deposit") {
@@ -886,9 +889,17 @@ export async function getExchangeStatement(
     }
 
     const topup = ev.doc;
-    running += topup.amount;
-    totalCredits += topup.amount;
-    totalTopUpCredits += topup.amount;
+    const isDebit = topup.entryType === "debit";
+    const amount = Number(topup.amount);
+    if (isDebit) {
+      running -= amount;
+      totalDebits += amount;
+      totalTopUpDebits += amount;
+    } else {
+      running += amount;
+      totalCredits += amount;
+      totalTopUpCredits += amount;
+    }
     const createdByObj = topup.createdBy as { fullName?: string; username?: string } | undefined;
     const createdByLabel =
       createdByObj?.fullName?.trim() || createdByObj?.username?.trim() || "";
@@ -898,15 +909,16 @@ export async function getExchangeStatement(
       kind: "topup" as const,
       refId: topup._id.toString(),
       at: formatDateTimeForTimeZone(new Date(ev.t), timeZone),
-      label: "Top Up",
+      label: isDebit ? "Top Up Debit" : "Top Up",
       playerId: "",
-      amount: topup.amount,
-      direction: "credit" as const,
+      amount,
+      direction: (isDebit ? "debit" : "credit") as "debit" | "credit",
       balanceAfter: running,
       bonusMemo: 0,
       utr: undefined,
       remark: topup.remark ?? "",
       createdByName: createdByLabel,
+      topupEntryType: isDebit ? ("debit" as const) : ("credit" as const),
       subExchangeId: isGroup ? topupExId : undefined,
       subExchangeName: isGroup
         ? (subNameMap.get(topupExId) ?? (topupExId === String(exchangeObjectId) ? "(direct)" : ""))
@@ -932,6 +944,7 @@ export async function getExchangeStatement(
     totalDepositOutflow,
     totalWithdrawalInflow,
     totalTopUpCredits,
+    totalTopUpDebits,
     rows,
   };
 }
@@ -955,6 +968,7 @@ export async function exportExchangeStatementToBuffer(
     { Field: "Total Credits", Value: statement.totalCredits },
     { Field: "Total Debits", Value: statement.totalDebits },
     { Field: "Top-Up Credits", Value: statement.totalTopUpCredits },
+    { Field: "Top-Up Debits", Value: statement.totalTopUpDebits },
     { Field: "Closing Balance", Value: statement.periodClosingBalance },
     { Field: "Current Balance", Value: statement.exchange.currentBalance },
   ];

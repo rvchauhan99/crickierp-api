@@ -265,6 +265,7 @@ describe("Exchange API integration", () => {
     expect(topupRes.status).toBe(201);
     expect(topupRes.body.success).toBe(true);
     expect(topupRes.body.data.amount).toBe(40);
+    expect(topupRes.body.data.entryType).toBe("credit");
     expect(topupRes.body.data.currentBalance).toBe(500 - 110 + 70 + 40);
 
     const topupCount = await ExchangeTopupModel.countDocuments({ exchangeId: exchange._id });
@@ -280,6 +281,7 @@ describe("Exchange API integration", () => {
     expect(statementRes.status).toBe(200);
     expect(statementRes.body.data.exchange.currentBalance).toBe(500 - 110 + 70 + 40);
     expect(statementRes.body.data.totalTopUpCredits).toBe(40);
+    expect(statementRes.body.data.totalTopUpDebits).toBe(0);
     expect(statementRes.body.data.totalCredits).toBe(110);
     expect(statementRes.body.data.totalDebits).toBe(110);
     expect(statementRes.body.data.periodClosingBalance).toBe(500);
@@ -290,7 +292,73 @@ describe("Exchange API integration", () => {
     ]);
     const topupRow = statementRes.body.data.rows.find((r: { kind: string }) => r.kind === "topup");
     expect(topupRow.direction).toBe("credit");
+    expect(topupRow.label).toBe("Top Up");
     expect(topupRow.amount).toBe(40);
+  });
+
+  it("creates debit topup, decreases current balance and shows debit in statement", async () => {
+    const actor = await UserModel.findOne({ username: "superadmin" }).select("_id").lean();
+    expect(actor?._id).toBeDefined();
+    const actorId = actor!._id;
+
+    const exchange = await ExchangeModel.create({
+      name: "E2E Topup Debit",
+      provider: "Provider TD",
+      openingBalance: 500,
+      currentBalance: 500,
+      bonus: 0,
+      status: "active",
+      createdBy: actorId,
+      updatedBy: actorId,
+    });
+
+    const creditRes = await request(app)
+      .post("/api/v1/exchange-topup")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        exchangeId: exchange._id.toString(),
+        entryType: "credit",
+        amount: 100,
+        remark: "Credit first",
+      });
+    expect(creditRes.status).toBe(201);
+    expect(creditRes.body.data.currentBalance).toBe(600);
+
+    const debitRes = await request(app)
+      .post("/api/v1/exchange-topup")
+      .set("Authorization", `Bearer ${accessToken}`)
+      .send({
+        exchangeId: exchange._id.toString(),
+        entryType: "debit",
+        amount: 40,
+        remark: "Manual debit",
+      });
+    expect(debitRes.status).toBe(201);
+    expect(debitRes.body.data.entryType).toBe("debit");
+    expect(debitRes.body.data.amount).toBe(40);
+    expect(debitRes.body.data.currentBalance).toBe(560);
+
+    const listRes = await request(app)
+      .get("/api/v1/exchange-topup")
+      .query({ exchangeId: exchange._id.toString(), pageSize: 10 })
+      .set("Authorization", `Bearer ${accessToken}`);
+    expect(listRes.status).toBe(200);
+    const types = (listRes.body.data as Array<{ entryType: string }>).map((r) => r.entryType).sort();
+    expect(types).toEqual(["credit", "debit"]);
+
+    const statementRes = await request(app)
+      .get(`/api/v1/exchange/${exchange._id.toString()}/statement`)
+      .set("Authorization", `Bearer ${accessToken}`);
+    expect(statementRes.status).toBe(200);
+    expect(statementRes.body.data.totalTopUpCredits).toBe(100);
+    expect(statementRes.body.data.totalTopUpDebits).toBe(40);
+    expect(statementRes.body.data.exchange.currentBalance).toBe(560);
+    const debitRow = statementRes.body.data.rows.find(
+      (r: { kind: string; direction: string }) => r.kind === "topup" && r.direction === "debit",
+    );
+    expect(debitRow).toBeDefined();
+    expect(debitRow.label).toBe("Top Up Debit");
+    expect(debitRow.amount).toBe(40);
   });
 
   it("uses entryAt/requestedAt precedence for exchange statement event time", async () => {

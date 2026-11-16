@@ -95,3 +95,8 @@ export const movePlayersBodySchema = z
       });
     }
   });
+
+export const exportExchangeQuerySchema = listExchangeQuerySchema.omit({
+  page: true,
+  pageSize: true,
+});
