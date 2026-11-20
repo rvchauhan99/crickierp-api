@@ -8,16 +8,21 @@ import { validate } from "../../shared/middlewares/validate.middleware";
 import {
   amendWithdrawalController,
   bulkBankerApproveController,
+  createBankerUtrUploadJobController,
   createBulkBankerApproveJobController,
   createWithdrawalController,
   createWithdrawalImportJobController,
   deleteWithdrawalController,
+  downloadBankerUtrUploadJobErrorCsvController,
   downloadWithdrawalImportJobErrorCsvController,
+  getBankerUtrUploadJobController,
   getBulkBankerApproveJobController,
   getWithdrawalImportJobController,
   listSavedAccountsController,
   listWithdrawalController,
+  sampleBankerUtrUploadController,
   sampleWithdrawalCsvController,
+  streamBankerUtrUploadJobEventsController,
   streamWithdrawalApprovalQueueEventsController,
   streamBulkBankerApproveJobEventsController,
   streamWithdrawalImportJobEventsController,
@@ -25,7 +30,9 @@ import {
   updateWithdrawalBankerController,
   updateWithdrawalStatusController,
   exportWithdrawalController,
+  validateBankerUtrUploadController,
   validateWithdrawalImportController,
+  validateWithdrawalPlayerAccountController,
 } from "./withdrawal.controller";
 import { withdrawalListPermissionMiddleware } from "./withdrawal.list.middleware";
 import { withdrawalStatusPermissionMiddleware } from "./withdrawal.status.middleware";
@@ -33,6 +40,7 @@ import {
   approvalQueueEventsQuerySchema,
   amendWithdrawalBodySchema,
   bulkBankerApproveBodySchema,
+  createBankerUtrUploadJobBodySchema,
   createBulkBankerApproveJobBodySchema,
   createWithdrawalBodySchema,
   createWithdrawalImportJobBodySchema,
@@ -40,6 +48,7 @@ import {
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
+  validateWithdrawalPlayerAccountBodySchema,
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
 
@@ -124,11 +133,56 @@ withdrawalRouter.get(
   streamBulkBankerApproveJobEventsController,
 );
 
+withdrawalRouter.get(
+  "/banker-utr-upload/sample",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  sampleBankerUtrUploadController,
+);
+
+withdrawalRouter.post(
+  "/banker-utr-upload/validate",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  upload.single("file"),
+  validateBankerUtrUploadController,
+);
+
+withdrawalRouter.post(
+  "/banker-utr-upload/jobs",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  validate({ body: createBankerUtrUploadJobBodySchema }),
+  createBankerUtrUploadJobController,
+);
+
+withdrawalRouter.get(
+  "/banker-utr-upload/jobs/:jobId",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  getBankerUtrUploadJobController,
+);
+
+withdrawalRouter.get(
+  "/banker-utr-upload/jobs/:jobId/events",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  streamBankerUtrUploadJobEventsController,
+);
+
+withdrawalRouter.get(
+  "/banker-utr-upload/jobs/:jobId/errors.csv",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_BANKER),
+  downloadBankerUtrUploadJobErrorCsvController,
+);
+
 withdrawalRouter.post(
   "/",
   permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE),
   validate({ body: createWithdrawalBodySchema }),
   createWithdrawalController,
+);
+
+withdrawalRouter.post(
+  "/validate-player-account",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE),
+  validate({ body: validateWithdrawalPlayerAccountBodySchema }),
+  validateWithdrawalPlayerAccountController,
 );
 
 withdrawalRouter.get(

@@ -29,6 +29,11 @@ import { logger } from "../../shared/logger";
 import { normalizeUtr } from "../../shared/utils/utr";
 import { UserModel } from "../users/user.model";
 import { WithdrawalModel } from "./withdrawal.model";
+import {
+  assertWithdrawalPlayerAccountLock,
+  getWithdrawalPlayerAccountLockMode,
+  withdrawalBeneficiaryAccountKey,
+} from "./withdrawal-player-account-lock";
 
 export const WITHDRAWAL_IMPORT_CHUNK_SIZE = 100;
 
@@ -815,6 +820,11 @@ export async function applyWithdrawalImportRows(
   let created = 0;
   const errors: WithdrawalImportCommitError[] = [];
   const jobPayoutUtrSet = new Set<string>();
+  const lockMode = getWithdrawalPlayerAccountLockMode();
+  /** In-file account key → player mongo id (for ENV lock modes). */
+  const jobAccountOwnerByKey = new Map<string, string>();
+  /** In-file player mongo id → first account key (strict_1to1). */
+  const jobPlayerAccountKey = new Map<string, string>();
 
   const indexedRows: IndexedWithdrawalImportRow[] = rows.map((row, index) => ({ index, row }));
   const { bankById, personById, playerById } = await loadWithdrawalImportLookups(rows);
@@ -838,6 +848,55 @@ export async function applyWithdrawalImportRows(
             error: "Payout UTR already exists in another transaction",
           });
           continue;
+        }
+      }
+
+      if (lockMode !== "off") {
+        const accountKey = withdrawalBeneficiaryAccountKey(item.row.accountNumber, item.row.ifsc);
+        const playerMongoId = item.row.playerMongoId;
+        const existingOwner = jobAccountOwnerByKey.get(accountKey);
+        if (existingOwner && existingOwner !== playerMongoId) {
+          errors.push({
+            row: item.index + 1,
+            utr: withdrawalImportRowIdentifier(item.row),
+            error: "This bank account is already linked to another player.",
+          });
+          continue;
+        }
+        if (lockMode === "strict_1to1") {
+          const lockedKey = jobPlayerAccountKey.get(playerMongoId);
+          if (lockedKey && lockedKey !== accountKey) {
+            errors.push({
+              row: item.index + 1,
+              utr: withdrawalImportRowIdentifier(item.row),
+              error: "This player is already locked to a different withdrawal account.",
+            });
+            continue;
+          }
+        }
+        try {
+          await assertWithdrawalPlayerAccountLock({
+            playerId: playerMongoId,
+            accountNumber: item.row.accountNumber,
+            ifsc: item.row.ifsc,
+          });
+        } catch (err: unknown) {
+          const message =
+            err instanceof AppError
+              ? err.message
+              : err instanceof Error
+                ? err.message
+                : "Player account lock validation failed";
+          errors.push({
+            row: item.index + 1,
+            utr: withdrawalImportRowIdentifier(item.row),
+            error: message,
+          });
+          continue;
+        }
+        jobAccountOwnerByKey.set(accountKey, playerMongoId);
+        if (lockMode === "strict_1to1" && !jobPlayerAccountKey.has(playerMongoId)) {
+          jobPlayerAccountKey.set(playerMongoId, accountKey);
         }
       }
 

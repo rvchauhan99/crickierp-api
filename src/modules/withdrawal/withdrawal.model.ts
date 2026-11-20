@@ -61,6 +61,11 @@ export interface WithdrawalDocument {
   /** @deprecated Legacy queue field; list uses `view` query instead */
   stage?: "exchange" | "banker" | "final";
   createdBy: Types.ObjectId;
+  /** Banker who completed payout (status → approved). */
+  approvedBy?: Types.ObjectId;
+  approvedAt?: Date;
+  /** First time status left open (`requested`) for approved/rejected/finalized. Frozen for due-time. */
+  resolvedAt?: Date;
   amendmentCount?: number;
   lastAmendedAt?: Date;
   lastAmendedBy?: Types.ObjectId;
@@ -125,6 +130,9 @@ const withdrawalSchema = new Schema<WithdrawalDocument>(
     },
     stage: { type: String, enum: ["exchange", "banker", "final"] },
     createdBy: { type: Schema.Types.ObjectId, required: true, ref: "User" },
+    approvedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    approvedAt: { type: Date },
+    resolvedAt: { type: Date },
     amendmentCount: { type: Number, min: 0, default: 0 },
     lastAmendedAt: { type: Date },
     lastAmendedBy: { type: Schema.Types.ObjectId, ref: "User" },

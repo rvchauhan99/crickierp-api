@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { env } from "../../config/env";
+import { env, type WithdrawalPlayerAccountLockMode } from "../../config/env";
 import { AppError } from "../../shared/errors/AppError";
 import type { SupportedCurrency } from "../../shared/constants/currencies";
 import { SUPPORTED_CURRENCIES } from "../../shared/constants/currencies";
@@ -22,6 +22,11 @@ export type PlatformSettingsView = {
   supportedCurrencies: readonly SupportedCurrency[];
   /** When false, liability module and person settlement are off for this deploy. */
   liabilityModuleEnabled: boolean;
+  /**
+   * Withdrawal player↔account lock mode for this deploy.
+   * off | account_ownership | strict_1to1
+   */
+  withdrawalPlayerAccountLockMode: WithdrawalPlayerAccountLockMode;
 };
 
 async function ensureSingleton() {
@@ -59,6 +64,7 @@ function toView(doc: Awaited<ReturnType<typeof ensureSingleton>>): PlatformSetti
     currencyConversionEnabled: conversionEnabled,
     supportedCurrencies: conversionEnabled ? SUPPORTED_CURRENCIES : [currency],
     liabilityModuleEnabled: env.liabilityModuleEnabled,
+    withdrawalPlayerAccountLockMode: env.withdrawalPlayerAccountLockMode,
   };
 }
 

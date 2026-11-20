@@ -14,6 +14,7 @@ import {
   updateWithdrawalStatus,
   exportWithdrawalsToBuffer,
   validateWithdrawalImportRows,
+  validateWithdrawalPlayerAccount,
 } from "./withdrawal.service";
 import {
   createWithdrawalImportJob,
@@ -25,9 +26,20 @@ import {
   getWithdrawalBulkApproveJobStatus,
 } from "./withdrawal-bulk-approve-job.service";
 import {
+  buildBankerUtrUploadSampleCsv,
+  buildBankerUtrUploadSampleXlsx,
+  validateBankerUtrUploadFile,
+} from "./withdrawal-banker-utr-upload.service";
+import {
+  createWithdrawalBankerUtrUploadJob,
+  getWithdrawalBankerUtrUploadJobErrorCsv,
+  getWithdrawalBankerUtrUploadJobStatus,
+} from "./withdrawal-banker-utr-upload-job.service";
+import {
   approvalQueueEventsQuerySchema,
   amendWithdrawalBodySchema,
   bulkBankerApproveBodySchema,
+  createBankerUtrUploadJobBodySchema,
   createBulkBankerApproveJobBodySchema,
   createWithdrawalBodySchema,
   createWithdrawalImportJobBodySchema,
@@ -35,6 +47,7 @@ import {
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
+  validateWithdrawalPlayerAccountBodySchema,
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
 import { resolveRequestTimeZone } from "../../shared/utils/requestTimezone";
@@ -42,6 +55,7 @@ import { omitCustomBusinessDateTime } from "../../shared/utils/businessEntryDate
 import { subscribeApprovalQueueEvents } from "../approval/approval-queue-events";
 import { subscribeWithdrawalImportEvents } from "./withdrawal-import-events";
 import { subscribeWithdrawalBulkApproveEvents } from "./withdrawal-bulk-approve-events";
+import { subscribeWithdrawalBankerUtrUploadEvents } from "./withdrawal-banker-utr-upload-events";
 
 export async function createWithdrawalController(req: Request, res: Response) {
   const body = omitCustomBusinessDateTime(
@@ -53,10 +67,20 @@ export async function createWithdrawalController(req: Request, res: Response) {
   res.status(StatusCodes.CREATED).json({ success: true, data });
 }
 
+export async function validateWithdrawalPlayerAccountController(req: Request, res: Response) {
+  const body = validateWithdrawalPlayerAccountBodySchema.parse(req.body);
+  const data = await validateWithdrawalPlayerAccount(body);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
 export async function listWithdrawalController(req: Request, res: Response) {
   const query = listWithdrawalQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const result = await listWithdrawals(query, { actorId: req.user!.userId, timeZone });
+  const result = await listWithdrawals(query, {
+    actorId: req.user!.userId,
+    actorRole: req.user!.role,
+    timeZone,
+  });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
@@ -94,7 +118,10 @@ export async function deleteWithdrawalController(req: Request, res: Response) {
 export async function exportWithdrawalController(req: Request, res: Response) {
   const query = exportWithdrawalQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportWithdrawalsToBuffer({ ...query, page: 1, pageSize: 20 }, { timeZone });
+  const buffer = await exportWithdrawalsToBuffer(
+    { ...query, page: 1, pageSize: 20 },
+    { actorRole: req.user!.role, timeZone },
+  );
   res.setHeader("Content-Disposition", 'attachment; filename="withdrawals-export.xlsx"');
   res.setHeader(
     "Content-Type",
@@ -227,4 +254,69 @@ export async function downloadWithdrawalImportJobErrorCsvController(req: Request
   res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function sampleBankerUtrUploadController(req: Request, res: Response) {
+  const format = String(req.query.format ?? "xlsx").toLowerCase();
+  if (format === "csv") {
+    const csv = buildBankerUtrUploadSampleCsv();
+    res.setHeader("Content-Disposition", 'attachment; filename="withdrawal-banker-utr-upload-sample.csv"');
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.status(StatusCodes.OK).send(csv);
+    return;
+  }
+  if (format !== "xlsx") {
+    res.status(StatusCodes.BAD_REQUEST).json({
+      success: false,
+      message: 'Invalid format. Use "csv" or "xlsx".',
+    });
+    return;
+  }
+  const buffer = buildBankerUtrUploadSampleXlsx();
+  res.setHeader("Content-Disposition", 'attachment; filename="withdrawal-banker-utr-upload-sample.xlsx"');
+  res.setHeader(
+    "Content-Type",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  res.status(StatusCodes.OK).send(buffer);
+}
+
+export async function validateBankerUtrUploadController(req: Request, res: Response) {
+  const file = req.file;
+  if (!file?.buffer) {
+    res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: "File is required (field name: file)" });
+    return;
+  }
+  const data = await validateBankerUtrUploadFile(file.buffer, file.originalname);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function createBankerUtrUploadJobController(req: Request, res: Response) {
+  const body = createBankerUtrUploadJobBodySchema.parse(req.body);
+  const data = await createWithdrawalBankerUtrUploadJob({
+    rows: body.rows,
+    actorId: req.user!.userId,
+    requestId: req.requestId,
+  });
+  res.status(StatusCodes.ACCEPTED).json({ success: true, data });
+}
+
+export async function getBankerUtrUploadJobController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  const data = await getWithdrawalBankerUtrUploadJobStatus(jobId, req.user!.userId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function streamBankerUtrUploadJobEventsController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  await getWithdrawalBankerUtrUploadJobStatus(jobId, req.user!.userId);
+  subscribeWithdrawalBankerUtrUploadEvents(jobId, res);
+}
+
+export async function downloadBankerUtrUploadJobErrorCsvController(req: Request, res: Response) {
+  const jobId = String(req.params.jobId);
+  const { fileName, csv } = await getWithdrawalBankerUtrUploadJobErrorCsv(jobId, req.user!.userId);
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.status(StatusCodes.OK).send(csv);
 }

@@ -214,4 +214,24 @@ describe("Dashboard P&L KPI structure integration", () => {
     expect(data.pnl.pendingGrossAmount).toBe(0);
     expect(data.pnl.pendingNetAmount).toBe(0);
   });
+
+  it("exchange breakdown In/Out/grossPL use non-rejected totals (includes pending)", async () => {
+    const data = await fetchSummary();
+    const rows = data.exchangesBreakdown ?? [];
+    expect(rows.length).toBeGreaterThan(0);
+
+    const ex = rows.find((r: { name?: string }) => r.name === "P&L Exchange") ?? rows[0];
+    // Same basis as KPI headlines: pending deposit 500 + verified 1000; requested 100 + approved 400.
+    expect(ex.depositTotal).toBe(1500);
+    expect(ex.depositTotalCount).toBe(2);
+    expect(ex.depositVerified).toBe(1000);
+    expect(ex.withdrawalTotal).toBe(500);
+    expect(ex.withdrawalTotalCount).toBe(2);
+    expect(ex.withdrawalApproved).toBe(400);
+    expect(ex.netPL).toBe(ex.depositTotal - ex.withdrawalTotal);
+    expect(ex.grossPL).toBe(ex.netPL + (ex.netBonus ?? 0));
+    // Must NOT stay on verified-only (would be 1000 - 400 = 600).
+    expect(ex.netPL).toBe(1000);
+    expect(ex.netPL).not.toBe(ex.depositVerified - ex.withdrawalApproved);
+  });
 });

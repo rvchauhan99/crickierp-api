@@ -12,6 +12,7 @@ import { LiabilityEntryModel } from "../liability/liability-entry.model";
 import { PlayerModel } from "../player/player.model";
 import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
 import { AuditLogModel } from "../audit/audit.model";
+import { UserModel } from "../users/user.model";
 import {
   DEFAULT_TIMEZONE,
   formatDateForTimeZone,
@@ -38,8 +39,24 @@ import { resolveMoneyFromRequest, convertSecondaryAmount, roundMoneyToCurrency }
 import { getCurrencyMinUnit } from "../../shared/constants/currencies";
 import {
   assertLiabilityModuleEnabled,
+  isLiabilityModuleEnabled,
   requirePlatformCurrency,
 } from "../settings/settings.service";
+import {
+  applyNonSuperadminTxnLookback,
+  WITHDRAWAL_TX_EXPR,
+} from "../../shared/utils/txnLookback";
+import {
+  assertWithdrawalPlayerAccountLock,
+  withdrawalBeneficiaryAccountKey,
+} from "./withdrawal-player-account-lock";
+
+export {
+  assertWithdrawalPlayerAccountLock,
+  getWithdrawalPlayerAccountLockMode,
+  validateWithdrawalPlayerAccount,
+  withdrawalBeneficiaryAccountKey,
+} from "./withdrawal-player-account-lock";
 
 type ListWithdrawalQuery = z.infer<typeof listWithdrawalQuerySchema>;
 type AmendWithdrawalInput = z.infer<typeof amendWithdrawalBodySchema>;
@@ -208,11 +225,31 @@ function bankDisplayName(b: { holderName: string; bankName: string; accountNumbe
   return `${b.holderName} - ${b.bankName} - ${last4}`;
 }
 
+/** Map FE aliases (pending) onto stored withdrawal statuses. */
+function normalizeWithdrawalStatusFilter(raw: string | undefined): string | undefined {
+  const status = trimUndef(raw);
+  if (!status) return undefined;
+  if (status === "pending") return "requested";
+  return status;
+}
+
 /** Base filters per list view (deposit-style `view` query). */
-function viewBaseCondition(view: ListWithdrawalQuery["view"]): Record<string, unknown> {
+function viewBaseCondition(
+  view: ListWithdrawalQuery["view"],
+  statusRaw?: string,
+): Record<string, unknown> {
   switch (view) {
-    case "banker":
-      return { status: "requested" };
+    case "banker": {
+      const status = normalizeWithdrawalStatusFilter(statusRaw);
+      if (!status || status === "requested") {
+        return { status: "requested" };
+      }
+      if (status === "all") {
+        return { status: { $in: ["requested", "approved", "rejected", "finalized"] as const } };
+      }
+      // Explicit non-pending status is applied in buildWithdrawalListFilter.
+      return {};
+    }
     case "exchange":
       return { status: { $in: ["requested", "approved", "rejected"] as const } };
     case "final":
@@ -222,7 +259,7 @@ function viewBaseCondition(view: ListWithdrawalQuery["view"]): Record<string, un
 }
 
 function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Record<string, unknown> {
-  const conditions: Record<string, unknown>[] = [viewBaseCondition(q.view)];
+  const conditions: Record<string, unknown>[] = [viewBaseCondition(q.view, q.status)];
 
   const search = trimUndef(q.search);
   if (search) {
@@ -238,7 +275,7 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Re
     });
   }
 
-  const statusFilter = trimUndef(q.status);
+  const statusFilter = normalizeWithdrawalStatusFilter(q.status);
   if (statusFilter && statusFilter !== "all") {
     if (
       statusFilter === "requested" ||
@@ -246,7 +283,10 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Re
       statusFilter === "rejected" ||
       statusFilter === "finalized"
     ) {
-      conditions.push({ status: statusFilter });
+      // Banker default already locked to requested; skip duplicate AND.
+      if (!(q.view === "banker" && statusFilter === "requested")) {
+        conditions.push({ status: statusFilter });
+      }
     }
   }
 
@@ -295,6 +335,16 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Re
     });
   }
 
+  const createdBy = trimUndef(q.createdBy);
+  if (createdBy && Types.ObjectId.isValid(createdBy)) {
+    conditions.push({ createdBy: new Types.ObjectId(createdBy) });
+  }
+
+  const approvedBy = trimUndef(q.approvedBy);
+  if (approvedBy && Types.ObjectId.isValid(approvedBy)) {
+    conditions.push({ approvedBy: new Types.ObjectId(approvedBy) });
+  }
+
   if (conditions.length === 0) {
     return {};
   }
@@ -302,6 +352,92 @@ function buildWithdrawalListFilter(q: ListWithdrawalQuery, timeZone: string): Re
     return conditions[0];
   }
   return { $and: conditions };
+}
+
+function formatUserForExport(user: unknown): string {
+  if (!user || typeof user !== "object") return "";
+  const u = user as { fullName?: unknown; username?: unknown };
+  const fullName = u.fullName != null ? String(u.fullName).trim() : "";
+  const username = u.username != null ? String(u.username).trim() : "";
+  if (fullName && username) return `${fullName} (${username})`;
+  return fullName || username;
+}
+
+/**
+ * Legacy approved/finalized rows may lack `approvedBy`. Fill from banker payout audit
+ * (and persist) so exchange/final lists show the approver.
+ */
+async function hydrateMissingApprovedBy(
+  rows: Array<Record<string, unknown>>,
+): Promise<void> {
+  const missing = rows.filter((row) => {
+    const status = String(row.status ?? "");
+    if (status !== "approved" && status !== "finalized") return false;
+    return row.approvedBy == null || row.approvedBy === "";
+  });
+  if (missing.length === 0) return;
+
+  const entityIds = missing.map((row) => String(row._id));
+  const logs = await AuditLogModel.find({
+    action: "withdrawal.banker_payout",
+    entity: "withdrawal",
+    entityId: { $in: entityIds },
+  })
+    .select("entityId actorId createdAt")
+    .sort({ createdAt: -1 })
+    .lean();
+
+  const actorByEntity = new Map<string, { actorId: Types.ObjectId; at: Date }>();
+  for (const log of logs) {
+    const entityId = String(log.entityId ?? "").trim();
+    if (!entityId || actorByEntity.has(entityId)) continue;
+    if (!log.actorId || !Types.ObjectId.isValid(String(log.actorId))) continue;
+    actorByEntity.set(entityId, {
+      actorId: new Types.ObjectId(String(log.actorId)),
+      at: log.createdAt instanceof Date ? log.createdAt : new Date(),
+    });
+  }
+  if (actorByEntity.size === 0) return;
+
+  const actorIds = [...new Set([...actorByEntity.values()].map((v) => String(v.actorId)))];
+  const users = await UserModel.find({ _id: { $in: actorIds.map((id) => new Types.ObjectId(id)) } })
+    .select("fullName username")
+    .lean();
+  const userById = new Map(users.map((u) => [String(u._id), u]));
+
+  const persistOps: Array<{
+    updateOne: {
+      filter: Record<string, unknown>;
+      update: { $set: { approvedBy: Types.ObjectId; approvedAt: Date; resolvedAt: Date } };
+    };
+  }> = [];
+
+  for (const row of missing) {
+    const entityId = String(row._id);
+    const hit = actorByEntity.get(entityId);
+    if (!hit) continue;
+    const user = userById.get(String(hit.actorId));
+    row.approvedBy = user
+      ? { _id: hit.actorId, fullName: user.fullName, username: user.username }
+      : hit.actorId;
+    row.approvedAt = hit.at;
+    if (row.resolvedAt == null) row.resolvedAt = hit.at;
+    persistOps.push({
+      updateOne: {
+        filter: {
+          _id: new Types.ObjectId(entityId),
+          $or: [{ approvedBy: { $exists: false } }, { approvedBy: null }],
+        },
+        update: { $set: { approvedBy: hit.actorId, approvedAt: hit.at, resolvedAt: hit.at } },
+      },
+    });
+  }
+
+  if (persistOps.length > 0) {
+    void WithdrawalModel.bulkWrite(persistOps, { ordered: false }).catch((err) => {
+      logger.warn({ err }, "Failed to persist hydrated withdrawal approvedBy");
+    });
+  }
 }
 
 function payableFromAmounts(amount: number, reverseBonus: number, platformCurrency: string): number {
@@ -352,6 +488,12 @@ export async function createWithdrawal(
 ) {
   const player = await PlayerModel.findById(input.playerId);
   if (!player) throw new AppError("not_found", "Player not found", 404);
+
+  await assertWithdrawalPlayerAccountLock({
+    playerId: input.playerId,
+    accountNumber: input.accountNumber,
+    ifsc: input.ifsc,
+  });
 
   const platformCurrency = await requirePlatformCurrency();
   const money = await resolveMoneyFromRequest(
@@ -442,6 +584,13 @@ export async function updateWithdrawalByExchange(
   if (doc.status !== "requested") {
     throw new AppError("business_rule_error", "Only requested withdrawals can be updated", 400);
   }
+
+  await assertWithdrawalPlayerAccountLock({
+    playerId: String(doc.player),
+    accountNumber: input.accountNumber,
+    ifsc: input.ifsc,
+    excludeWithdrawalId: doc._id,
+  });
 
   const platformCurrency = await requirePlatformCurrency();
   const money = await resolveMoneyFromRequest(
@@ -555,6 +704,9 @@ export async function updateWithdrawalByBanker(
     payoutLiabilityEntryId: doc.payoutLiabilityEntryId?.toString(),
     utr: doc.utr,
     status: doc.status,
+    approvedBy: doc.approvedBy?.toString(),
+    approvedAt: doc.approvedAt,
+    resolvedAt: doc.resolvedAt,
   };
 
   const bankIdStr = mode === "bank" ? input.bankId?.trim() || doc.payoutBankId?.toString() : undefined;
@@ -577,6 +729,10 @@ export async function updateWithdrawalByBanker(
     doc.payoutLiabilityEntryId = undefined;
     doc.utr = utrTrim;
     doc.status = "approved";
+    doc.approvedBy = new Types.ObjectId(actorId);
+    const approvedNow = new Date();
+    doc.approvedAt = approvedNow;
+    if (!doc.resolvedAt) doc.resolvedAt = approvedNow;
     await doc.save();
   } else {
     if (!personId) {
@@ -594,6 +750,10 @@ export async function updateWithdrawalByBanker(
     doc.payoutLiabilityEntryId = undefined;
     doc.utr = utrTrim;
     doc.status = "approved";
+    doc.approvedBy = new Types.ObjectId(actorId);
+    const approvedNow = new Date();
+    doc.approvedAt = approvedNow;
+    if (!doc.resolvedAt) doc.resolvedAt = approvedNow;
     await doc.save();
 
     const platformCurrency = await requirePlatformCurrency();
@@ -634,6 +794,9 @@ export async function updateWithdrawalByBanker(
         : undefined;
       doc.utr = prev.utr;
       doc.status = prev.status;
+      doc.approvedBy = prev.approvedBy ? new Types.ObjectId(prev.approvedBy) : undefined;
+      doc.approvedAt = prev.approvedAt;
+      doc.resolvedAt = prev.resolvedAt;
       await doc.save();
       throw err;
     }
@@ -781,10 +944,14 @@ async function lastBankerPayoutBankForActor(
 
 export async function listWithdrawals(
   query: ListWithdrawalQuery,
-  options?: { actorId?: string; timeZone?: string },
+  options?: { actorId?: string; actorRole?: string; timeZone?: string },
 ) {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
-  const filter = buildWithdrawalListFilter(query, timeZone);
+  const filter = applyNonSuperadminTxnLookback(
+    buildWithdrawalListFilter(query, timeZone),
+    options?.actorRole,
+    WITHDRAWAL_TX_EXPR,
+  );
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -809,6 +976,7 @@ export async function listWithdrawals(
       .populate("payoutBankId", "holderName bankName accountNumber")
       .populate("payoutLiabilityPersonId", "name isActive")
       .populate("createdBy", "fullName username")
+      .populate("approvedBy", "fullName username")
       .populate("lastAmendedBy", "fullName username")
       .sort({ [sortField]: sortValue })
       .skip(cursor ? 0 : skip)
@@ -821,6 +989,7 @@ export async function listWithdrawals(
     ...row,
     playerName: sanitizeWithdrawalPlayerName(row.playerName),
   }));
+  await hydrateMissingApprovedBy(rows as unknown as Array<Record<string, unknown>>);
 
   const meta: {
     total: number;
@@ -869,8 +1038,11 @@ export async function updateWithdrawalStatus(
   }
   const old = doc.status;
   doc.status = status;
+  if (!doc.resolvedAt) {
+    doc.resolvedAt = new Date();
+  }
 
-  let newValue: Record<string, unknown> = { status };
+  let newValue: Record<string, unknown> = { status, resolvedAt: doc.resolvedAt };
   if (status === "rejected") {
     const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.WITHDRAWAL_BANKER_REJECT);
     const rejectText = composeRejectReasonText(resolved.masterText, input.remark);
@@ -878,6 +1050,7 @@ export async function updateWithdrawalStatus(
     doc.rejectReasonId = new Types.ObjectId(resolved.id);
     newValue = {
       status,
+      resolvedAt: doc.resolvedAt,
       rejectReason: rejectText,
       rejectReasonId: resolved.id,
       remark: input.remark?.trim() || undefined,
@@ -914,9 +1087,11 @@ export async function listSavedAccountsForPlayer(playerId: string) {
   }
   const rows = await WithdrawalModel.find({
     player: new Types.ObjectId(playerId),
+    status: { $ne: "rejected" },
     accountNumber: { $nin: [null, ""] },
   })
-    .sort({ updatedAt: -1 })
+    // Earliest first so index 0 matches strict_1to1 canonical lock.
+    .sort({ requestedAt: 1, createdAt: 1, _id: 1 })
     .limit(300)
     .select("accountNumber accountHolderName bankName ifsc")
     .lean();
@@ -933,7 +1108,7 @@ export async function listSavedAccountsForPlayer(playerId: string) {
     const acc = String(r.accountNumber ?? "").trim();
     const ifsc = String(r.ifsc ?? "").trim();
     if (!acc) continue;
-    const key = `${acc}|${ifsc}`;
+    const key = withdrawalBeneficiaryAccountKey(acc, ifsc);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({
@@ -951,10 +1126,14 @@ const EXPORT_MAX_ROWS = 10_000;
 
 export async function exportWithdrawalsToBuffer(
   query: ListWithdrawalQuery,
-  options?: { timeZone?: string },
+  options?: { actorRole?: string; timeZone?: string },
 ): Promise<Buffer> {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
-  const filter = buildWithdrawalListFilter(query, timeZone);
+  const filter = applyNonSuperadminTxnLookback(
+    buildWithdrawalListFilter(query, timeZone),
+    options?.actorRole,
+    WITHDRAWAL_TX_EXPR,
+  );
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await WithdrawalModel.find(filter)
@@ -962,41 +1141,115 @@ export async function exportWithdrawalsToBuffer(
     .populate("payoutBankId", "holderName bankName accountNumber")
     .populate("payoutLiabilityPersonId", "name")
     .populate("createdBy", "fullName username")
+    .populate("approvedBy", "fullName username")
     .sort({ [query.sortBy]: sortValue })
     .limit(EXPORT_MAX_ROWS)
     .lean();
 
-  return generateExcelBuffer(rows, [
-    { header: "Player ID", transform: (r) => (r.player as any)?.playerId ?? "" },
-    { header: "Account Number", key: "accountNumber" },
-    { header: "Account Holder", key: "accountHolderName" },
-    { header: "Bank", key: "bankName" },
-    { header: "IFSC", key: "ifsc" },
-    { header: "Amount", transform: (r) => Math.round(Number(r.amount ?? 0)) },
-    { header: "Reverse Bonus", transform: (r) => Math.round(Number(r.reverseBonus ?? 0)) },
-    { header: "Payable Amount", transform: (r) => Math.round(Number(r.payableAmount ?? 0)) },
-    { header: "Status", key: "status" },
-    { header: "UTR", key: "utr" },
-    {
-      header: "Payout settlement",
-      transform: (r) => (String((r as { payoutSettlementType?: string }).payoutSettlementType ?? "bank") === "person" ? "Liability person" : "Bank"),
-    },
-    {
-      header: "Payout liable person",
-      transform: (r) => String((r as { payoutLiabilityPersonName?: string }).payoutLiabilityPersonName ?? "").trim(),
-    },
-    { header: "Payout Bank", key: "payoutBankName" },
-    { header: "Amendment Count", key: "amendmentCount" },
-    {
-      header: "Last Amended At",
-      transform: (r) => formatDateTimeForTimeZone(r.lastAmendedAt, timeZone),
-    },
-    { header: "Created By", transform: (r) => (r.createdBy as any)?.fullName ?? "" },
-    {
-      header: "Transaction At",
-      transform: (r) => formatDateTimeForTimeZone(r.requestedAt ?? r.createdAt, timeZone),
-    },
-  ], "Withdrawals");
+  await hydrateMissingApprovedBy(rows as unknown as Array<Record<string, unknown>>);
+
+  const payoutBankAccount = (r: Record<string, unknown>): string => {
+    const pop = r.payoutBankId as { accountNumber?: unknown } | string | null | undefined;
+    if (pop && typeof pop === "object" && pop.accountNumber != null) {
+      return String(pop.accountNumber).trim();
+    }
+    return "";
+  };
+
+  const liabilityEnabled = isLiabilityModuleEnabled();
+  const isBankerExport = query.view === "banker";
+
+  type ExcelCol = {
+    header: string;
+    key?: string;
+    transform?: (r: Record<string, unknown>) => string | number;
+  };
+
+  const columns: ExcelCol[] = isBankerExport
+    ? [
+        { header: "Withdrawal ID", transform: (r) => String(r._id ?? "") },
+        { header: "Player ID", transform: (r) => (r.player as { playerId?: string } | undefined)?.playerId ?? "" },
+        { header: "Account Holder", key: "accountHolderName" },
+        { header: "Account Number", key: "accountNumber" },
+        { header: "IFSC", key: "ifsc" },
+        { header: "Amount", transform: (r) => Math.round(Number(r.amount ?? 0)) },
+        { header: "Payable Amount", transform: (r) => Math.round(Number(r.payableAmount ?? 0)) },
+        { header: "Status", key: "status" },
+        { header: "UTR", key: "utr" },
+        { header: "Payout Bank", transform: (r) => payoutBankAccount(r) },
+        ...(liabilityEnabled
+          ? ([
+              {
+                header: "Payout settlement",
+                transform: (r) =>
+                  String((r as { payoutSettlementType?: string }).payoutSettlementType ?? "bank") === "person"
+                    ? "Liability person"
+                    : "Bank",
+              },
+              {
+                header: "Payout liable person",
+                transform: (r) =>
+                  String((r as { payoutLiabilityPersonName?: string }).payoutLiabilityPersonName ?? "").trim(),
+              },
+            ] as ExcelCol[])
+          : []),
+        { header: "Created By", transform: (r) => formatUserForExport(r.createdBy) },
+        { header: "Approved By", transform: (r) => formatUserForExport(r.approvedBy) },
+        {
+          header: "Transaction At",
+          transform: (r) =>
+            formatDateTimeForTimeZone(
+              (r.requestedAt as Date | undefined) ?? (r.createdAt as Date | undefined),
+              timeZone,
+            ),
+        },
+      ]
+    : [
+        { header: "Player ID", transform: (r) => (r.player as { playerId?: string } | undefined)?.playerId ?? "" },
+        { header: "Account Number", key: "accountNumber" },
+        { header: "Account Holder", key: "accountHolderName" },
+        { header: "Bank", key: "bankName" },
+        { header: "IFSC", key: "ifsc" },
+        { header: "Amount", transform: (r) => Math.round(Number(r.amount ?? 0)) },
+        { header: "Reverse Bonus", transform: (r) => Math.round(Number(r.reverseBonus ?? 0)) },
+        { header: "Payable Amount", transform: (r) => Math.round(Number(r.payableAmount ?? 0)) },
+        { header: "Status", key: "status" },
+        { header: "UTR", key: "utr" },
+        ...(liabilityEnabled
+          ? ([
+              {
+                header: "Payout settlement",
+                transform: (r) =>
+                  String((r as { payoutSettlementType?: string }).payoutSettlementType ?? "bank") === "person"
+                    ? "Liability person"
+                    : "Bank",
+              },
+              {
+                header: "Payout liable person",
+                transform: (r) =>
+                  String((r as { payoutLiabilityPersonName?: string }).payoutLiabilityPersonName ?? "").trim(),
+              },
+            ] as ExcelCol[])
+          : []),
+        { header: "Payout Bank", key: "payoutBankName" },
+        { header: "Amendment Count", key: "amendmentCount" },
+        {
+          header: "Last Amended At",
+          transform: (r) => formatDateTimeForTimeZone(r.lastAmendedAt as Date | undefined, timeZone),
+        },
+        { header: "Created By", transform: (r) => formatUserForExport(r.createdBy) },
+        { header: "Approved By", transform: (r) => formatUserForExport(r.approvedBy) },
+        {
+          header: "Transaction At",
+          transform: (r) =>
+            formatDateTimeForTimeZone(
+              (r.requestedAt as Date | undefined) ?? (r.createdAt as Date | undefined),
+              timeZone,
+            ),
+        },
+      ];
+
+  return generateExcelBuffer(rows as unknown as Record<string, unknown>[], columns, "Withdrawals");
 }
 
 export async function deleteWithdrawalWithReversal(id: string, actorId: string, requestId?: string) {

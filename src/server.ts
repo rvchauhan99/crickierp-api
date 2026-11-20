@@ -19,6 +19,10 @@ import {
   startWithdrawalBulkApproveWorker,
   stopWithdrawalBulkApproveWorker,
 } from "./modules/withdrawal/withdrawal-bulk-approve-job.service";
+import {
+  startWithdrawalBankerUtrUploadWorker,
+  stopWithdrawalBankerUtrUploadWorker,
+} from "./modules/withdrawal/withdrawal-banker-utr-upload-job.service";
 import { startQueueWorkers, stopQueueWorkers } from "./shared/queue/queue";
 
 async function start() {
@@ -32,6 +36,7 @@ async function start() {
   startDepositBulkExchangeApproveWorker();
   startWithdrawalImportWorker();
   startWithdrawalBulkApproveWorker();
+  startWithdrawalBankerUtrUploadWorker();
   startQueueWorkers();
   app.listen(env.port, () => {
     logger.info(`API server running on port ${env.port}`);
@@ -45,6 +50,7 @@ start().catch((error) => {
   void stopDepositBulkExchangeApproveWorker();
   void stopWithdrawalImportWorker();
   void stopWithdrawalBulkApproveWorker();
+  void stopWithdrawalBankerUtrUploadWorker();
   void stopQueueWorkers();
   process.exit(1);
 });

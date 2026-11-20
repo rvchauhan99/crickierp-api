@@ -3,6 +3,9 @@ import {
   type SupportedCurrency,
 } from "../shared/constants/currencies";
 
+/** Withdrawal player↔bank-account uniqueness rule for this deploy. */
+export type WithdrawalPlayerAccountLockMode = "off" | "account_ownership" | "strict_1to1";
+
 type EnvConfig = {
   nodeEnv: string;
   port: number;
@@ -59,6 +62,18 @@ type EnvConfig = {
    * Bank→bank transfers still use LiabilityEntry internally. Default true.
    */
   liabilityModuleEnabled: boolean;
+  /**
+   * Hours of deposit/withdrawal history visible to non-superadmin (admin, sub_admin).
+   * Superadmin always sees all. Set 0 to disable the restriction. Default 24.
+   */
+  depositWithdrawalLookbackHours: number;
+  /**
+   * Player↔withdrawal-account lock mode.
+   * - off: no rule (default)
+   * - account_ownership: accountNumber+IFSC may belong to only one player
+   * - strict_1to1: ownership plus each player may use only one account ever
+   */
+  withdrawalPlayerAccountLockMode: WithdrawalPlayerAccountLockMode;
 };
 
 function required(name: string, fallback?: string): string {
@@ -95,6 +110,18 @@ function parsePlatformCurrency(raw: string | undefined): SupportedCurrency {
     );
   }
   return value;
+}
+
+function parseWithdrawalPlayerAccountLockMode(
+  raw: string | undefined,
+): WithdrawalPlayerAccountLockMode {
+  const value = (raw?.trim().toLowerCase() || "off") as string;
+  if (value === "off" || value === "account_ownership" || value === "strict_1to1") {
+    return value;
+  }
+  throw new Error(
+    `Invalid WITHDRAWAL_PLAYER_ACCOUNT_LOCK_MODE="${raw ?? ""}". Must be off | account_ownership | strict_1to1.`,
+  );
 }
 
 export const env: EnvConfig = {
@@ -139,4 +166,8 @@ export const env: EnvConfig = {
   platformCurrency: parsePlatformCurrency(process.env.PLATFORM_CURRENCY),
   currencyConversionEnabled: (process.env.CURRENCY_CONVERSION_ENABLED ?? "false") === "true",
   liabilityModuleEnabled: (process.env.LIABILITY_MODULE_ENABLED ?? "true") === "true",
+  depositWithdrawalLookbackHours: Number(process.env.DEPOSIT_WITHDRAWAL_LOOKBACK_HOURS ?? 24),
+  withdrawalPlayerAccountLockMode: parseWithdrawalPlayerAccountLockMode(
+    process.env.WITHDRAWAL_PLAYER_ACCOUNT_LOCK_MODE,
+  ),
 };
