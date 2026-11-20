@@ -65,14 +65,21 @@ export async function updateDepositController(req: Request, res: Response) {
 export async function listDepositController(req: Request, res: Response) {
   const query = listDepositQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const result = await listDeposits(query, { actorId: req.user!.userId, timeZone });
+  const result = await listDeposits(query, {
+    actorId: req.user!.userId,
+    actorRole: req.user!.role,
+    timeZone,
+  });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
 }
 
 export async function exportDepositController(req: Request, res: Response) {
   const query = exportDepositQuerySchema.parse(req.query);
   const timeZone = resolveRequestTimeZone(req);
-  const buffer = await exportDepositsToBuffer({ ...query, page: 1, pageSize: 20 }, { timeZone });
+  const buffer = await exportDepositsToBuffer(
+    { ...query, page: 1, pageSize: 20 },
+    { actorRole: req.user!.role, timeZone },
+  );
   res.setHeader("Content-Disposition", 'attachment; filename="deposits-export.xlsx"');
   res.setHeader(
     "Content-Type",

@@ -48,6 +48,10 @@ import { escapeRegex as escapeUtrRegex, normalizeUtr } from "../../shared/utils/
 import { createLiabilityEntry, deleteLiabilityEntryForReversal } from "../liability/liability.service";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
 import { chunkArray } from "../../shared/utils/chunkArray";
+import {
+  applyNonSuperadminTxnLookback,
+  DEPOSIT_TX_EXPR,
+} from "../../shared/utils/txnLookback";
 import { resolveMoneyFromRequest, convertSecondaryAmount, roundMoneyToCurrency } from "../../shared/utils/moneyFx";
 import { canSetCustomBusinessEntryDateTime } from "../../shared/utils/businessEntryDateTime";
 import { UserModel } from "../users/user.model";
@@ -655,10 +659,14 @@ async function lastBankerDepositForActor(
 
 export async function listDeposits(
   query: ListDepositQuery,
-  options?: { actorId?: string; timeZone?: string },
+  options?: { actorId?: string; actorRole?: string; timeZone?: string },
 ) {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
-  const filter = buildDepositListFilter(query, timeZone);
+  const filter = applyNonSuperadminTxnLookback(
+    buildDepositListFilter(query, timeZone),
+    options?.actorRole,
+    DEPOSIT_TX_EXPR,
+  );
   const page = query.page;
   const pageSize = pageSizeFromQuery(query);
   const skip = (page - 1) * pageSize;
@@ -737,10 +745,14 @@ function formatUserForExport(u: unknown): string {
 
 export async function exportDepositsToBuffer(
   query: ListDepositQuery,
-  options?: { timeZone?: string },
+  options?: { actorRole?: string; timeZone?: string },
 ): Promise<Buffer> {
   const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
-  const filter = buildDepositListFilter(query, timeZone);
+  const filter = applyNonSuperadminTxnLookback(
+    buildDepositListFilter(query, timeZone),
+    options?.actorRole,
+    DEPOSIT_TX_EXPR,
+  );
   const sortValue = query.sortOrder === "asc" ? 1 : -1;
 
   const rows = await DepositModel.find(filter)

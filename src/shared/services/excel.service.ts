@@ -29,7 +29,11 @@ export function generateExcelBuffer<T = any>(
       })
     : (data as Record<string, any>[]);
 
-  const worksheet = xlsx.utils.json_to_sheet(exportData);
+  // Keep header row when there is no data but columns were provided.
+  const worksheet =
+    exportData.length === 0 && Array.isArray(columnsOrSheetName)
+      ? xlsx.utils.aoa_to_sheet([columnsOrSheetName.map((c) => c.header)])
+      : xlsx.utils.json_to_sheet(exportData);
   const workbook = xlsx.utils.book_new();
   xlsx.utils.book_append_sheet(workbook, worksheet, resolvedSheetName);
   

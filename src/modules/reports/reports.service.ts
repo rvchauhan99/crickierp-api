@@ -364,7 +364,7 @@ async function getExchangePeriodBalancesForDashboard(args: {
     DepositModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
       {
         $match: {
-          status: { $in: ["verified", "finalized"] },
+          status: { $in: ["pending", "not_settled", "verified", "finalized"] },
           player: { $exists: true, $ne: null },
         },
       },
@@ -378,7 +378,7 @@ async function getExchangePeriodBalancesForDashboard(args: {
     DepositModel.aggregate<{ _id: Types.ObjectId; totalAmount: number }>([
       {
         $match: {
-          status: { $in: ["verified", "finalized"] },
+          status: { $in: ["pending", "not_settled", "verified", "finalized"] },
           player: { $exists: true, $ne: null },
         },
       },
@@ -825,6 +825,7 @@ export async function getDashboardSummary(
           _id: { $ifNull: ["$exchangeDoc._id", "unknown"] },
           name: { $first: { $ifNull: ["$exchangeDoc.name", "Unknown"] } },
           depositTotal: { $sum: "$amount" },
+          depositTotalCount: { $sum: 1 },
           depositVerified: { $sum: { $cond: [{ $in: ["$status", ["verified", "finalized"]] }, "$amount", 0] } },
           depositVerifiedCount: {
             $sum: { $cond: [{ $in: ["$status", ["verified", "finalized"]] }, 1, 0] },
@@ -860,6 +861,7 @@ export async function getDashboardSummary(
           _id: { $ifNull: ["$exchangeDoc._id", "unknown"] },
           name: { $first: { $ifNull: ["$exchangeDoc.name", "Unknown"] } },
           withdrawalTotal: { $sum: { $ifNull: ["$payableAmount", "$amount"] } },
+          withdrawalTotalCount: { $sum: 1 },
           withdrawalApproved: { $sum: { $cond: [{ $eq: ["$status", "approved"] }, { $ifNull: ["$payableAmount", "$amount"] }, 0] } },
           withdrawalApprovedCount: {
             $sum: { $cond: [{ $eq: ["$status", "approved"] }, 1, 0] },
@@ -1255,9 +1257,11 @@ export async function getDashboardSummary(
       exchangeId: string;
       name: string;
       depositTotal: number;
+      depositTotalCount: number;
       depositVerified: number;
       depositVerifiedCount: number;
       withdrawalTotal: number;
+      withdrawalTotalCount: number;
       withdrawalApproved: number;
       withdrawalApprovedCount: number;
       bonusGiven: number;
@@ -1271,9 +1275,11 @@ export async function getDashboardSummary(
         exchangeId: id,
         name,
         depositTotal: 0,
+        depositTotalCount: 0,
         depositVerified: 0,
         depositVerifiedCount: 0,
         withdrawalTotal: 0,
+        withdrawalTotalCount: 0,
         withdrawalApproved: 0,
         withdrawalApprovedCount: 0,
         bonusGiven: 0,
@@ -1287,6 +1293,7 @@ export async function getDashboardSummary(
   for (const row of exchangeDeposits) {
     const obj = getExchangeObj(String(row._id), String(row.name));
     obj.depositTotal = row.depositTotal ?? 0;
+    obj.depositTotalCount = row.depositTotalCount ?? 0;
     obj.depositVerified = row.depositVerified ?? 0;
     obj.depositVerifiedCount = row.depositVerifiedCount ?? 0;
     obj.bonusGiven = row.bonusTotal ?? 0;
@@ -1295,6 +1302,7 @@ export async function getDashboardSummary(
   for (const row of exchangeWithdrawals) {
     const obj = getExchangeObj(String(row._id), String(row.name));
     obj.withdrawalTotal = row.withdrawalTotal ?? 0;
+    obj.withdrawalTotalCount = row.withdrawalTotalCount ?? 0;
     obj.withdrawalApproved = row.withdrawalApproved ?? 0;
     obj.withdrawalApprovedCount = row.withdrawalApprovedCount ?? 0;
     obj.bonusRecovered = row.reverseBonusTotal ?? 0;
@@ -1319,7 +1327,8 @@ export async function getDashboardSummary(
   const leafRows = exchangesBreakdown
     .map((e) => {
       const netBonus = e.bonusGiven - e.bonusRecovered;
-      const netPL = e.depositVerified - e.withdrawalApproved;
+      // KPI/bank basis: all non-rejected totals (includes pending)
+      const netPL = e.depositTotal - e.withdrawalTotal;
       return {
         ...e,
         exchangeId: e.exchangeIdString,
@@ -1332,7 +1341,7 @@ export async function getDashboardSummary(
           )?.firstTimeDepositAmount ?? 0,
         netPL,
         netBonus,
-        /** Sheet-style Sub Total / Gross P&L: deposits − withdrawals + net bonus */
+        /** Sheet-style Sub Total / Gross P&L: deposits − withdrawals + net bonus (includes pending) */
         grossPL: netPL + netBonus,
         periodOpeningBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodOpeningBalance ?? 0 : 0,
         periodClosingBalance: e.exchangeObjectId ? exchangeBalanceMap.get(e.exchangeIdString)?.periodClosingBalance ?? 0 : 0,
@@ -1393,9 +1402,11 @@ export async function getDashboardSummary(
 
   const rolledParents = [...byParent.entries()].map(([parentId, subs]) => {
     const depositTotal = subs.reduce((s, r) => s + r.depositTotal, 0);
+    const depositTotalCount = subs.reduce((s, r) => s + (r.depositTotalCount ?? 0), 0);
     const depositVerified = subs.reduce((s, r) => s + r.depositVerified, 0);
     const depositVerifiedCount = subs.reduce((s, r) => s + (r.depositVerifiedCount ?? 0), 0);
     const withdrawalTotal = subs.reduce((s, r) => s + r.withdrawalTotal, 0);
+    const withdrawalTotalCount = subs.reduce((s, r) => s + (r.withdrawalTotalCount ?? 0), 0);
     const withdrawalApproved = subs.reduce((s, r) => s + r.withdrawalApproved, 0);
     const withdrawalApprovedCount = subs.reduce((s, r) => s + (r.withdrawalApprovedCount ?? 0), 0);
     const bonusGiven = subs.reduce((s, r) => s + r.bonusGiven, 0);
@@ -1404,15 +1415,18 @@ export async function getDashboardSummary(
     const firstTimeDepositAmount = subs.reduce((s, r) => s + r.firstTimeDepositAmount, 0);
     const periodOpeningBalance = subs.reduce((s, r) => s + r.periodOpeningBalance, 0);
     const periodClosingBalance = subs.reduce((s, r) => s + r.periodClosingBalance, 0);
-    const netPL = depositVerified - withdrawalApproved;
+    // KPI/bank basis: all non-rejected totals (includes pending)
+    const netPL = depositTotal - withdrawalTotal;
     const netBonus = bonusGiven - bonusRecovered;
     return {
       exchangeId: parentId,
       name: parentNameMap.get(parentId) ?? leafMeta.get(parentId)?.name ?? "Unknown",
       depositTotal,
+      depositTotalCount,
       depositVerified,
       depositVerifiedCount,
       withdrawalTotal,
+      withdrawalTotalCount,
       withdrawalApproved,
       withdrawalApprovedCount,
       bonusGiven,

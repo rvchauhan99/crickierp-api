@@ -21,6 +21,13 @@ export const createWithdrawalBodySchema = z.object({
   requestedAt: optionalDateTime,
 }).merge(moneyFxInputSchema);
 
+export const validateWithdrawalPlayerAccountBodySchema = z.object({
+  playerId: z.string().length(24),
+  accountNumber: z.string().min(1).max(40).trim(),
+  ifsc: z.string().min(4).max(20).trim(),
+  excludeWithdrawalId: z.string().length(24).optional(),
+});
+
 export const withdrawalBankerPayoutBodySchema = z
   .object({
     payoutSettlementType: z.enum(["bank", "person"]).optional().default("bank"),
@@ -79,6 +86,8 @@ export const listWithdrawalQuerySchema = z.object({
   createdAt_from: z.string().optional(),
   createdAt_to: z.string().optional(),
   createdAt_op: z.string().optional(),
+  createdBy: z.string().optional(),
+  approvedBy: z.string().optional(),
   hasAmendment: z.enum(["yes", "no"]).optional(),
 });
 
@@ -139,6 +148,19 @@ export const bulkBankerApproveBodySchema = z.object({
 });
 
 export const createBulkBankerApproveJobBodySchema = bulkBankerApproveBodySchema;
+
+export const createBankerUtrUploadJobBodySchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        withdrawalId: z.string().length(24),
+        utr: z.string().min(4).max(120).trim(),
+        payoutBankId: z.string().length(24),
+      }),
+    )
+    .min(1)
+    .max(10000),
+});
 
 export const exportWithdrawalQuerySchema = listWithdrawalQuerySchema.omit({
   page: true,
