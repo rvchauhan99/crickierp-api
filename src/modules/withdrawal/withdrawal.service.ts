@@ -1172,7 +1172,6 @@ export async function exportWithdrawalsToBuffer(
         { header: "Account Holder", key: "accountHolderName" },
         { header: "Account Number", key: "accountNumber" },
         { header: "IFSC", key: "ifsc" },
-        { header: "Amount", transform: (r) => Math.round(Number(r.amount ?? 0)) },
         { header: "Payable Amount", transform: (r) => Math.round(Number(r.payableAmount ?? 0)) },
         { header: "Status", key: "status" },
         { header: "UTR", key: "utr" },

@@ -22,7 +22,6 @@ export const BANKER_UTR_UPLOAD_PRIORITY_HEADERS = [
   "Account Holder",
   "Account Number",
   "IFSC",
-  "Amount",
   "Payable Amount",
   "Status",
   "UTR",
@@ -108,7 +107,6 @@ export function buildBankerUtrUploadSampleXlsx(): Buffer {
   sample["Account Holder"] = "John Doe";
   sample["Account Number"] = "1234567890";
   sample["IFSC"] = "HDFC0001234";
-  sample["Amount"] = "1000";
   sample["Payable Amount"] = "1000";
   sample["Status"] = "requested";
   sample["UTR"] = "UTR1234567890";
@@ -127,7 +125,6 @@ export function buildBankerUtrUploadSampleCsv(): string {
     if (h === "Account Holder") return "John Doe";
     if (h === "Account Number") return "1234567890";
     if (h === "IFSC") return "HDFC0001234";
-    if (h === "Amount") return "1000";
     if (h === "Payable Amount") return "1000";
     if (h === "Status") return "requested";
     if (h === "UTR") return "UTR1234567890";
