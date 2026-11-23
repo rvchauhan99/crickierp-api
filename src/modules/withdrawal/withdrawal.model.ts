@@ -52,6 +52,8 @@ export interface WithdrawalDocument {
   payoutBankId?: Types.ObjectId;
   payoutBankName?: string;
   utr?: string;
+  /** Optional free-text note from banker at payout time. */
+  narration?: string;
   /** Business requested datetime selected by exchange user (can be backdated). */
   requestedAt?: Date;
   /** Denormalized text from Reason master (+ optional remark). */
@@ -120,6 +122,7 @@ const withdrawalSchema = new Schema<WithdrawalDocument>(
     payoutBankId: { type: Schema.Types.ObjectId, ref: "Bank" },
     payoutBankName: { type: String, trim: true, default: "" },
     utr: { type: String, trim: true },
+    narration: { type: String, trim: true, default: "" },
     requestedAt: { type: Date },
     rejectReason: { type: String, trim: true },
     rejectReasonId: { type: Schema.Types.ObjectId, ref: "Reason" },
