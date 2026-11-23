@@ -20,6 +20,7 @@ import {
   getWithdrawalImportJobController,
   listSavedAccountsController,
   listWithdrawalController,
+  lookupBeneficiaryAccountsController,
   sampleBankerUtrUploadController,
   sampleWithdrawalCsvController,
   streamBankerUtrUploadJobEventsController,
@@ -48,6 +49,7 @@ import {
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
+  lookupBeneficiaryAccountsQuerySchema,
   validateWithdrawalPlayerAccountBodySchema,
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
@@ -183,6 +185,13 @@ withdrawalRouter.post(
   permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE),
   validate({ body: validateWithdrawalPlayerAccountBodySchema }),
   validateWithdrawalPlayerAccountController,
+);
+
+withdrawalRouter.get(
+  "/beneficiary-accounts/lookup",
+  permissionMiddleware(PERMISSIONS.WITHDRAWAL_EXCHANGE),
+  validate({ query: lookupBeneficiaryAccountsQuerySchema }),
+  lookupBeneficiaryAccountsController,
 );
 
 withdrawalRouter.get(

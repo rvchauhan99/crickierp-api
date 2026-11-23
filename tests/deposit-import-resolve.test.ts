@@ -23,13 +23,23 @@ describe("deposit-import-resolve", () => {
     status: "inactive",
   };
 
+  const emptyLast4 = () => new Map<string, BankImportRecord | "ambiguous">();
+
   describe("resolveBankImportKey", () => {
     it("resolves by account number", () => {
       const maps: BankImportMaps = {
         bankByAccountMap: new Map([["1234567890", activeBank]]),
         bankByHolderMap: new Map(),
+        bankByLast4Map: emptyLast4(),
       };
-      expect(resolveBankImportKey("1234567890", maps.bankByAccountMap, maps.bankByHolderMap)).toEqual({
+      expect(
+        resolveBankImportKey(
+          "1234567890",
+          maps.bankByAccountMap,
+          maps.bankByHolderMap,
+          maps.bankByLast4Map,
+        ),
+      ).toEqual({
         status: "ok",
         id: "bank-1",
         displayName: activeBank.displayName,
@@ -40,8 +50,11 @@ describe("deposit-import-resolve", () => {
       const maps: BankImportMaps = {
         bankByAccountMap: new Map(),
         bankByHolderMap: new Map(),
+        bankByLast4Map: emptyLast4(),
       };
-      expect(resolveBankImportKey("missing", maps.bankByAccountMap, maps.bankByHolderMap)).toEqual({
+      expect(
+        resolveBankImportKey("missing", maps.bankByAccountMap, maps.bankByHolderMap, maps.bankByLast4Map),
+      ).toEqual({
         status: "not_found",
       });
     });
@@ -50,8 +63,11 @@ describe("deposit-import-resolve", () => {
       const maps: BankImportMaps = {
         bankByAccountMap: new Map(),
         bankByHolderMap: new Map([["demo", "ambiguous"]]),
+        bankByLast4Map: emptyLast4(),
       };
-      expect(resolveBankImportKey("demo", maps.bankByAccountMap, maps.bankByHolderMap)).toEqual({
+      expect(
+        resolveBankImportKey("demo", maps.bankByAccountMap, maps.bankByHolderMap, maps.bankByLast4Map),
+      ).toEqual({
         status: "ambiguous",
       });
     });
@@ -60,8 +76,11 @@ describe("deposit-import-resolve", () => {
       const maps: BankImportMaps = {
         bankByAccountMap: new Map([["demo", activeBank]]),
         bankByHolderMap: new Map([["demo", "ambiguous"]]),
+        bankByLast4Map: emptyLast4(),
       };
-      expect(resolveBankImportKey("demo", maps.bankByAccountMap, maps.bankByHolderMap)).toEqual({
+      expect(
+        resolveBankImportKey("demo", maps.bankByAccountMap, maps.bankByHolderMap, maps.bankByLast4Map),
+      ).toEqual({
         status: "ok",
         id: "bank-1",
         displayName: activeBank.displayName,
@@ -72,10 +91,80 @@ describe("deposit-import-resolve", () => {
       const maps: BankImportMaps = {
         bankByAccountMap: new Map([["inactive-acc", inactiveBank]]),
         bankByHolderMap: new Map(),
+        bankByLast4Map: emptyLast4(),
       };
-      expect(resolveBankImportKey("inactive-acc", maps.bankByAccountMap, maps.bankByHolderMap)).toEqual({
+      expect(
+        resolveBankImportKey(
+          "inactive-acc",
+          maps.bankByAccountMap,
+          maps.bankByHolderMap,
+          maps.bankByLast4Map,
+        ),
+      ).toEqual({
         status: "inactive",
         displayName: inactiveBank.displayName,
+      });
+    });
+
+    it("resolves by last 4 digits when exact account/holder miss", () => {
+      const maps: BankImportMaps = {
+        bankByAccountMap: new Map(),
+        bankByHolderMap: new Map(),
+        bankByLast4Map: new Map([["7890", activeBank]]),
+      };
+      expect(
+        resolveBankImportKey("7890", maps.bankByAccountMap, maps.bankByHolderMap, maps.bankByLast4Map),
+      ).toEqual({
+        status: "ok",
+        id: "bank-1",
+        displayName: activeBank.displayName,
+      });
+    });
+
+    it("returns inactive when only inactive banks match last 4 digits", () => {
+      const maps: BankImportMaps = {
+        bankByAccountMap: new Map(),
+        bankByHolderMap: new Map(),
+        bankByLast4Map: new Map([["1234", inactiveBank]]),
+      };
+      expect(
+        resolveBankImportKey("1234", maps.bankByAccountMap, maps.bankByHolderMap, maps.bankByLast4Map),
+      ).toEqual({
+        status: "inactive",
+        displayName: inactiveBank.displayName,
+      });
+    });
+
+    it("returns ambiguous when multiple active banks share last 4 digits", () => {
+      const maps: BankImportMaps = {
+        bankByAccountMap: new Map(),
+        bankByHolderMap: new Map(),
+        bankByLast4Map: new Map([["4455", "ambiguous"]]),
+      };
+      expect(
+        resolveBankImportKey("4455", maps.bankByAccountMap, maps.bankByHolderMap, maps.bankByLast4Map),
+      ).toEqual({
+        status: "ambiguous",
+      });
+    });
+
+    it("prefers exact account number over last 4 map", () => {
+      const otherActive: BankImportRecord = {
+        id: "bank-9",
+        displayName: "Other - Other Bank - 7890",
+        status: "active",
+      };
+      const maps: BankImportMaps = {
+        bankByAccountMap: new Map([["7890", activeBank]]),
+        bankByHolderMap: new Map(),
+        bankByLast4Map: new Map([["7890", otherActive]]),
+      };
+      expect(
+        resolveBankImportKey("7890", maps.bankByAccountMap, maps.bankByHolderMap, maps.bankByLast4Map),
+      ).toEqual({
+        status: "ok",
+        id: "bank-1",
+        displayName: activeBank.displayName,
       });
     });
   });
@@ -134,11 +223,27 @@ describe("deposit-import-resolve", () => {
       const maps: BankImportMaps = {
         bankByAccountMap: new Map([["demo", activeBank]]),
         bankByHolderMap: new Map(),
+        bankByLast4Map: emptyLast4(),
       };
       const cache = buildBankResolutionCache(["demo", "missing"], maps);
       expect(cache.size).toBe(2);
       expect(cache.get("demo")).toEqual({ status: "ok", id: "bank-1", displayName: activeBank.displayName });
       expect(cache.get("missing")).toEqual({ status: "not_found" });
+    });
+
+    it("buildBankResolutionCache resolves last 4 digit keys", () => {
+      const maps: BankImportMaps = {
+        bankByAccountMap: new Map(),
+        bankByHolderMap: new Map(),
+        bankByLast4Map: new Map([["4455", activeBank]]),
+      };
+      const cache = buildBankResolutionCache(["4455", "9999"], maps);
+      expect(cache.get("4455")).toEqual({
+        status: "ok",
+        id: "bank-1",
+        displayName: activeBank.displayName,
+      });
+      expect(cache.get("9999")).toEqual({ status: "not_found" });
     });
 
     it("buildPersonResolutionCache resolves each unique name once", () => {

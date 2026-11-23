@@ -110,7 +110,7 @@ export function buildBankerUtrUploadSampleXlsx(): Buffer {
   sample["Payable Amount"] = "1000";
   sample["Status"] = "requested";
   sample["UTR"] = "UTR1234567890";
-  sample["Payout Bank"] = "991122334455";
+  sample["Payout Bank"] = "4455";
   const worksheet = xlsx.utils.json_to_sheet([sample], { header: headers });
   const workbook = xlsx.utils.book_new();
   xlsx.utils.book_append_sheet(workbook, worksheet, "UTR Upload");
@@ -128,7 +128,7 @@ export function buildBankerUtrUploadSampleCsv(): string {
     if (h === "Payable Amount") return "1000";
     if (h === "Status") return "requested";
     if (h === "UTR") return "UTR1234567890";
-    if (h === "Payout Bank") return "991122334455";
+    if (h === "Payout Bank") return "4455";
     return "";
   });
   return `${headers.join(",")}\n${values.join(",")}\n`;
@@ -245,9 +245,13 @@ export async function validateBankerUtrUploadFile(
     } else {
       const bankResult = bankCache.get(bankKey);
       if (!bankResult || bankResult.status === "not_found") {
-        errors.push(`Payout bank "${p.payoutBank}" not found (tried account number and holder name)`);
+        errors.push(
+          `Payout bank "${p.payoutBank}" not found (tried account number, holder name, and last 4 digits)`,
+        );
       } else if (bankResult.status === "ambiguous") {
-        errors.push(`Multiple banks found for "${p.payoutBank}". Use account number instead.`);
+        errors.push(
+          `Multiple banks found for "${p.payoutBank}". Use the full account number instead.`,
+        );
       } else if (bankResult.status === "inactive") {
         errors.push(`Payout bank "${bankResult.displayName}" is not active`);
       } else {

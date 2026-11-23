@@ -28,6 +28,16 @@ export const validateWithdrawalPlayerAccountBodySchema = z.object({
   excludeWithdrawalId: z.string().length(24).optional(),
 });
 
+/** Global beneficiary account search for exchange create (account → player autofill). */
+export const lookupBeneficiaryAccountsQuerySchema = z.object({
+  q: z
+    .string()
+    .optional()
+    .transform((v) => String(v ?? "").trim())
+    .pipe(z.string().max(40)),
+  limit: z.coerce.number().int().positive().max(50).optional().default(25),
+});
+
 export const withdrawalBankerPayoutBodySchema = z
   .object({
     payoutSettlementType: z.enum(["bank", "person"]).optional().default("bank"),

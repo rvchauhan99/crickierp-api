@@ -1122,6 +1122,83 @@ export async function listSavedAccountsForPlayer(playerId: string) {
   return out;
 }
 
+export type BeneficiaryAccountLookupMatch = {
+  playerId: string;
+  playerLabel: string;
+  accountNumber: string;
+  accountHolderName: string;
+  bankName: string;
+  ifsc: string;
+};
+
+/**
+ * Search historical non-rejected withdrawal beneficiary accounts (optionally by account number prefix).
+ * Dedupes by player + accountNumber|IFSC; newest first. Used for exchange create account-first autofill.
+ */
+export async function lookupBeneficiaryAccounts(input: {
+  q?: string;
+  limit?: number;
+}): Promise<BeneficiaryAccountLookupMatch[]> {
+  const q = String(input.q ?? "").trim();
+  const limit = Math.min(Math.max(Number(input.limit) || 25, 1), 50);
+
+  const filter: Record<string, unknown> = {
+    status: { $ne: "rejected" },
+    accountNumber: { $nin: [null, ""] },
+    player: { $ne: null },
+  };
+  if (q) {
+    filter.accountNumber = { $regex: `^${escapeRegex(q)}`, $options: "i" };
+  }
+
+  const rows = await WithdrawalModel.find(filter)
+    .sort({ requestedAt: -1, createdAt: -1, _id: -1 })
+    .limit(300)
+    .select("accountNumber accountHolderName bankName ifsc player playerName")
+    .populate("player", "playerId")
+    .lean();
+
+  const seen = new Set<string>();
+  const out: BeneficiaryAccountLookupMatch[] = [];
+
+  for (const r of rows) {
+    const acc = String(r.accountNumber ?? "").trim();
+    const ifsc = String(r.ifsc ?? "").trim();
+    if (!acc) continue;
+
+    const playerRaw = r.player as unknown;
+    let playerId = "";
+    let playerLabel = "";
+    if (playerRaw && typeof playerRaw === "object") {
+      const obj = playerRaw as { _id?: unknown; id?: unknown; playerId?: unknown };
+      playerId = String(obj._id ?? obj.id ?? "").trim();
+      playerLabel = String(obj.playerId ?? "").trim();
+    } else if (playerRaw != null) {
+      playerId = String(playerRaw).trim();
+    }
+    if (!playerId || !Types.ObjectId.isValid(playerId)) continue;
+    if (!playerLabel) {
+      playerLabel = sanitizeWithdrawalPlayerName(r.playerName) || playerId;
+    }
+
+    const key = `${playerId}|${withdrawalBeneficiaryAccountKey(acc, ifsc)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      playerId,
+      playerLabel,
+      accountNumber: acc,
+      accountHolderName: String(r.accountHolderName ?? "").trim(),
+      bankName: String(r.bankName ?? "").trim(),
+      ifsc,
+    });
+    if (out.length >= limit) break;
+  }
+
+  return out;
+}
+
 const EXPORT_MAX_ROWS = 10_000;
 
 export async function exportWithdrawalsToBuffer(

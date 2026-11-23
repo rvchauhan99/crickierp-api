@@ -9,6 +9,7 @@ import {
   deleteWithdrawalWithReversal,
   listSavedAccountsForPlayer,
   listWithdrawals,
+  lookupBeneficiaryAccounts,
   updateWithdrawalByExchange,
   updateWithdrawalByBanker,
   updateWithdrawalStatus,
@@ -47,6 +48,7 @@ import {
   listWithdrawalQuerySchema,
   updateWithdrawalBodySchema,
   updateWithdrawalStatusBodySchema,
+  lookupBeneficiaryAccountsQuerySchema,
   validateWithdrawalPlayerAccountBodySchema,
   withdrawalBankerPayoutBodySchema,
 } from "./withdrawal.validation";
@@ -140,6 +142,12 @@ export async function updateWithdrawalStatusController(req: Request, res: Respon
 export async function listSavedAccountsController(req: Request, res: Response) {
   const playerId = String(req.params.playerId);
   const data = await listSavedAccountsForPlayer(playerId);
+  res.status(StatusCodes.OK).json({ success: true, data });
+}
+
+export async function lookupBeneficiaryAccountsController(req: Request, res: Response) {
+  const query = lookupBeneficiaryAccountsQuerySchema.parse(req.query);
+  const data = await lookupBeneficiaryAccounts({ q: query.q, limit: query.limit });
   res.status(StatusCodes.OK).json({ success: true, data });
 }
 
