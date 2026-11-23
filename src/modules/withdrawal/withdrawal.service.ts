@@ -703,11 +703,15 @@ export async function updateWithdrawalByBanker(
     payoutLiabilityPersonName: doc.payoutLiabilityPersonName,
     payoutLiabilityEntryId: doc.payoutLiabilityEntryId?.toString(),
     utr: doc.utr,
+    narration: doc.narration,
     status: doc.status,
     approvedBy: doc.approvedBy?.toString(),
     approvedAt: doc.approvedAt,
     resolvedAt: doc.resolvedAt,
   };
+
+  const narrationTrim =
+    input.narration !== undefined ? String(input.narration).trim() : String(doc.narration ?? "").trim();
 
   const bankIdStr = mode === "bank" ? input.bankId?.trim() || doc.payoutBankId?.toString() : undefined;
   const personId =
@@ -728,6 +732,7 @@ export async function updateWithdrawalByBanker(
     doc.payoutLiabilityPersonName = "";
     doc.payoutLiabilityEntryId = undefined;
     doc.utr = utrTrim;
+    doc.narration = narrationTrim;
     doc.status = "approved";
     doc.approvedBy = new Types.ObjectId(actorId);
     const approvedNow = new Date();
@@ -749,6 +754,7 @@ export async function updateWithdrawalByBanker(
     doc.payoutLiabilityPersonName = person.name.trim();
     doc.payoutLiabilityEntryId = undefined;
     doc.utr = utrTrim;
+    doc.narration = narrationTrim;
     doc.status = "approved";
     doc.approvedBy = new Types.ObjectId(actorId);
     const approvedNow = new Date();
@@ -793,6 +799,7 @@ export async function updateWithdrawalByBanker(
         ? new Types.ObjectId(prev.payoutLiabilityEntryId)
         : undefined;
       doc.utr = prev.utr;
+      doc.narration = prev.narration ?? "";
       doc.status = prev.status;
       doc.approvedBy = prev.approvedBy ? new Types.ObjectId(prev.approvedBy) : undefined;
       doc.approvedAt = prev.approvedAt;
@@ -853,6 +860,7 @@ export async function updateWithdrawalByBanker(
                 payoutSettlementType: "bank",
                 bankId: bankIdStr,
                 utr: utrTrim,
+                narration: narrationTrim,
                 status: "approved",
               } as Record<string, unknown>)
             : ({
@@ -860,6 +868,7 @@ export async function updateWithdrawalByBanker(
                 liabilityPersonId: personId,
                 liabilityEntryId: doc.payoutLiabilityEntryId?.toString(),
                 utr: utrTrim,
+                narration: narrationTrim,
                 status: "approved",
               } as Record<string, unknown>),
         requestId,

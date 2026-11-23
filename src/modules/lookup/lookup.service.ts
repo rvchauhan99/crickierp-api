@@ -33,12 +33,17 @@ export async function listBankLookupOptions({ q, limit }: LookupQueryParams) {
   const filter: Record<string, unknown> = { status: "active" };
   if (qTrim) {
     const esc = escapeRegex(qTrim);
-    filter.$or = [
+    const or: Record<string, unknown>[] = [
       { holderName: { $regex: esc, $options: "i" } },
       { bankName: { $regex: esc, $options: "i" } },
       { accountNumber: { $regex: esc, $options: "i" } },
       { ifsc: { $regex: esc, $options: "i" } },
     ];
+    // Last 3–4 digits of account number (banker payout UX).
+    if (/^\d{3,4}$/.test(qTrim)) {
+      or.push({ accountNumber: { $regex: `${esc}$` } });
+    }
+    filter.$or = or;
   }
   const rows = await BankModel.find(filter)
     .sort({ holderName: 1, bankName: 1 })

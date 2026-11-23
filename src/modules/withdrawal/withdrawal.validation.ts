@@ -44,6 +44,7 @@ export const withdrawalBankerPayoutBodySchema = z
     bankId: z.string().length(24).optional(),
     liabilityPersonId: z.string().length(24).optional(),
     utr: z.string().min(4).max(120).trim(),
+    narration: z.string().max(500).trim().optional(),
   })
   .superRefine((data, ctx) => {
     const mode = data.payoutSettlementType ?? "bank";
