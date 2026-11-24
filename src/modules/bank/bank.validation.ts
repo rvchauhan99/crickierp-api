@@ -95,6 +95,30 @@ export const listBankTransferQuerySchema = z.object({
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
 });
 
+/** Amend an existing bank↔bank transfer (requires reason). */
+export const amendBankTransferBodySchema = z
+  .object({
+    fromBankId: z.string().length(24),
+    toBankId: z.string().length(24),
+    amount: z.number().min(0.01),
+    entryDate: ymd,
+    referenceNo: optionalTrimmed,
+    remark: optionalTrimmed,
+    reasonId: z.string().length(24),
+    /** Optional free-text context appended to the selected reason master. */
+    amendRemark: optionalTrimmed,
+  })
+  .merge(moneyFxInputSchema)
+  .superRefine((data, ctx) => {
+    if (data.fromBankId === data.toBankId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "From bank and To bank must be different",
+        path: ["toBankId"],
+      });
+    }
+  });
+
 export const createBankSettlementBodySchema = z.object({
   effectiveAt: z.coerce.date(),
   masterReportedBalance: z.coerce.number().finite().nonnegative(),

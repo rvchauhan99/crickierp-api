@@ -6,6 +6,8 @@ import { bootstrapData } from "../src/shared/db/bootstrap";
 import { signAccessToken } from "../src/shared/utils/jwt";
 import { UserModel } from "../src/modules/users/user.model";
 import { BankModel } from "../src/modules/bank/bank.model";
+import { ReasonModel } from "../src/modules/masters/reason.model";
+import { REASON_TYPES } from "../src/shared/constants/reasonTypes";
 import { PERMISSIONS } from "../src/shared/constants/permissions";
 
 function todayIstYmd(): string {
@@ -218,6 +220,100 @@ describe("Bank transfer entry integration", () => {
     expect(dashRes.body.data.pnl.netAll).toBe(0);
     expect(dashRes.body.data.deposit.totalAmount).toBe(0);
     expect(dashRes.body.data.withdrawal.totalAmount).toBe(0);
+  });
+
+  it("amends amount and restores bank balances with amendment history", async () => {
+    const entryDate = todayIstYmd();
+    const reason = await ReasonModel.findOne({
+      reasonType: REASON_TYPES.BANK_TRANSFER_AMEND,
+      isActive: true,
+    })
+      .select("_id")
+      .lean();
+    expect(reason?._id).toBeTruthy();
+
+    const postRes = await request(app)
+      .post("/api/v1/bank/transfers")
+      .set("Authorization", `Bearer ${superadminToken}`)
+      .send({
+        fromBankId,
+        toBankId,
+        amount: 500,
+        entryDate,
+        referenceNo: "TRFR-AMEND-1",
+        remark: "Before amend",
+      });
+    expect(postRes.status).toBe(201);
+    const transferId = String(postRes.body.data._id ?? postRes.body.data.id);
+
+    const beforeFrom = await BankModel.findById(fromBankId).lean();
+    const beforeTo = await BankModel.findById(toBankId).lean();
+
+    const amendRes = await request(app)
+      .patch(`/api/v1/bank/transfers/${transferId}/amend`)
+      .set("Authorization", `Bearer ${superadminToken}`)
+      .send({
+        fromBankId,
+        toBankId,
+        amount: 800,
+        entryDate,
+        referenceNo: "TRFR-AMEND-1b",
+        remark: "After amend",
+        reasonId: String(reason!._id),
+        amendRemark: "Amount was wrong",
+      });
+    expect(amendRes.status).toBe(200);
+    expect(amendRes.body.data.amount).toBe(800);
+    expect(amendRes.body.data.amendmentCount).toBe(1);
+    expect(amendRes.body.data.amendmentHistory?.length).toBe(1);
+    expect(String(amendRes.body.data.amendmentHistory[0].reason)).toMatch(/Amount was wrong|Amount correction/i);
+
+    const [fromBank, toBank] = await Promise.all([
+      BankModel.findById(fromBankId).lean(),
+      BankModel.findById(toBankId).lean(),
+    ]);
+    expect(fromBank?.currentBalance).toBe(Number(beforeFrom?.currentBalance) - 300);
+    expect(toBank?.currentBalance).toBe(Number(beforeTo?.currentBalance) + 300);
+
+    const listRes = await request(app)
+      .get("/api/v1/bank/transfers")
+      .set("Authorization", `Bearer ${superadminToken}`);
+    expect(listRes.status).toBe(200);
+    const row = (listRes.body.data as Array<Record<string, unknown>>).find(
+      (r) => String(r.id ?? r._id) === transferId,
+    );
+    expect(row).toBeDefined();
+    expect(row!.amount).toBe(800);
+    expect(row!.amendmentCount).toBe(1);
+  });
+
+  it("rejects amend when from and to bank are the same", async () => {
+    const entryDate = todayIstYmd();
+    const reason = await ReasonModel.findOne({
+      reasonType: REASON_TYPES.BANK_TRANSFER_AMEND,
+      isActive: true,
+    })
+      .select("_id")
+      .lean();
+
+    const postRes = await request(app)
+      .post("/api/v1/bank/transfers")
+      .set("Authorization", `Bearer ${superadminToken}`)
+      .send({ fromBankId, toBankId, amount: 50, entryDate });
+    expect(postRes.status).toBe(201);
+    const transferId = String(postRes.body.data._id ?? postRes.body.data.id);
+
+    const amendRes = await request(app)
+      .patch(`/api/v1/bank/transfers/${transferId}/amend`)
+      .set("Authorization", `Bearer ${superadminToken}`)
+      .send({
+        fromBankId,
+        toBankId: fromBankId,
+        amount: 50,
+        entryDate,
+        reasonId: String(reason!._id),
+      });
+    expect(amendRes.status).toBe(400);
   });
 
 });

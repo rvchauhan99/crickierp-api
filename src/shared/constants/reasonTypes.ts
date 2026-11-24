@@ -6,6 +6,7 @@ export const REASON_TYPES = {
   EXPENSE_CANCEL: "expense_cancel",
   DEPOSIT_FINAL_AMEND: "deposit_final_amend",
   WITHDRAWAL_FINAL_AMEND: "withdrawal_final_amend",
+  BANK_TRANSFER_AMEND: "bank_transfer_amend",
 } as const;
 
 export type ReasonType = (typeof REASON_TYPES)[keyof typeof REASON_TYPES];

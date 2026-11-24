@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { StatusCodes } from "http-status-codes";
 import {
+  amendBankTransfer,
   createBank,
   createBankSettlement,
   createBankTransfer,
@@ -15,6 +16,7 @@ import {
   updateBankStatus,
 } from "./bank.service";
 import {
+  amendBankTransferBodySchema,
   bankIdParamSchema,
   bankLedgerQuerySchema,
   bankSummaryQuerySchema,
@@ -133,4 +135,21 @@ export async function listBankTransferController(req: Request, res: Response) {
   const timeZone = resolveRequestTimeZone(req);
   const result = await listBankTransfers(query, { timeZone });
   res.status(StatusCodes.OK).json({ success: true, data: result.rows, meta: result.meta });
+}
+
+export async function amendBankTransferController(req: Request, res: Response) {
+  const { id } = bankIdParamSchema.parse(req.params);
+  const parsed = amendBankTransferBodySchema.parse(req.body);
+  const timeZone = resolveRequestTimeZone(req);
+  const data = await amendBankTransfer(
+    id,
+    {
+      ...parsed,
+      entryDate: resolveBusinessYmdForActor(parsed.entryDate, req.user!.role),
+    },
+    req.user!.userId,
+    req.requestId,
+    { timeZone },
+  );
+  res.status(StatusCodes.OK).json({ success: true, data });
 }
