@@ -4,6 +4,27 @@ export type LiabilityAccountType = "bank" | "person" | "expense" | "deposit" | "
 export type LiabilityEntryType = "receipt" | "payment" | "contra" | "journal";
 export type LiabilityEntrySourceType = "expense" | "deposit" | "withdrawal";
 
+/** Snapshot of a bank↔bank transfer at amend time. */
+export type BankTransferAmendmentSnapshot = {
+  fromBankId?: string;
+  toBankId?: string;
+  amount?: number;
+  operatedCurrency?: string;
+  operatedAmount?: number;
+  exchangeRate?: number;
+  entryDate?: string;
+  referenceNo?: string;
+  remark?: string;
+};
+
+export type BankTransferAmendmentEntry = {
+  at: Date;
+  by: Types.ObjectId;
+  reason: string;
+  old: BankTransferAmendmentSnapshot;
+  new: BankTransferAmendmentSnapshot;
+};
+
 export interface LiabilityEntryDocument {
   _id: Types.ObjectId;
   entryDate: Date;
@@ -23,9 +44,39 @@ export interface LiabilityEntryDocument {
   referenceNo?: string;
   remark?: string;
   createdBy: Types.ObjectId;
+  amendmentCount?: number;
+  lastAmendedAt?: Date;
+  lastAmendedBy?: Types.ObjectId;
+  amendmentHistory?: BankTransferAmendmentEntry[];
   createdAt: Date;
   updatedAt: Date;
 }
+
+const bankTransferAmendmentSnapshotSchema = new Schema<BankTransferAmendmentSnapshot>(
+  {
+    fromBankId: { type: String, trim: true },
+    toBankId: { type: String, trim: true },
+    amount: { type: Number },
+    operatedCurrency: { type: String, trim: true },
+    operatedAmount: { type: Number },
+    exchangeRate: { type: Number },
+    entryDate: { type: String, trim: true },
+    referenceNo: { type: String, trim: true },
+    remark: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
+const bankTransferAmendmentEntrySchema = new Schema<BankTransferAmendmentEntry>(
+  {
+    at: { type: Date, required: true },
+    by: { type: Schema.Types.ObjectId, required: true, ref: "User" },
+    reason: { type: String, required: true, trim: true },
+    old: { type: bankTransferAmendmentSnapshotSchema, required: true },
+    new: { type: bankTransferAmendmentSnapshotSchema, required: true },
+  },
+  { _id: false },
+);
 
 const liabilityEntrySchema = new Schema<LiabilityEntryDocument>(
   {
@@ -51,6 +102,10 @@ const liabilityEntrySchema = new Schema<LiabilityEntryDocument>(
     referenceNo: { type: String, trim: true, default: "" },
     remark: { type: String, trim: true, default: "" },
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    amendmentCount: { type: Number, default: 0, min: 0 },
+    lastAmendedAt: { type: Date },
+    lastAmendedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    amendmentHistory: { type: [bankTransferAmendmentEntrySchema], default: [] },
   },
   { timestamps: true },
 );

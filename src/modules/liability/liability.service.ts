@@ -174,7 +174,7 @@ async function applyBankCurrentBalanceDelta(bankId: string, signedDelta: number)
   await bank.save();
 }
 
-async function applyLiabilityBankBalanceLegs(
+export async function applyLiabilityBankBalanceLegs(
   fromAccountType: LiabilityEntryAccountLiteral,
   fromAccountId: string,
   toAccountType: LiabilityEntryAccountLiteral,

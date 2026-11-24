@@ -7,11 +7,17 @@ import { DepositModel } from "../deposit/deposit.model";
 import { depositBankCashMongoFilter } from "../deposit/deposit-bank-cash";
 import { WithdrawalModel } from "../withdrawal/withdrawal.model";
 import { ExpenseModel } from "../expense/expense.model";
-import { LiabilityEntryModel } from "../liability/liability-entry.model";
+import { LiabilityEntryModel, type BankTransferAmendmentSnapshot } from "../liability/liability-entry.model";
 import { LiabilityPersonModel } from "../liability/liability-person.model";
-import { createLiabilityEntry } from "../liability/liability.service";
+import { applyLiabilityBankBalanceLegs, createLiabilityEntry } from "../liability/liability.service";
+import { composeRejectReasonText, loadActiveReasonForReject } from "../reason/reasonLookup.service";
+import { REASON_TYPES } from "../../shared/constants/reasonTypes";
+import { getCurrencyMinUnit } from "../../shared/constants/currencies";
+import { requirePlatformCurrency } from "../settings/settings.service";
+import { invalidateCacheDomains } from "../../shared/cache/domainCache";
 import {
   DEFAULT_TIMEZONE,
+  formatDateForTimeZone,
   formatDateTimeForTimeZone,
   ymdToUtcEnd,
   ymdToUtcStart,
@@ -20,16 +26,64 @@ import { BankModel } from "./bank.model";
 import { BankBalanceSettlementModel } from "./bank-balance-settlement.model";
 import { computeClosingBalanceActualByBankIds } from "./bankClosingBalance";
 import {
+  amendBankTransferBodySchema,
   bankSummaryQuerySchema,
   listBankQuerySchema,
   listBankTransferQuerySchema,
 } from "./bank.validation";
-import { resolveOpeningMoneyFromRequest } from "../../shared/utils/moneyFx";
+import { resolveMoneyFromRequest, resolveOpeningMoneyFromRequest } from "../../shared/utils/moneyFx";
 import { getBanksBreakdownSummary } from "../reports/reports.service";
 
 type ListBankQuery = z.infer<typeof listBankQuerySchema>;
 type BankSummaryQuery = z.infer<typeof bankSummaryQuerySchema>;
 type ListBankTransferQuery = z.infer<typeof listBankTransferQuerySchema>;
+type AmendBankTransferInput = z.infer<typeof amendBankTransferBodySchema>;
+
+function parseYmdToDate(ymd: string, timeZone: string = DEFAULT_TIMEZONE): Date {
+  const start = ymdToUtcStart(ymd, timeZone);
+  if (!start) throw new AppError("validation_error", "entryDate must be YYYY-MM-DD", 400);
+  return start;
+}
+
+function isInternalBankTransfer(doc: {
+  entryType?: string;
+  fromAccountType?: string;
+  toAccountType?: string;
+  sourceType?: string | null;
+  sourceExpenseId?: unknown;
+  sourceDepositId?: unknown;
+  sourceWithdrawalId?: unknown;
+}): boolean {
+  if (doc.entryType !== "contra") return false;
+  if (doc.fromAccountType !== "bank" || doc.toAccountType !== "bank") return false;
+  if (doc.sourceType) return false;
+  if (doc.sourceExpenseId || doc.sourceDepositId || doc.sourceWithdrawalId) return false;
+  return true;
+}
+
+function bankTransferSnapshot(input: {
+  fromBankId: string;
+  toBankId: string;
+  amount: number;
+  operatedCurrency?: string;
+  operatedAmount?: number;
+  exchangeRate?: number;
+  entryDate: string;
+  referenceNo?: string;
+  remark?: string;
+}): BankTransferAmendmentSnapshot {
+  return {
+    fromBankId: input.fromBankId,
+    toBankId: input.toBankId,
+    amount: input.amount,
+    operatedCurrency: input.operatedCurrency,
+    operatedAmount: input.operatedAmount,
+    exchangeRate: input.exchangeRate,
+    entryDate: input.entryDate,
+    referenceNo: input.referenceNo?.trim() || undefined,
+    remark: input.remark?.trim() || undefined,
+  };
+}
 
 function isBankToBankLiability(le: {
   fromAccountType?: string;
@@ -1019,6 +1073,175 @@ export async function createBankTransfer(
   return doc;
 }
 
+export async function amendBankTransfer(
+  id: string,
+  input: AmendBankTransferInput,
+  actorId: string,
+  requestId?: string,
+  options?: { timeZone?: string },
+) {
+  if (!Types.ObjectId.isValid(id)) {
+    throw new AppError("validation_error", "Invalid transfer id", 400);
+  }
+  if (input.fromBankId === input.toBankId) {
+    throw new AppError("business_rule_error", "From bank and To bank must be different", 400);
+  }
+
+  const timeZone = options?.timeZone || DEFAULT_TIMEZONE;
+  const doc = await LiabilityEntryModel.findById(id);
+  if (!doc) throw new AppError("not_found", "Bank transfer not found", 404);
+  if (!isInternalBankTransfer(doc)) {
+    throw new AppError("business_rule_error", "Only internal bank transfers can be amended", 400);
+  }
+
+  const money = await resolveMoneyFromRequest(
+    {
+      amount: input.amount,
+      operatedCurrency: input.operatedCurrency,
+      operatedAmount: input.operatedAmount,
+      exchangeRate: input.exchangeRate,
+    },
+    { minPlatformAmount: getCurrencyMinUnit(await requirePlatformCurrency()) },
+  );
+
+  const oldFromId = String(doc.fromAccountId);
+  const oldToId = String(doc.toAccountId);
+  const oldAmount = Number(doc.amount);
+  const oldEntryDateYmd = formatDateForTimeZone(doc.entryDate, timeZone);
+  const oldSnapshot = bankTransferSnapshot({
+    fromBankId: oldFromId,
+    toBankId: oldToId,
+    amount: oldAmount,
+    operatedCurrency: doc.operatedCurrency,
+    operatedAmount: doc.operatedAmount,
+    exchangeRate: doc.exchangeRate,
+    entryDate: oldEntryDateYmd,
+    referenceNo: doc.referenceNo,
+    remark: doc.remark,
+  });
+  const newSnapshot = bankTransferSnapshot({
+    fromBankId: input.fromBankId,
+    toBankId: input.toBankId,
+    amount: money.amount,
+    operatedCurrency: money.operatedCurrency,
+    operatedAmount: money.operatedAmount,
+    exchangeRate: money.exchangeRate,
+    entryDate: input.entryDate,
+    referenceNo: input.referenceNo,
+    remark: input.remark,
+  });
+
+  const resolved = await loadActiveReasonForReject(input.reasonId, REASON_TYPES.BANK_TRANSFER_AMEND);
+  const amendReasonText = composeRejectReasonText(resolved.masterText, input.amendRemark);
+
+  const moneyOrBanksChanged =
+    oldFromId !== input.fromBankId ||
+    oldToId !== input.toBankId ||
+    oldAmount !== money.amount ||
+    String(doc.operatedCurrency ?? "") !== String(money.operatedCurrency ?? "") ||
+    Number(doc.operatedAmount ?? 0) !== Number(money.operatedAmount ?? 0) ||
+    Number(doc.exchangeRate ?? 0) !== Number(money.exchangeRate ?? 0);
+
+  // Ensure new banks exist/active before reversing old legs
+  const [fromBank, toBank] = await Promise.all([
+    BankModel.findById(input.fromBankId).lean(),
+    BankModel.findById(input.toBankId).lean(),
+  ]);
+  if (!fromBank) throw new AppError("not_found", "From bank not found", 404);
+  if (!toBank) throw new AppError("not_found", "To bank not found", 404);
+  if (fromBank.status !== "active") throw new AppError("business_rule_error", "From bank is not active", 400);
+  if (toBank.status !== "active") throw new AppError("business_rule_error", "To bank is not active", 400);
+
+  let reversed = false;
+  if (moneyOrBanksChanged) {
+    await applyLiabilityBankBalanceLegs("bank", oldFromId, "bank", oldToId, oldAmount, -1);
+    reversed = true;
+    try {
+      // Preflight new from-bank after reverse
+      const fromAfter = await BankModel.findById(input.fromBankId).lean();
+      const prev = fromAfter?.currentBalance ?? fromAfter?.openingBalance ?? 0;
+      if (prev < money.amount) {
+        throw new AppError("business_rule_error", "Insufficient bank balance for this transfer", 400);
+      }
+      await applyLiabilityBankBalanceLegs(
+        "bank",
+        input.fromBankId,
+        "bank",
+        input.toBankId,
+        money.amount,
+        1,
+      );
+    } catch (err) {
+      if (reversed) {
+        await applyLiabilityBankBalanceLegs("bank", oldFromId, "bank", oldToId, oldAmount, 1);
+      }
+      throw err;
+    }
+  }
+
+  try {
+    doc.entryDate = parseYmdToDate(input.entryDate, timeZone);
+    doc.amount = money.amount;
+    doc.operatedCurrency = money.operatedCurrency;
+    doc.operatedAmount = money.operatedAmount;
+    doc.exchangeRate = money.exchangeRate;
+    doc.fromAccountId = new Types.ObjectId(input.fromBankId);
+    doc.toAccountId = new Types.ObjectId(input.toBankId);
+    doc.referenceNo = input.referenceNo?.trim() ?? "";
+    doc.remark = input.remark?.trim() ?? "";
+    doc.amendmentCount = (doc.amendmentCount ?? 0) + 1;
+    doc.lastAmendedAt = new Date();
+    doc.lastAmendedBy = new Types.ObjectId(actorId);
+    const history = doc.amendmentHistory ?? [];
+    history.push({
+      at: new Date(),
+      by: new Types.ObjectId(actorId),
+      reason: amendReasonText,
+      old: oldSnapshot,
+      new: newSnapshot,
+    });
+    doc.amendmentHistory = history;
+    await doc.save();
+  } catch (err) {
+    if (moneyOrBanksChanged) {
+      // Undo new legs and restore old
+      try {
+        await applyLiabilityBankBalanceLegs(
+          "bank",
+          input.fromBankId,
+          "bank",
+          input.toBankId,
+          money.amount,
+          -1,
+        );
+        await applyLiabilityBankBalanceLegs("bank", oldFromId, "bank", oldToId, oldAmount, 1);
+      } catch {
+        // best-effort rollback
+      }
+    }
+    throw err;
+  }
+
+  await createAuditLog({
+    actorId,
+    action: "bank.transfer.amend",
+    entity: "liability_entry",
+    entityId: doc._id.toString(),
+    oldValue: oldSnapshot as unknown as Record<string, unknown>,
+    newValue: {
+      ...newSnapshot,
+      reason: amendReasonText,
+      reasonId: resolved.id,
+      amendRemark: input.amendRemark?.trim() || undefined,
+    } as unknown as Record<string, unknown>,
+    requestId,
+  });
+
+  await invalidateCacheDomains(["bank", "dashboard"]);
+
+  return doc.toObject();
+}
+
 export async function listBankTransfers(
   query: ListBankTransferQuery,
   options?: { timeZone?: string },
@@ -1070,6 +1293,8 @@ export async function listBankTransfers(
   const [rows, total] = await Promise.all([
     LiabilityEntryModel.find(filter)
       .populate("createdBy", "fullName username")
+      .populate("lastAmendedBy", "fullName username")
+      .populate("amendmentHistory.by", "fullName username")
       .sort({ [query.sortBy]: sortValue })
       .skip(skip)
       .limit(pageSize)

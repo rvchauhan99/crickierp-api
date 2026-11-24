@@ -7,6 +7,7 @@ import { requireSuperadminMiddleware } from "../../shared/middlewares/superadmin
 import {
   bankLedgerController,
   bankSummaryController,
+  amendBankTransferController,
   createBankController,
   createBankSettlementController,
   createBankTransferController,
@@ -19,6 +20,7 @@ import {
   updateBankStatusController,
 } from "./bank.controller";
 import {
+  amendBankTransferBodySchema,
   bankIdParamSchema,
   bankLedgerQuerySchema,
   bankSummaryQuerySchema,
@@ -65,6 +67,12 @@ bankRouter.get(
   permissionMiddleware(PERMISSIONS.BANK_TRANSFER),
   validate({ query: listBankTransferQuerySchema }),
   listBankTransferController,
+);
+bankRouter.patch(
+  "/transfers/:id/amend",
+  permissionMiddleware(PERMISSIONS.BANK_TRANSFER),
+  validate({ params: bankIdParamSchema, body: amendBankTransferBodySchema }),
+  amendBankTransferController,
 );
 bankRouter.get(
   "/:id/settlements",

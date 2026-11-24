@@ -181,6 +181,27 @@ export async function bootstrapData() {
       reasonType: REASON_TYPES.WITHDRAWAL_FINAL_AMEND,
       reason: "Other (add details in remark)",
     },
+    // bank_transfer_amend
+    {
+      reasonType: REASON_TYPES.BANK_TRANSFER_AMEND,
+      reason: "Amount correction after reconciliation",
+    },
+    {
+      reasonType: REASON_TYPES.BANK_TRANSFER_AMEND,
+      reason: "Wrong from / to bank",
+    },
+    {
+      reasonType: REASON_TYPES.BANK_TRANSFER_AMEND,
+      reason: "Date correction",
+    },
+    {
+      reasonType: REASON_TYPES.BANK_TRANSFER_AMEND,
+      reason: "Reference / remark correction",
+    },
+    {
+      reasonType: REASON_TYPES.BANK_TRANSFER_AMEND,
+      reason: "Other (add details in remark)",
+    },
   ];
 
   for (const row of seedRows) {
